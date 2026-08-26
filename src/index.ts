@@ -429,7 +429,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					if (campaign_id) await getOwnedObject(env, "CAMPAIGN", campaign_id);
 					const params: Record<string, string | number> = {
 						fields:
-							"id,name,campaign_id,status,effective_status,daily_budget,lifetime_budget,optimization_goal,billing_event,bid_strategy,targeting,promoted_object,start_time,end_time,created_time,updated_time",
+							"id,name,campaign_id,status,effective_status,daily_budget,lifetime_budget,optimization_goal,billing_event,bid_strategy,destination_type,targeting,promoted_object,start_time,end_time,created_time,updated_time",
 						limit,
 					};
 					if (after) params.after = after;
@@ -764,6 +764,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					campaign_id: z.string().regex(META_ID_PATTERN),
 					confirmation_phrase: z.string().max(700).optional(),
 					daily_budget_minor: z.number().int().min(100).max(10_000_000).optional(),
+					destination_type: z.literal("WEBSITE").optional(),
 					end_time: z.string().max(100).optional(),
 					expected_campaign_name: z.string().min(1).max(500),
 					lifetime_budget_minor: z
@@ -794,6 +795,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 				campaign_id,
 				confirmation_phrase,
 				daily_budget_minor,
+				destination_type,
 				end_time,
 				expected_campaign_name,
 				lifetime_budget_minor,
@@ -821,6 +823,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						targeting,
 					};
 					setOptionalBudget(params, daily_budget_minor, lifetime_budget_minor);
+					if (destination_type) params.destination_type = destination_type;
 					if (promoted_object) params.promoted_object = promoted_object;
 					if (start_time) params.start_time = start_time;
 					if (end_time) params.end_time = end_time;
