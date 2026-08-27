@@ -759,7 +759,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							"LOWEST_COST_WITH_BID_CAP",
 							"COST_CAP",
 						])
-						.default("LOWEST_COST_WITHOUT_CAP"),
+						.optional(),
 					billing_event: z.enum(["IMPRESSIONS", "LINK_CLICKS"]),
 					campaign_id: z.string().regex(META_ID_PATTERN),
 					confirmation_phrase: z.string().max(700).optional(),
@@ -814,7 +814,6 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const campaign = await getOwnedObject(env, "CAMPAIGN", campaign_id);
 					assertExpectedName(campaign, expected_campaign_name);
 					const params: Record<string, string | number | boolean | object> = {
-						bid_strategy,
 						billing_event,
 						campaign_id,
 						name,
@@ -823,7 +822,15 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						targeting,
 					};
 					setOptionalBudget(params, daily_budget_minor, lifetime_budget_minor);
-					if (destination_type) params.destination_type = destination_type;
+					if (bid_strategy) params.bid_strategy = bid_strategy;
+					if (destination_type) {
+						params.destination_type = destination_type;
+					} else if (
+						optimization_goal === "LANDING_PAGE_VIEWS" ||
+						optimization_goal === "LINK_CLICKS"
+					) {
+						params.destination_type = "WEBSITE";
+					}
 					if (promoted_object) params.promoted_object = promoted_object;
 					if (start_time) params.start_time = start_time;
 					if (end_time) params.end_time = end_time;
