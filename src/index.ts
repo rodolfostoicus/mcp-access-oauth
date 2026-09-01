@@ -21,6 +21,8 @@ type MetaEnv = Env & {
 type MetaGraphErrorPayload = {
 	error?: {
 		code?: number;
+		error_user_msg?: string;
+		error_user_title?: string;
 		error_subcode?: number;
 		fbtrace_id?: string;
 		message?: string;
@@ -113,6 +115,8 @@ function safeMetaError(payload: MetaGraphErrorPayload, status: number) {
 	const metaError = payload.error;
 	if (!metaError) return `Meta API returned HTTP ${status}.`;
 	return [
+		metaError.error_user_title,
+		metaError.error_user_msg,
 		metaError.message,
 		metaError.type ? `type=${metaError.type}` : undefined,
 		metaError.code !== undefined ? `code=${metaError.code}` : undefined,
@@ -171,6 +175,8 @@ async function callMetaGraph(
 			error: z
 				.object({
 					code: z.number().optional(),
+					error_user_msg: z.string().optional(),
+					error_user_title: z.string().optional(),
 					error_subcode: z.number().optional(),
 					fbtrace_id: z.string().optional(),
 					message: z.string().optional(),
