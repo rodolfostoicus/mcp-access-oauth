@@ -372,9 +372,24 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 			async () => {
 				try {
 					const env = this.env as MetaEnv;
-					const payload = graphListSchema.parse(
-						await callMetaGraph(env, "GET", "me/permissions", {}),
-					);
+					const [permissionResponse, tokenSubject] = await Promise.all([
+						callMetaGraph(env, "GET", "me/permissions", {}),
+						callMetaGraph(env, "GET", "me", { fields: "id,name" }),
+					]);
+					const payload = graphListSchema.parse(permissionResponse);
+					let accessiblePages: Array<Record<string, unknown>> = [];
+					let pageAccessError: string | undefined;
+					try {
+						const pageResponse = graphListSchema.parse(
+							await callMetaGraph(env, "GET", "me/accounts", {
+								fields: "id,name,tasks",
+								limit: 100,
+							}),
+						);
+						accessiblePages = pageResponse.data;
+					} catch (error) {
+						pageAccessError = error instanceof Error ? error.message : "Unable to list Pages.";
+					}
 					const permissions = payload.data.map((item) => ({
 						permission: item.permission,
 						status: item.status,
@@ -385,11 +400,14 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							.map((item) => item.permission),
 					);
 					return asToolResult({
+						accessible_pages: accessiblePages,
+						page_access_error: pageAccessError,
 						permissions,
 						ready_for_reads: granted.has("ads_read") || granted.has("ads_management"),
 						ready_for_writes: granted.has("ads_management"),
 						write_switch_enabled:
 							env.META_WRITE_ENABLED?.trim().toLowerCase() === "true",
+						token_subject: tokenSubject,
 					});
 				} catch (error) {
 					return asToolError(error);
