@@ -10,7 +10,7 @@ const META_GRAPH_ORIGIN = "https://graph.facebook.com";
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
-const CONNECTOR_VERSION = "2.2.3";
+const CONNECTOR_VERSION = "2.2.4";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -46,6 +46,7 @@ const graphListSchema = z
 		data: z.array(z.record(z.string(), z.unknown())).default([]),
 		paging: z
 			.object({
+				next: z.string().optional(),
 				cursors: z
 					.object({ after: z.string().optional(), before: z.string().optional() })
 					.optional(),
@@ -370,13 +371,18 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 			{
 				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: true },
 				description:
-					"Read-only. Confirm the configured Meta ad account, status, currency, and timezone. Optionally search or validate bounded professional job-title IDs; never changes targeting or ads.",
+					"Read-only. Confirm the configured Meta ad account, status, currency, and timezone. Optionally inspect bounded job-title diagnostics or saved/custom audience metadata. Never retrieves audience members or changes targeting or ads.",
 				inputSchema: {
 					work_position_queries: z.array(z.string().trim().min(2).max(80)).min(1).max(5).optional(),
 					work_position_ids: z.array(z.string().regex(META_ID_PATTERN)).min(1).max(20).optional(),
+					audience_inventory: z.object({
+						kind: z.enum(["saved", "custom"]),
+						after: z.string().max(2_000).optional(),
+						limit: z.number().int().min(1).max(100).default(100),
+					}).strict().optional(),
 				},
 			},
-			async ({ work_position_queries, work_position_ids }) => {
+			async ({ work_position_queries, work_position_ids, audience_inventory }) => {
 				try {
 					const env = this.env as MetaEnv;
 					const { accountId, apiVersion } = getMetaConfig(env);
@@ -407,10 +413,33 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							workPositionValidation = { diagnostic_error: asToolError(error).content[0].text };
 						}
 					}
+					let audienceInventory: Record<string, unknown> | undefined;
+					if (audience_inventory) {
+						try {
+							const isSaved = audience_inventory.kind === "saved";
+							const params: Record<string, string | number | boolean | object> = {
+								fields: isSaved
+									? "id,name,description,targeting,approximate_count_lower_bound,approximate_count_upper_bound,operation_status,run_status,time_created,time_updated"
+									: "id,name,description,subtype,delivery_status,operation_status,approximate_count_lower_bound,approximate_count_upper_bound,data_source,customer_file_source,rule,time_created,time_updated",
+								limit: audience_inventory.limit,
+							};
+							if (audience_inventory.after) params.after = audience_inventory.after;
+							const response = graphListSchema.parse(await callMetaGraph(
+								env, "GET", `${accountId}/${isSaved ? "saved_audiences" : "customaudiences"}`, params,
+							));
+							audienceInventory = {
+								kind: audience_inventory.kind, audiences: response.data,
+								paging: pagingCursors(response.paging), has_next: Boolean(response.paging?.next),
+							};
+						} catch (error) {
+							audienceInventory = { kind: audience_inventory.kind, diagnostic_error: asToolError(error).content[0].text };
+						}
+					}
 					return asToolResult({
 						api_version: apiVersion, connector_version: CONNECTOR_VERSION, account,
 						work_position_search: workPositionSearch,
 						work_position_validation: workPositionValidation,
+						audience_inventory: audienceInventory,
 					});
 				} catch (error) {
 					return asToolError(error);

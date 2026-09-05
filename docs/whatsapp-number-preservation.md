@@ -87,3 +87,30 @@ specifies home/recent, not guaranteed residence-only targeting.
 API contract reference: the official Meta SDK `AdAccount.get_targeting_search`
 and `get_targeting_valid_a_t_i_on` in
 https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/adobjects/adaccount.py
+
+## Existing audience inventory — 2.2.4
+
+The user identified a possible existing audience named Médicos Sul. Account
+reads accept an optional `audience_inventory` with a strict `kind` of `saved`
+or `custom`, `limit` 1–100, and an optional opaque `after` cursor (max 2,000
+characters). The route is fixed to the configured account's `saved_audiences`
+or `customaudiences` GET edge. No member records are requested and no audience
+is created, edited or attached to an ad set by this diagnostic.
+
+Default account reads still perform one account GET. Metadata errors are
+isolated and explicit. Pagination exposes sanitized cursors and `has_next`;
+it never exposes or follows raw Graph paging URLs. A terminal `after` cursor
+without `next` does not imply another page. Search names locally without
+assuming a server filtering operator.
+
+A saved medical audience is a targeting preset, not proof of a physician list.
+Inspect its targeting and any custom-audience references. Custom subtype,
+data-source and delivery metadata distinguish lists from website, engagement
+or lookalike audiences; they do not establish professional credentials or
+consent of individual members. Name alone cannot authorize wider geography,
+age or professions. Preserve existing audience definitions and active ads.
+
+Official Meta SDK contract references:
+- https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/adobjects/savedaudience.py
+- https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/adobjects/customaudience.py
+- https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/api.py
