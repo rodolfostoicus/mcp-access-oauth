@@ -10,7 +10,7 @@ const META_GRAPH_ORIGIN = "https://graph.facebook.com";
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
-const CONNECTOR_VERSION = "2.2.2";
+const CONNECTOR_VERSION = "2.2.3";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -370,17 +370,48 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 			{
 				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: true },
 				description:
-					"Read-only. Confirm the configured Meta ad account, status, currency, and timezone.",
-				inputSchema: {},
+					"Read-only. Confirm the configured Meta ad account, status, currency, and timezone. Optionally search or validate bounded professional job-title IDs; never changes targeting or ads.",
+				inputSchema: {
+					work_position_queries: z.array(z.string().trim().min(2).max(80)).min(1).max(5).optional(),
+					work_position_ids: z.array(z.string().regex(META_ID_PATTERN)).min(1).max(20).optional(),
+				},
 			},
-			async () => {
+			async ({ work_position_queries, work_position_ids }) => {
 				try {
 					const env = this.env as MetaEnv;
 					const { accountId, apiVersion } = getMetaConfig(env);
 					const account = await callMetaGraph(env, "GET", accountId, {
 						fields: "id,name,account_status,currency,timezone_name",
 					});
-					return asToolResult({ api_version: apiVersion, connector_version: CONNECTOR_VERSION, account });
+					const workPositionSearch = work_position_queries
+						? await Promise.all(work_position_queries.map(async (query) => {
+							try {
+								const response = graphListSchema.parse(await callMetaGraph(env, "GET", `${accountId}/targetingsearch`, {
+									q: query, countries: ["BR"], limit_type: "work_positions",
+									whitelisted_types: ["work_positions"], limit: 20,
+									objective: "OUTCOME_ENGAGEMENT", optimization_goal: "CONVERSATIONS",
+								}));
+								return { query, results: response.data, paging: pagingCursors(response.paging) };
+							} catch (error) {
+								return { query, diagnostic_error: asToolError(error).content[0].text };
+							}
+						})) : undefined;
+					let workPositionValidation: Record<string, unknown> | undefined;
+					if (work_position_ids) {
+						try {
+							const response = graphListSchema.parse(await callMetaGraph(env, "GET", `${accountId}/targetingvalidation`, {
+								targeting_list: work_position_ids.map((id) => ({ type: "work_positions", id })),
+							}));
+							workPositionValidation = { results: response.data };
+						} catch (error) {
+							workPositionValidation = { diagnostic_error: asToolError(error).content[0].text };
+						}
+					}
+					return asToolResult({
+						api_version: apiVersion, connector_version: CONNECTOR_VERSION, account,
+						work_position_search: workPositionSearch,
+						work_position_validation: workPositionValidation,
+					});
 				} catch (error) {
 					return asToolError(error);
 				}
