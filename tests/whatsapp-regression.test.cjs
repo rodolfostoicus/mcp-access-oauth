@@ -347,8 +347,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("Page WhatsApp diagnostics are read-only and report connector version", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.2.3");
-  assert.equal(h.metadata.version, "2.2.3");
+  assert.equal(result.connector_version, "2.2.4");
+  assert.equal(h.metadata.version, "2.2.4");
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, true);
   assert.equal(result.write_switch_enabled, true);
@@ -388,9 +388,10 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.3");
+  assert.equal(result.connector_version, "2.2.4");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
+  assert.equal(Object.hasOwn(result, "audience_inventory"), false);
   assert.equal(h.calls.length, 1);
   assert.equal(h.calls[0].method, "GET");
   assert.equal(h.calls[0].path, `act_${ACCOUNT}`);
@@ -459,9 +460,89 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.3");
+  assert.equal(result.connector_version, "2.2.4");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
   assert.equal(h.kvWrites.length, 0);
+});
+
+test("saved and custom audience inventories use fixed account GET edges and sanitize pagination", async () => {
+  for (const kind of ["saved", "custom"]) {
+    const edge = kind === "saved" ? "saved_audiences" : "customaudiences";
+    const audiences = kind === "saved"
+      ? [{ id: "920001", name: "Médicos Sul", targeting: { age_min: 26, age_max: 55 } }]
+      : [{ id: "920002", name: "Médicos Sul", subtype: "CUSTOM", data_source: { type: "FILE_IMPORTED" } }];
+    const h = await harness({
+      respond(call) {
+        if (call.path === `act_${ACCOUNT}/${edge}`) {
+          return {
+            data: audiences,
+            paging: {
+              cursors: { before: "offline-before", after: "offline-after" },
+              ...(kind === "saved" ? {
+                next: `https://graph.facebook.com/v26.0/act_${ACCOUNT}/${edge}?access_token=FAKE_SECRET_MUST_NOT_RETURN`,
+              } : {}),
+            },
+          };
+        }
+      },
+    });
+    const input = { audience_inventory: { kind, ...(kind === "custom" ? { after: "opaque-next-page", limit: 17 } : {}) } };
+    const result = toolPayload(await h.invoke("meta_get_ad_account", input));
+    assert.equal(h.calls.length, 2); // account plus exactly one metadata page
+    const request = h.calls[1];
+    assert.equal(request.method, "GET");
+    assert.equal(request.path, `act_${ACCOUNT}/${edge}`);
+    assert.equal(request.params.limit, kind === "saved" ? "100" : "17");
+    assert.equal(request.params.after, kind === "saved" ? undefined : "opaque-next-page");
+    assert.match(request.params.fields, kind === "saved" ? /targeting/ : /data_source/);
+    assert.doesNotMatch(request.params.fields, /(^|,)users(,|$)/);
+    assert.equal(result.audience_inventory.kind, kind);
+    assert.deepEqual(result.audience_inventory.audiences, audiences);
+    assert.equal(result.audience_inventory.paging.after, "offline-after");
+    assert.equal(result.audience_inventory.has_next, kind === "saved");
+    // An after cursor alone must not imply another page; raw URL/token is private.
+    assert.doesNotMatch(JSON.stringify(result), /FAKE_SECRET_MUST_NOT_RETURN|graph\.facebook\.com|access_token/);
+    assert.equal(postCalls(h).length, 0);
+    assert.equal(h.kvWrites.length, 0);
+    assert.equal(h.kvReads.length, 0);
+  }
+});
+
+test("audience inventory bounds and injected account or endpoint reject before Graph access", async () => {
+  for (const audience_inventory of [
+    { kind: "members" },
+    { kind: "saved", limit: 0 },
+    { kind: "custom", limit: 101 },
+    { kind: "saved", limit: 1.5 },
+    { kind: "custom", after: "a".repeat(2001) },
+    { kind: "saved", account_id: "999999" },
+    { kind: "custom", path: "999999/users" },
+  ]) {
+    const h = await harness();
+    await assert.rejects(h.invoke("meta_get_ad_account", { audience_inventory }));
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.kvWrites.length, 0);
+  }
+});
+
+test("audience metadata failures remain isolated from the normal account result", async () => {
+  for (const kind of ["saved", "custom"]) {
+    const h = await harness({
+      respond(call) {
+        if (call.path.endsWith("/saved_audiences") || call.path.endsWith("/customaudiences")) {
+          return { httpStatus: 400, body: { error: { code: 100, message: "Offline audience inventory failure" } } };
+        }
+      },
+    });
+    const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
+    assert.equal(result.account.id, `act_${ACCOUNT}`);
+    assert.equal(result.connector_version, "2.2.4");
+    assert.equal(result.audience_inventory.kind, kind);
+    assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
+    assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
+    assert.equal(postCalls(h).length, 0);
+    assert.equal(h.kvWrites.length, 0);
+  }
 });
