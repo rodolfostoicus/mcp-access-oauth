@@ -1058,7 +1058,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						promotedObjectForMeta?.whatsapp_phone_number || "",
 					);
 					if (compatibilityWhatsappPhone) {
-						if (!/^\\d{10,15}$/.test(compatibilityWhatsappPhone)) {
+						if (!/^\d{10,15}$/.test(compatibilityWhatsappPhone)) {
 							throw new Error("promoted_object.whatsapp_phone_number must contain 10 to 15 digits.");
 						}
 						if (String(campaign.objective || "") !== "OUTCOME_ENGAGEMENT") {
