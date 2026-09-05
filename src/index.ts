@@ -10,6 +10,7 @@ const META_GRAPH_ORIGIN = "https://graph.facebook.com";
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
+const CONNECTOR_VERSION = "2.2.2";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -361,7 +362,7 @@ async function runIdempotentCreate(
 }
 
 export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
-	server = new McpServer({ name: "Meta Ads Stoicus Secure", version: "2.2.1" });
+	server = new McpServer({ name: "Meta Ads Stoicus Secure", version: CONNECTOR_VERSION });
 
 	async init() {
 		this.server.registerTool(
@@ -379,7 +380,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const account = await callMetaGraph(env, "GET", accountId, {
 						fields: "id,name,account_status,currency,timezone_name",
 					});
-					return asToolResult({ api_version: apiVersion, account });
+					return asToolResult({ api_version: apiVersion, connector_version: CONNECTOR_VERSION, account });
 				} catch (error) {
 					return asToolError(error);
 				}
@@ -416,6 +417,24 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					} catch (error) {
 						pageAccessError = error instanceof Error ? error.message : "Unable to list Pages.";
 					}
+					// Inspect only Pages already returned by the configured token. These
+					// read-only diagnostics must never invalidate the permissions result.
+					const pageWhatsappDiagnostics = await Promise.all(
+						accessiblePages.map(async (page) => {
+							const pageId = String(page.id || "");
+							try {
+								const details = await callMetaGraph(env, "GET", pageId, {
+									fields: "id,whatsapp_number,has_whatsapp_number,has_whatsapp_business_number",
+								});
+								return { page_id: pageId, ...z.record(z.string(), z.unknown()).parse(details) };
+							} catch (error) {
+								return {
+									page_id: pageId,
+									diagnostic_error: asToolError(error).content[0].text,
+								};
+							}
+						}),
+					);
 					let whatsappAssetDiagnostics: Record<string, unknown> = {};
 					try {
 						const account = z
@@ -485,8 +504,10 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							.map((item) => item.permission),
 					);
 					return asToolResult({
+						connector_version: CONNECTOR_VERSION,
 						accessible_pages: accessiblePages,
 						page_access_error: pageAccessError,
+						page_whatsapp_diagnostics: pageWhatsappDiagnostics,
 						whatsapp_assets: whatsappAssetDiagnostics,
 						permissions,
 						ready_for_reads: granted.has("ads_read") || granted.has("ads_management"),
@@ -1064,7 +1085,9 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						if (String(campaign.objective || "") !== "OUTCOME_ENGAGEMENT") {
 							throw new Error("WhatsApp conversations require an OUTCOME_ENGAGEMENT campaign.");
 						}
-						delete promotedObjectForMeta?.whatsapp_phone_number;
+						// This is a real Graph API field, not a helper-only marker.
+						// Preserve the selected phone so Meta does not resolve a different
+						// default number on a Page that has multiple linked numbers.
 					}
 					const resolvedOptimizationGoal = compatibilityWhatsappPhone
 						? "CONVERSATIONS"
