@@ -1623,7 +1623,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 	}
 }
 
-export default new OAuthProvider({
+const oauthProvider = new OAuthProvider({
 	apiHandler: MyMCP.serve("/mcp"),
 	apiRoute: "/mcp",
 	authorizeEndpoint: "/authorize",
@@ -1631,3 +1631,14 @@ export default new OAuthProvider({
 	defaultHandler: { fetch: handleAccessRequest as any },
 	tokenEndpoint: "/token",
 });
+
+export default {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+		const url = new URL(request.url);
+		if (url.pathname === "/mcp-v2") {
+			url.pathname = "/mcp";
+			request = new Request(url.toString(), request);
+		}
+		return oauthProvider.fetch(request, env, ctx);
+	},
+};
