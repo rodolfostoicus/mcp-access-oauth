@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { McpAgent } from "agents/mcp";
 import { z } from "zod";
 import { handleAccessRequest } from "./access-handler";
+import { getCreativeAssetResponse } from "./creative-assets";
 import type { Props } from "./workers-oauth-utils";
 
 const DEFAULT_META_API_VERSION = "v26.0";
@@ -10,7 +11,7 @@ const META_GRAPH_ORIGIN = "https://graph.facebook.com";
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
-const CONNECTOR_VERSION = "2.2.4";
+const CONNECTOR_VERSION = "2.2.5";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -677,7 +678,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					if (campaign_id) await getOwnedObject(env, "CAMPAIGN", campaign_id);
 					const params: Record<string, string | number> = {
 						fields:
-							"id,name,adset_id,campaign_id,status,effective_status,creative{id,name},created_time,updated_time",
+							"id,name,adset_id,campaign_id,status,effective_status,creative{id,name,object_story_spec,image_hash,thumbnail_url},created_time,updated_time",
 						limit,
 					};
 					if (after) params.after = after;
@@ -1750,6 +1751,8 @@ const oauthProvider = new OAuthProvider({
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+		const creativeAssetResponse = getCreativeAssetResponse(request);
+		if (creativeAssetResponse) return creativeAssetResponse;
 		const url = new URL(request.url);
 		if (url.pathname === "/mcp-v2") {
 			url.pathname = "/mcp";
