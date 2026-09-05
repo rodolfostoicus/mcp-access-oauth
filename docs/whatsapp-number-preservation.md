@@ -60,3 +60,30 @@ BREVAR objective or infer native WhatsApp eligibility from Lead Ads success.
 If this connector release introduces a regression, revert only this release
 through a reviewed follow-up commit and deploy with `--keep-vars`. Do not
 delete campaigns or alter the working WhatsApp provider as a rollback action.
+
+## Follow-up: opt-in professional-targeting diagnosis — 2.2.3
+
+Production 2.2.2 was confirmed by readback. Re-validating the selected phone
+advanced past the old WhatsApp error. Meta rejected Advantage+ with hard
+minimum age 26 (1870188), then rejected the strict audience using the single
+Medical Doctor (MD) job-title ID (2446395). Removing only that job-title filter
+in a validate-only diagnostic produced `success: true`; nothing was created.
+Changing home-only to home/recent did not resolve the job-title rejection.
+
+This does not authorize publishing without a medical-professional filter.
+The account read action now accepts optional, bounded `work_position_queries`
+(at most five) and `work_position_ids` (at most twenty) to query the account's
+read-only `targetingsearch` and `targetingvalidation` endpoints. Search is limited
+to job titles, BR, engagement/conversations, and twenty results per query.
+An ordinary empty account read performs no extra targeting requests. Errors
+remain explicit and isolated; no request is converted to a write.
+
+These are self-declared job titles, not CRM verification. Do not interpret a
+valid ID as proof of sufficient audience size or professional eligibility.
+The authorized age, profession, regions, budget and destination remain required
+before any actual ad-set creation. Meta's current location-types documentation
+specifies home/recent, not guaranteed residence-only targeting.
+
+API contract reference: the official Meta SDK `AdAccount.get_targeting_search`
+and `get_targeting_valid_a_t_i_on` in
+https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/adobjects/adaccount.py
