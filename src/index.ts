@@ -73,6 +73,15 @@ const promotedObjectSchema = z
 		message: "promoted_object must be at most 20,000 serialized characters.",
 	});
 
+const leadFormQuestionSchema = z
+	.object({
+		key: z.string().min(1).max(100).optional(),
+		label: z.string().min(1).max(500).optional(),
+		options: z.array(z.string().min(1).max(500)).min(2).max(20).optional(),
+		type: z.enum(["CITY", "CUSTOM", "EMAIL", "FULL_NAME", "PHONE", "STATE"]),
+	})
+	.strict();
+
 function getMetaConfig(env: MetaEnv) {
 	const accessToken = env.META_ACCESS_TOKEN?.trim();
 	const rawAccountId = env.META_AD_ACCOUNT_ID?.trim();
@@ -191,6 +200,22 @@ async function callMetaGraph(
 		throw new Error(safeMetaError(errorPayload, response.status));
 	}
 	return payload;
+}
+
+async function assertAccessiblePage(env: MetaEnv, pageId: string) {
+	const pages = graphListSchema.parse(
+		await callMetaGraph(env, "GET", "me/accounts", {
+			fields: "id,name,tasks",
+			limit: 100,
+		}),
+	).data;
+	const page = pages.find((item) => String(item.id || "") === pageId);
+	if (!page) throw new Error(`Page ${pageId} is not accessible to the configured token.`);
+	const tasks = Array.isArray(page.tasks) ? page.tasks.map(String) : [];
+	if (!tasks.includes("ADVERTISE") || !tasks.includes("MANAGE_LEADS")) {
+		throw new Error(`Page ${pageId} requires ADVERTISE and MANAGE_LEADS access.`);
+	}
+	return page;
 }
 
 async function getOwnedObject(
@@ -336,7 +361,7 @@ async function runIdempotentCreate(
 }
 
 export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
-	server = new McpServer({ name: "Meta Ads Stoicus Secure", version: "2.1.0" });
+	server = new McpServer({ name: "Meta Ads Stoicus Secure", version: "2.2.0" });
 
 	async init() {
 		this.server.registerTool(
@@ -372,6 +397,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 			async () => {
 				try {
 					const env = this.env as MetaEnv;
+					const { accountId } = getMetaConfig(env);
 					const [permissionResponse, tokenSubject] = await Promise.all([
 						callMetaGraph(env, "GET", "me/permissions", {}),
 						callMetaGraph(env, "GET", "me", { fields: "id,name" }),
@@ -390,6 +416,65 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					} catch (error) {
 						pageAccessError = error instanceof Error ? error.message : "Unable to list Pages.";
 					}
+					let whatsappAssetDiagnostics: Record<string, unknown> = {};
+					try {
+						const account = z
+							.object({ business: z.object({ id: z.string(), name: z.string().optional() }).optional() })
+							.passthrough()
+							.parse(
+								await callMetaGraph(env, "GET", accountId, {
+									fields: "business{id,name}",
+								}),
+							);
+						if (account.business) {
+							const [ownedResponse, clientResponse] = await Promise.allSettled([
+								callMetaGraph(
+									env,
+									"GET",
+									`${account.business.id}/owned_whatsapp_business_accounts`,
+									{ fields: "id,name", limit: 100 },
+								),
+								callMetaGraph(
+									env,
+									"GET",
+									`${account.business.id}/client_whatsapp_business_accounts`,
+									{ fields: "id,name", limit: 100 },
+								),
+							]);
+							whatsappAssetDiagnostics = {
+								business: account.business,
+								owned_whatsapp_business_accounts:
+									ownedResponse.status === "fulfilled"
+										? graphListSchema.parse(ownedResponse.value).data
+										: [],
+								owned_whatsapp_business_accounts_error:
+									ownedResponse.status === "rejected"
+										? ownedResponse.reason instanceof Error
+											? ownedResponse.reason.message
+											: "Unable to list owned WhatsApp Business Accounts."
+										: undefined,
+								client_whatsapp_business_accounts:
+									clientResponse.status === "fulfilled"
+										? graphListSchema.parse(clientResponse.value).data
+										: [],
+								client_whatsapp_business_accounts_error:
+									clientResponse.status === "rejected"
+										? clientResponse.reason instanceof Error
+											? clientResponse.reason.message
+											: "Unable to list shared WhatsApp Business Accounts."
+										: undefined,
+							};
+						} else {
+							whatsappAssetDiagnostics = {
+								whatsapp_asset_error: "The configured ad account has no Business Portfolio attached.",
+							};
+						}
+					} catch (error) {
+						whatsappAssetDiagnostics = {
+							whatsapp_asset_error:
+								error instanceof Error ? error.message : "Unable to inspect WhatsApp Business assets.",
+						};
+					}
 					const permissions = payload.data.map((item) => ({
 						permission: item.permission,
 						status: item.status,
@@ -402,6 +487,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					return asToolResult({
 						accessible_pages: accessiblePages,
 						page_access_error: pageAccessError,
+						whatsapp_assets: whatsappAssetDiagnostics,
 						permissions,
 						ready_for_reads: granted.has("ads_read") || granted.has("ads_management"),
 						ready_for_writes: granted.has("ads_management"),
@@ -1266,6 +1352,228 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						video_id,
 					});
 					return asToolResult(created);
+				} catch (error) {
+					return asToolError(error);
+				}
+			},
+		);
+
+		this.server.registerTool(
+			"meta_list_lead_forms",
+			{
+				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: true },
+				description: "Read-only. List Instant Forms owned by one accessible Facebook Page.",
+				inputSchema: {
+					after: z.string().max(2_000).optional(),
+					limit: z.number().int().min(1).max(100).default(25),
+					page_id: z.string().regex(META_ID_PATTERN),
+				},
+			},
+			async ({ after, limit, page_id }) => {
+				try {
+					const env = this.env as MetaEnv;
+					const page = await assertAccessiblePage(env, page_id);
+					const params: Record<string, string | number> = {
+						fields:
+							"id,name,status,created_time,locale,questions,privacy_policy_url,follow_up_action_url,is_optimized_for_quality",
+						limit,
+					};
+					if (after) params.after = after;
+					const response = graphListSchema.parse(
+						await callMetaGraph(env, "GET", `${page_id}/leadgen_forms`, params),
+					);
+					return asToolResult({
+						forms: response.data,
+						page: { id: page_id, name: page.name },
+						paging: pagingCursors(response.paging),
+					});
+				} catch (error) {
+					return asToolError(error);
+				}
+			},
+		);
+
+		this.server.registerTool(
+			"meta_create_lead_form",
+			{
+				annotations: {
+					destructiveHint: false,
+					idempotentHint: true,
+					openWorldHint: true,
+					readOnlyHint: false,
+				},
+				description:
+					"WRITE. Create one Meta Instant Form on an accessible Page. Exact confirmation and request_id are required. Forms do not spend money but may become selectable immediately.",
+				inputSchema: {
+					confirmation_phrase: z.string().max(700),
+					context_card: z
+						.object({
+							content: z.array(z.string().min(1).max(500)).min(1).max(20),
+							headline: z.string().min(1).max(500),
+							style: z.enum(["LIST_STYLE", "PARAGRAPH_STYLE"]).default("PARAGRAPH_STYLE"),
+						})
+						.optional(),
+					follow_up_action_url: z.string().url().max(2_000),
+					is_optimized_for_quality: z.boolean().default(true),
+					locale: z.string().min(2).max(20).default("pt_BR"),
+					name: z.string().min(1).max(500),
+					page_id: z.string().regex(META_ID_PATTERN),
+					privacy_policy_link_text: z.string().min(1).max(500),
+					privacy_policy_url: z.string().url().max(2_000),
+					questions: z.array(leadFormQuestionSchema).min(1).max(20),
+					request_id: z.string().uuid(),
+				},
+			},
+			async ({
+				confirmation_phrase,
+				context_card,
+				follow_up_action_url,
+				is_optimized_for_quality,
+				locale,
+				name,
+				page_id,
+				privacy_policy_link_text,
+				privacy_policy_url,
+				questions,
+				request_id,
+			}) => {
+				try {
+					const env = this.env as MetaEnv;
+					assertWritesEnabled(env);
+					await assertAccessiblePage(env, page_id);
+					assertConfirmation(confirmation_phrase, `CREATE LEAD FORM ${page_id} ${name}`);
+					for (const question of questions.filter((item) => item.type === "CUSTOM")) {
+						if (!question.label || !question.options || !question.key) {
+							throw new Error("CUSTOM questions require key, label, and at least two options.");
+						}
+					}
+					const params: Record<string, string | number | boolean | object> = {
+						follow_up_action_url,
+						is_optimized_for_quality,
+						locale,
+						name,
+						privacy_policy: {
+							link_text: privacy_policy_link_text,
+							url: privacy_policy_url,
+						},
+						questions,
+					};
+					if (context_card) params.context_card = context_card;
+					const created = await runIdempotentCreate(env, "lead-form", request_id, async () =>
+						writeResponseSchema.parse(
+							await callMetaGraph(env, "POST", `${page_id}/leadgen_forms`, params),
+						),
+					);
+					auditMutation("create_lead_form", { name, page_id, request_id });
+					return asToolResult(created);
+				} catch (error) {
+					return asToolError(error);
+				}
+			},
+		);
+
+		this.server.registerTool(
+			"meta_create_lead_form_video_ad_draft",
+			{
+				annotations: {
+					destructiveHint: false,
+					idempotentHint: true,
+					openWorldHint: true,
+					readOnlyHint: false,
+				},
+				description:
+					"WRITE/PREVIEW. Validate or create one PAUSED video ad connected to an existing Meta Instant Form.",
+				inputSchema: {
+					adset_id: z.string().regex(META_ID_PATTERN),
+					confirmation_phrase: z.string().max(700).optional(),
+					expected_adset_name: z.string().min(1).max(500),
+					headline: z.string().min(1).max(500),
+					instagram_actor_id: z.string().regex(META_ID_PATTERN).optional(),
+					lead_gen_form_id: z.string().regex(META_ID_PATTERN),
+					message: z.string().min(1).max(5_000),
+					name: z.string().min(1).max(500),
+					page_id: z.string().regex(META_ID_PATTERN),
+					request_id: z.string().uuid(),
+					validate_only: z.boolean().default(true),
+					video_id: z.string().regex(META_ID_PATTERN),
+				},
+			},
+			async ({
+				adset_id,
+				confirmation_phrase,
+				expected_adset_name,
+				headline,
+				instagram_actor_id,
+				lead_gen_form_id,
+				message,
+				name,
+				page_id,
+				request_id,
+				validate_only,
+				video_id,
+			}) => {
+				try {
+					const env = this.env as MetaEnv;
+					assertWritesEnabled(env);
+					const { accountId } = getMetaConfig(env);
+					const adset = await getOwnedObject(env, "ADSET", adset_id);
+					assertExpectedName(adset, expected_adset_name);
+					if (getPromotedPageId(adset) !== page_id) {
+						throw new Error(`page_id must match the promoted page on ad set ${adset_id}.`);
+					}
+					const form = z
+						.object({ id: z.string(), name: z.string(), status: z.string().optional() })
+						.passthrough()
+						.parse(
+							await callMetaGraph(env, "GET", lead_gen_form_id, { fields: "id,name,status" }),
+						);
+					const videoData: Record<string, unknown> = {
+						call_to_action: {
+							type: "LEARN_MORE",
+							value: { lead_gen_form_id },
+						},
+						message,
+						title: headline,
+						video_id,
+					};
+					const objectStorySpec: Record<string, unknown> = {
+						page_id,
+						video_data: videoData,
+					};
+					if (instagram_actor_id) objectStorySpec.instagram_actor_id = instagram_actor_id;
+					const params: Record<string, string | number | boolean | object> = {
+						adset_id,
+						creative: { object_story_spec: objectStorySpec },
+						name,
+						status: "PAUSED",
+					};
+					if (validate_only) {
+						params.execution_options = ["validate_only", "include_recommendations"];
+						const validation = await callMetaGraph(env, "POST", `${accountId}/ads`, params);
+						return asToolResult({ form, mode: "validate_only", status_for_create: "PAUSED", validation });
+					}
+					assertConfirmation(
+						confirmation_phrase || "",
+						`CREATE LEAD FORM VIDEO AD ${adset_id} ${name}`,
+					);
+					const created = await runIdempotentCreate(
+						env,
+						"lead-form-video-ad",
+						request_id,
+						async () =>
+							writeResponseSchema.parse(
+								await callMetaGraph(env, "POST", `${accountId}/ads`, params),
+							),
+					);
+					auditMutation("create_lead_form_video_ad", {
+						adset_id,
+						form_id: lead_gen_form_id,
+						name,
+						request_id,
+						status: "PAUSED",
+						video_id,
+					});
+					return asToolResult({ created, form });
 				} catch (error) {
 					return asToolError(error);
 				}
