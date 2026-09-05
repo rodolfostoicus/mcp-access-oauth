@@ -347,8 +347,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("Page WhatsApp diagnostics are read-only and report connector version", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.2.2");
-  assert.equal(h.metadata.version, "2.2.2");
+  assert.equal(result.connector_version, "2.2.3");
+  assert.equal(h.metadata.version, "2.2.3");
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, true);
   assert.equal(result.write_switch_enabled, true);
@@ -380,6 +380,88 @@ test("Page and WABA diagnostic failures preserve baseline permissions and identi
   assert.ok(page);
   assert.match(page.diagnostic_error, /Offline unsupported diagnostic field/);
   assert.match(result.whatsapp_assets.whatsapp_asset_error, /Offline unsupported diagnostic field/);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.kvWrites.length, 0);
+});
+
+test("account reads remain single-request by default and omit unrequested targeting diagnostics", async () => {
+  const h = await harness();
+  const result = toolPayload(await h.invoke("meta_get_ad_account"));
+  assert.equal(result.account.id, `act_${ACCOUNT}`);
+  assert.equal(result.connector_version, "2.2.3");
+  assert.equal(Object.hasOwn(result, "work_position_search"), false);
+  assert.equal(Object.hasOwn(result, "work_position_validation"), false);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].method, "GET");
+  assert.equal(h.calls[0].path, `act_${ACCOUNT}`);
+  assert.equal(h.kvWrites.length, 0);
+});
+
+test("opt-in work-position lookup and validation are bounded, Brazil-specific GET requests", async () => {
+  const positions = [{ id: "910001", name: "Physician", type: "work_positions" }];
+  const validation = [{ id: "910001", valid: true }, { id: "910002", valid: false }];
+  const h = await harness({
+    respond(call) {
+      if (call.path === `act_${ACCOUNT}/targetingsearch`) {
+        return { data: positions, paging: { cursors: { after: "offline-cursor" } } };
+      }
+      if (call.path === `act_${ACCOUNT}/targetingvalidation`) return { data: validation };
+    },
+  });
+  const result = toolPayload(await h.invoke("meta_get_ad_account", {
+    work_position_queries: ["Physician", "Emergency Physician"],
+    work_position_ids: ["910001", "910002"],
+  }));
+  assert.equal(result.account.id, `act_${ACCOUNT}`);
+  assert.equal(h.calls.length, 4); // account + two searches + one batched validation
+  assert.equal(postCalls(h).length, 0);
+  const searches = h.calls.filter(call => call.path.endsWith("/targetingsearch"));
+  assert.equal(searches.length, 2);
+  assert.deepEqual(searches.map(call => call.params.q), ["Physician", "Emergency Physician"]);
+  for (const call of searches) {
+    assert.equal(call.method, "GET");
+    assert.deepEqual(call.params.countries, ["BR"]);
+    assert.equal(call.params.limit_type, "work_positions");
+    assert.deepEqual(call.params.whitelisted_types, ["work_positions"]);
+    assert.equal(call.params.limit, "20");
+  }
+  const check = h.calls.find(call => call.path.endsWith("/targetingvalidation"));
+  assert.equal(check.method, "GET");
+  assert.deepEqual(check.params.targeting_list, [
+    { type: "work_positions", id: "910001" },
+    { type: "work_positions", id: "910002" },
+  ]);
+  assert.equal(result.work_position_search.length, 2);
+  assert.equal(result.work_position_search[0].query, "Physician");
+  assert.deepEqual(result.work_position_search[0].results, positions);
+  assert.deepEqual(result.work_position_validation.results, validation);
+  assert.equal(h.kvWrites.length, 0);
+});
+
+test("work-position schema bounds and transport failures preserve account-read safety", async () => {
+  for (const input of [
+    { work_position_queries: Array.from({ length: 6 }, () => "Physician") },
+    { work_position_ids: Array.from({ length: 21 }, (_, i) => String(910001 + i)) },
+    { work_position_ids: ["not-a-numeric-id"] },
+  ]) {
+    const h = await harness();
+    await assert.rejects(h.invoke("meta_get_ad_account", input));
+    assert.equal(h.calls.length, 0);
+  }
+  const h = await harness({
+    respond(call) {
+      if (call.path.endsWith("/targetingsearch") || call.path.endsWith("/targetingvalidation")) {
+        return { httpStatus: 400, body: { error: { code: 100, message: "Offline targeting diagnostic failure" } } };
+      }
+    },
+  });
+  const result = toolPayload(await h.invoke("meta_get_ad_account", {
+    work_position_queries: ["Physician"], work_position_ids: ["910001"],
+  }));
+  assert.equal(result.account.id, `act_${ACCOUNT}`);
+  assert.equal(result.connector_version, "2.2.3");
+  assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
+  assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
   assert.equal(h.kvWrites.length, 0);
 });
