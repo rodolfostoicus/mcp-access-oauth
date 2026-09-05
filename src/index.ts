@@ -361,7 +361,7 @@ async function runIdempotentCreate(
 }
 
 export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
-	server = new McpServer({ name: "Meta Ads Stoicus Secure", version: "2.2.0" });
+	server = new McpServer({ name: "Meta Ads Stoicus Secure", version: "2.2.1" });
 
 	async init() {
 		this.server.registerTool(
@@ -1051,25 +1051,46 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const { accountId } = getMetaConfig(env);
 					const campaign = await getOwnedObject(env, "CAMPAIGN", campaign_id);
 					assertExpectedName(campaign, expected_campaign_name);
+					const promotedObjectForMeta = promoted_object
+						? { ...promoted_object }
+						: undefined;
+					const compatibilityWhatsappPhone = String(
+						promotedObjectForMeta?.whatsapp_phone_number || "",
+					);
+					if (compatibilityWhatsappPhone) {
+						if (!/^\\d{10,15}$/.test(compatibilityWhatsappPhone)) {
+							throw new Error("promoted_object.whatsapp_phone_number must contain 10 to 15 digits.");
+						}
+						if (String(campaign.objective || "") !== "OUTCOME_ENGAGEMENT") {
+							throw new Error("WhatsApp conversations require an OUTCOME_ENGAGEMENT campaign.");
+						}
+						delete promotedObjectForMeta?.whatsapp_phone_number;
+					}
+					const resolvedOptimizationGoal = compatibilityWhatsappPhone
+						? "CONVERSATIONS"
+						: optimization_goal;
+					const resolvedDestinationType = compatibilityWhatsappPhone
+						? "WHATSAPP"
+						: destination_type;
 					const params: Record<string, string | number | boolean | object> = {
 						billing_event,
 						campaign_id,
 						name,
-						optimization_goal,
+						optimization_goal: resolvedOptimizationGoal,
 						status: "PAUSED",
 						targeting,
 					};
 					setOptionalBudget(params, daily_budget_minor, lifetime_budget_minor);
 					if (bid_strategy) params.bid_strategy = bid_strategy;
-					if (destination_type) {
-						params.destination_type = destination_type;
+					if (resolvedDestinationType) {
+						params.destination_type = resolvedDestinationType;
 					} else if (
-						optimization_goal === "LANDING_PAGE_VIEWS" ||
-						optimization_goal === "LINK_CLICKS"
+						resolvedOptimizationGoal === "LANDING_PAGE_VIEWS" ||
+						resolvedOptimizationGoal === "LINK_CLICKS"
 					) {
 						params.destination_type = "WEBSITE";
 					}
-					if (promoted_object) params.promoted_object = promoted_object;
+					if (promotedObjectForMeta) params.promoted_object = promotedObjectForMeta;
 					if (start_time) params.start_time = start_time;
 					if (end_time) params.end_time = end_time;
 					if (validate_only) {
@@ -1180,10 +1201,22 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const { accountId } = getMetaConfig(env);
 					const adset = await getOwnedObject(env, "ADSET", adset_id);
 					assertExpectedName(adset, expected_adset_name);
+					const parsedLink = new URL(link_url);
+					const isWhatsAppLink = parsedLink.hostname.toLowerCase() === "wa.me";
+					if (isWhatsAppLink) {
+						if (String(adset.destination_type || "") !== "WHATSAPP") {
+							throw new Error(`Ad set ${adset_id} must use destination_type WHATSAPP.`);
+						}
+						if (getPromotedPageId(adset) !== page_id) {
+							throw new Error(`page_id must match the promoted page on ad set ${adset_id}.`);
+						}
+					}
 					const linkData: Record<string, unknown> = {
 						call_to_action: {
-							type: call_to_action_type,
-							value: { link: link_url },
+							type: isWhatsAppLink ? "WHATSAPP_MESSAGE" : call_to_action_type,
+							value: isWhatsAppLink
+								? { app_destination: "WHATSAPP", link: link_url }
+								: { link: link_url },
 						},
 						link: link_url,
 						message,
