@@ -142,6 +142,7 @@ async function harness(options = {}) {
       if (name === "agents/mcp") return { McpAgent: MockAgent };
       if (name === "zod") return { z };
       if (name === "./access-handler") return { handleAccessRequest() { throw new Error("Authentication must not run."); } };
+      if (name === "./creative-assets") return { getCreativeAssetResponse() { return null; } };
       throw new Error(`Unexpected module in offline test: ${name}`);
     },
     fetch: mockFetch,
@@ -347,8 +348,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("Page WhatsApp diagnostics are read-only and report connector version", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.2.4");
-  assert.equal(h.metadata.version, "2.2.4");
+  assert.equal(result.connector_version, "2.2.5");
+  assert.equal(h.metadata.version, "2.2.5");
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, true);
   assert.equal(result.write_switch_enabled, true);
@@ -388,7 +389,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.4");
+  assert.equal(result.connector_version, "2.2.5");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -460,7 +461,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.4");
+  assert.equal(result.connector_version, "2.2.5");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -538,11 +539,59 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.2.4");
+    assert.equal(result.connector_version, "2.2.5");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
     assert.equal(postCalls(h).length, 0);
     assert.equal(h.kvWrites.length, 0);
   }
+});
+
+test("ad inventory exposes auditable creative fields through owned read-only edges", async () => {
+  const ads = [{
+    id: "900007", name: "Offline auditable ad", adset_id: ADSET, campaign_id: CAMPAIGN,
+    status: "PAUSED", effective_status: "PAUSED",
+    creative: {
+      id: "900008", name: "Offline creative", image_hash: "offline-image-hash",
+      thumbnail_url: "https://images.example/thumbnail.jpg",
+      object_story_spec: {
+        page_id: PAGE,
+        link_data: {
+          image_hash: "offline-image-hash", link: `https://wa.me/${PHONE}`,
+          call_to_action: { type: "WHATSAPP_MESSAGE", value: { app_destination: "WHATSAPP", link: `https://wa.me/${PHONE}` } },
+        },
+      },
+    },
+  }];
+  for (const [scope, parentId] of [[{ adset_id: ADSET }, ADSET], [{ campaign_id: CAMPAIGN }, CAMPAIGN], [{}, `act_${ACCOUNT}`]]) {
+    const h = await harness({
+      respond(call) {
+        if (call.path === `${parentId}/ads`) return {
+          data: ads,
+          paging: { cursors: { before: "offline-before", after: "offline-after" }, next: "https://graph.facebook.com/private-pagination-url" },
+        };
+      },
+    });
+    const result = toolPayload(await h.invoke("meta_list_ads", { ...scope, after: "cursor-in", limit: 7 }));
+    assert.deepEqual(result.ads, ads);
+    assert.deepEqual(result.paging, { before: "offline-before", after: "offline-after" });
+    const adsRead = h.calls.at(-1);
+    assert.equal(adsRead.method, "GET");
+    assert.equal(adsRead.path, `${parentId}/ads`);
+    assert.equal(adsRead.params.fields, "id,name,adset_id,campaign_id,status,effective_status,creative{id,name,object_story_spec,image_hash,thumbnail_url},created_time,updated_time");
+    assert.equal(adsRead.params.after, "cursor-in");
+    assert.equal(adsRead.params.limit, "7");
+    assert.equal(h.calls.length, Object.keys(scope).length ? 2 : 1);
+    if (Object.keys(scope).length) assert.equal(h.calls[0].path, parentId);
+    assert.equal(postCalls(h).length, 0);
+    assert.equal(h.kvReads.length, 0);
+    assert.equal(h.kvWrites.length, 0);
+  }
+  const wrongOwner = await harness({ adset: { ...adsetFixture, account_id: "999999" } });
+  const rejected = await wrongOwner.invoke("meta_list_ads", { adset_id: ADSET });
+  assert.equal(rejected.isError, true);
+  assert.equal(wrongOwner.calls.length, 1);
+  assert.equal(wrongOwner.calls[0].path, ADSET);
+  assert.equal(postCalls(wrongOwner).length, 0);
 });
