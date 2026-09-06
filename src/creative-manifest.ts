@@ -11,6 +11,11 @@ import asset7 from "./creative-data/acls-debriefing-feed-v3";
 import asset8 from "./creative-data/pals-avaliacao-pediatrica-feed-v2";
 import asset9 from "./creative-data/pals-lideranca-equipe-feed-v3";
 
+import asset10 from "./creative-data/brevar-oeste-preparo-feed";
+import asset11 from "./creative-data/brevar-oeste-preparo-stories";
+import asset12 from "./creative-data/brevar-oeste-regional-feed";
+import asset13 from "./creative-data/brevar-oeste-regional-stories";
+
 export const CREATIVE_ASSETS: Record<string, { mimeType: "image/jpeg" | "image/png"; base64: string }> = {
   "/creative-assets/brevar-preparo-feed-e0ab576a73501a45.jpg": { mimeType: "image/jpeg", base64: asset0 },
   "/creative-assets/brevar-fundamentos-feed-e25c570dca600000.jpg": { mimeType: "image/jpeg", base64: asset1 },
@@ -21,5 +26,9 @@ export const CREATIVE_ASSETS: Record<string, { mimeType: "image/jpeg" | "image/p
   "/creative-assets/acls-ritmo-desfibrilacao-feed-v2-271c190152aef06a.jpg": { mimeType: "image/jpeg", base64: asset6 },
   "/creative-assets/acls-debriefing-feed-v3-945073727862e82d.jpg": { mimeType: "image/jpeg", base64: asset7 },
   "/creative-assets/pals-avaliacao-pediatrica-feed-v2-7b631f100d10e279.jpg": { mimeType: "image/jpeg", base64: asset8 },
-  "/creative-assets/pals-lideranca-equipe-feed-v3-073882453f23d1e9.jpg": { mimeType: "image/jpeg", base64: asset9 }
+  "/creative-assets/pals-lideranca-equipe-feed-v3-073882453f23d1e9.jpg": { mimeType: "image/jpeg", base64: asset9 },
+  "/creative-assets/brevar-oeste-preparo-feed-9b503fe767c41b65.jpg": { mimeType: "image/jpeg", base64: asset10 },
+  "/creative-assets/brevar-oeste-preparo-stories-46e1e3cf4d0dc1a7.jpg": { mimeType: "image/jpeg", base64: asset11 },
+  "/creative-assets/brevar-oeste-regional-feed-7e7020f8549037b1.jpg": { mimeType: "image/jpeg", base64: asset12 },
+  "/creative-assets/brevar-oeste-regional-stories-78893973a4b01a45.jpg": { mimeType: "image/jpeg", base64: asset13 }
 };
