@@ -11,7 +11,7 @@ const META_GRAPH_ORIGIN = "https://graph.facebook.com";
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
-const CONNECTOR_VERSION = "2.2.7";
+const CONNECTOR_VERSION = "2.2.8";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -392,10 +392,12 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 			{
 				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: true },
 				description:
-					"Read-only. Confirm the configured Meta ad account, status, currency, and timezone. Optionally inspect bounded job-title diagnostics or saved/custom audience metadata. Never retrieves audience members or changes targeting or ads.",
+					"Read-only. Confirm the configured Meta ad account, status, currency, and timezone. Optionally inspect bounded job-title diagnostics, Brazilian city identifiers, aggregate reach estimates, or saved/custom audience metadata. Never retrieves audience members or changes targeting or ads.",
 				inputSchema: {
 					work_position_queries: z.array(z.string().trim().min(2).max(80)).min(1).max(5).optional(),
 					work_position_ids: z.array(z.string().regex(META_ID_PATTERN)).min(1).max(20).optional(),
+					geo_location_queries: z.array(z.string().trim().min(2).max(80)).min(1).max(5).optional(),
+					reach_estimate_targeting: targetingSchema.optional(),
 					audience_inventory: z.object({
 						kind: z.enum(["saved", "custom"]),
 						after: z.string().max(2_000).optional(),
@@ -403,7 +405,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					}).strict().optional(),
 				},
 			},
-			async ({ work_position_queries, work_position_ids, audience_inventory }) => {
+			async ({ work_position_queries, work_position_ids, geo_location_queries, reach_estimate_targeting, audience_inventory }) => {
 				try {
 					const env = this.env as MetaEnv;
 					const { accountId, apiVersion } = getMetaConfig(env);
@@ -434,6 +436,40 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							workPositionValidation = { diagnostic_error: asToolError(error).content[0].text };
 						}
 					}
+					const geoLocationSearch = geo_location_queries
+						? await Promise.all(geo_location_queries.map(async (query) => {
+							try {
+								const response = z.object({ data: z.array(z.object({
+									key: z.string(), name: z.string(), type: z.string().optional(),
+									country_code: z.string().optional(), country_name: z.string().optional(),
+									region: z.string().optional(), region_id: z.string().optional(),
+								})).max(20) }).parse(await callMetaGraph(env, "GET", "search", {
+									type: "adgeolocation", location_types: ["city"], country_code: "BR", q: query, limit: 20,
+								}));
+								// Whitelisted metadata only; never forward raw paging URLs or tokens.
+								return { query, results: response.data };
+							} catch (error) {
+								return { query, diagnostic_error: asToolError(error).content[0].text };
+							}
+						})) : undefined;
+					let reachEstimate: Record<string, unknown> | undefined;
+					if (reach_estimate_targeting) {
+						try {
+							const estimateSchema = z.object({
+								users_lower_bound: z.number().nonnegative().optional(),
+								users_upper_bound: z.number().nonnegative().optional(),
+								estimate_ready: z.boolean().optional(),
+							});
+							const response = z.object({
+								data: z.union([estimateSchema, z.array(estimateSchema).max(20)]),
+							}).parse(await callMetaGraph(env, "GET", `${accountId}/reachestimate`, {
+								targeting_spec: reach_estimate_targeting,
+							}));
+							reachEstimate = { results: Array.isArray(response.data) ? response.data : [response.data] };
+						} catch (error) {
+							reachEstimate = { diagnostic_error: asToolError(error).content[0].text };
+						}
+					}
 					let audienceInventory: Record<string, unknown> | undefined;
 					if (audience_inventory) {
 						try {
@@ -460,6 +496,8 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						api_version: apiVersion, connector_version: CONNECTOR_VERSION, account,
 						work_position_search: workPositionSearch,
 						work_position_validation: workPositionValidation,
+						geo_location_search: geoLocationSearch,
+						reach_estimate: reachEstimate,
 						audience_inventory: audienceInventory,
 					});
 				} catch (error) {
