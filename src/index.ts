@@ -11,7 +11,7 @@ const META_GRAPH_ORIGIN = "https://graph.facebook.com";
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
-const CONNECTOR_VERSION = "2.2.9";
+const CONNECTOR_VERSION = "2.2.10";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -686,10 +686,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 				inputSchema: {
 					after: z.string().max(2_000).optional(),
 					campaign_id: z.string().regex(META_ID_PATTERN).optional(),
+					include_targeting_diagnostics: z.boolean().default(false),
 					limit: z.number().int().min(1).max(100).default(25),
 				},
 			},
-			async ({ after, campaign_id, limit }) => {
+			async ({ after, campaign_id, include_targeting_diagnostics, limit }) => {
 				try {
 					const env = this.env as MetaEnv;
 					const { accountId } = getMetaConfig(env);
@@ -699,6 +700,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							"id,name,campaign_id,status,effective_status,daily_budget,lifetime_budget,optimization_goal,billing_event,bid_strategy,destination_type,targeting,promoted_object,start_time,end_time,adset_schedule,pacing_type,created_time,updated_time",
 						limit,
 					};
+					if (include_targeting_diagnostics) params.fields += ",targeting_optimization_types";
 					if (after) params.after = after;
 					const response = graphListSchema.parse(
 						await callMetaGraph(env, "GET", `${campaign_id || accountId}/adsets`, params),
@@ -1146,7 +1148,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					campaign_id: z.string().regex(META_ID_PATTERN),
 					confirmation_phrase: z.string().max(700).optional(),
 					daily_budget_minor: z.number().int().min(100).max(10_000_000).optional(),
-					destination_type: z.enum(["WEBSITE", "WHATSAPP"]).optional(),
+					destination_type: z.enum(["ON_POST", "WEBSITE", "WHATSAPP"]).optional(),
 					end_time: z.string().max(100).optional(),
 					expected_campaign_name: z.string().min(1).max(500),
 					lifetime_budget_minor: z
@@ -1163,6 +1165,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						"LEAD_GENERATION",
 						"LINK_CLICKS",
 						"OFFSITE_CONVERSIONS",
+						"POST_ENGAGEMENT",
 						"REACH",
 					]),
 					promoted_object: promotedObjectSchema.optional(),
@@ -1194,6 +1197,29 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 				try {
 					const env = this.env as MetaEnv;
 					assertWritesEnabled(env);
+					const promotedObjectForMeta = promoted_object
+						? { ...promoted_object }
+						: undefined;
+					const compatibilityWhatsappPhone = String(
+						promotedObjectForMeta?.whatsapp_phone_number || "",
+					);
+					if (compatibilityWhatsappPhone && !/^\d{10,15}$/.test(compatibilityWhatsappPhone)) {
+						throw new Error("promoted_object.whatsapp_phone_number must contain 10 to 15 digits.");
+					}
+					if (compatibilityWhatsappPhone && destination_type !== undefined && destination_type !== "WHATSAPP") {
+						throw new Error(`destination_type ${destination_type} conflicts with promoted_object.whatsapp_phone_number.`);
+					}
+					if (destination_type === "WHATSAPP") {
+						if (!compatibilityWhatsappPhone) {
+							throw new Error("Explicit WHATSAPP destination requires promoted_object.whatsapp_phone_number.");
+						}
+						if (optimization_goal !== "CONVERSATIONS" && optimization_goal !== "LINK_CLICKS") {
+							throw new Error("Explicit WHATSAPP destination requires optimization_goal CONVERSATIONS or LINK_CLICKS.");
+						}
+					}
+					if (destination_type === "ON_POST" && optimization_goal !== "POST_ENGAGEMENT" && optimization_goal !== "REACH") {
+						throw new Error("Explicit ON_POST destination requires optimization_goal POST_ENGAGEMENT or REACH.");
+					}
 					const { accountId } = getMetaConfig(env);
 					const campaign = await getOwnedObject(env, "CAMPAIGN", campaign_id);
 					assertExpectedName(campaign, expected_campaign_name);
@@ -1212,24 +1238,18 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							throw new Error("Scheduled creation requires ordered start_time/end_time with explicit timezone offsets.");
 						}
 					}
-					const promotedObjectForMeta = promoted_object
-						? { ...promoted_object }
-						: undefined;
-					const compatibilityWhatsappPhone = String(
-						promotedObjectForMeta?.whatsapp_phone_number || "",
-					);
 					if (compatibilityWhatsappPhone) {
-						if (!/^\d{10,15}$/.test(compatibilityWhatsappPhone)) {
-							throw new Error("promoted_object.whatsapp_phone_number must contain 10 to 15 digits.");
-						}
 						if (String(campaign.objective || "") !== "OUTCOME_ENGAGEMENT") {
-							throw new Error("WhatsApp conversations require an OUTCOME_ENGAGEMENT campaign.");
+							throw new Error("WhatsApp ad sets require an OUTCOME_ENGAGEMENT campaign.");
 						}
 						// This is a real Graph API field, not a helper-only marker.
 						// Preserve the selected phone so Meta does not resolve a different
 						// default number on a Page that has multiple linked numbers.
 					}
-					const resolvedOptimizationGoal = compatibilityWhatsappPhone
+					// Legacy callers omit destination_type and historically resolve to
+					// conversations. An explicit WhatsApp destination preserves the
+					// requested supported goal instead of silently replacing it.
+					const resolvedOptimizationGoal = compatibilityWhatsappPhone && destination_type === undefined
 						? "CONVERSATIONS"
 						: optimization_goal;
 					const resolvedDestinationType = compatibilityWhatsappPhone
@@ -1270,6 +1290,8 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						);
 						return asToolResult({
 							mode: "validate_only",
+							resolved_destination_type: params.destination_type ?? null,
+							resolved_optimization_goal: params.optimization_goal,
 							status_for_create: "PAUSED",
 							validation,
 						});
