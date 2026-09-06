@@ -11,7 +11,7 @@ const META_GRAPH_ORIGIN = "https://graph.facebook.com";
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
-const CONNECTOR_VERSION = "2.2.5";
+const CONNECTOR_VERSION = "2.2.6";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -69,6 +69,26 @@ const targetingSchema = z
 	.refine((value) => JSON.stringify(value).length <= 50_000, {
 		message: "targeting must be at most 50,000 serialized characters.",
 	});
+
+// Account-timezone delivery windows; scheduling is opt-in and never inferred.
+const adsetScheduleSchema = z.array(z.object({
+	days: z.array(z.number().int().min(0).max(6)).min(1).max(7),
+	start_minute: z.number().int().min(0).max(1380).multipleOf(60),
+	end_minute: z.number().int().min(60).max(1440).multipleOf(60),
+	timezone_type: z.literal("ADVERTISER"),
+}).strict().refine((window) => window.end_minute > window.start_minute, {
+	message: "Each schedule window must end after it starts; split overnight windows.",
+})).min(1).max(49).superRefine((windows, ctx) => {
+	for (let day = 0; day < 7; day++) {
+		const intervals = windows.filter((window) => window.days.includes(day))
+			.sort((a, b) => a.start_minute - b.start_minute);
+		for (let i = 1; i < intervals.length; i++) {
+			if (intervals[i].start_minute < intervals[i - 1].end_minute) {
+				ctx.addIssue({ code: "custom", message: "Schedule windows must not overlap." });
+			}
+		}
+	}
+});
 
 const promotedObjectSchema = z
 	.record(z.string(), z.unknown())
@@ -637,7 +657,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					if (campaign_id) await getOwnedObject(env, "CAMPAIGN", campaign_id);
 					const params: Record<string, string | number> = {
 						fields:
-							"id,name,campaign_id,status,effective_status,daily_budget,lifetime_budget,optimization_goal,billing_event,bid_strategy,destination_type,targeting,promoted_object,start_time,end_time,created_time,updated_time",
+							"id,name,campaign_id,status,effective_status,daily_budget,lifetime_budget,optimization_goal,billing_event,bid_strategy,destination_type,targeting,promoted_object,start_time,end_time,adset_schedule,pacing_type,created_time,updated_time",
 						limit,
 					};
 					if (after) params.after = after;
@@ -1072,6 +1092,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 				description:
 					"WRITE/PREVIEW. Validate or create one ad set under an owned campaign. Real creation is always PAUSED and requires exact confirmation.",
 				inputSchema: {
+					adset_schedule: adsetScheduleSchema.optional(),
 					bid_strategy: z
 						.enum([
 							"LOWEST_COST_WITHOUT_CAP",
@@ -1110,6 +1131,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 				},
 			},
 			async ({
+				adset_schedule,
 				bid_strategy,
 				billing_event,
 				campaign_id,
@@ -1133,6 +1155,21 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const { accountId } = getMetaConfig(env);
 					const campaign = await getOwnedObject(env, "CAMPAIGN", campaign_id);
 					assertExpectedName(campaign, expected_campaign_name);
+					if (adset_schedule) {
+						// CBO pacing belongs on the campaign; do not silently mix levels.
+						if (Number(campaign.daily_budget || 0) > 0 || Number(campaign.lifetime_budget || 0) > 0) {
+							throw new Error("Scheduled creation currently requires an ad-set lifetime budget and no campaign budget.");
+						}
+						if (!lifetime_budget_minor || daily_budget_minor !== undefined) {
+							throw new Error("adset_schedule requires lifetime_budget_minor and no daily budget.");
+						}
+						const explicitZone = /(Z|[+-]\d{2}:?\d{2})$/;
+						if (!start_time || !end_time || !explicitZone.test(start_time) || !explicitZone.test(end_time)
+							|| !Number.isFinite(Date.parse(start_time)) || !Number.isFinite(Date.parse(end_time))
+							|| Date.parse(end_time) <= Date.parse(start_time)) {
+							throw new Error("Scheduled creation requires ordered start_time/end_time with explicit timezone offsets.");
+						}
+					}
 					const promotedObjectForMeta = promoted_object
 						? { ...promoted_object }
 						: undefined;
@@ -1177,6 +1214,10 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					if (promotedObjectForMeta) params.promoted_object = promotedObjectForMeta;
 					if (start_time) params.start_time = start_time;
 					if (end_time) params.end_time = end_time;
+					if (adset_schedule) {
+						params.adset_schedule = adset_schedule;
+						params.pacing_type = ["day_parting"];
+					}
 					if (validate_only) {
 						params.execution_options = ["validate_only", "include_recommendations"];
 						const validation = await callMetaGraph(
