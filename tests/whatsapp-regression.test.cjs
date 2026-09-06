@@ -348,8 +348,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("Page WhatsApp diagnostics are read-only and report connector version", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.2.7");
-  assert.equal(h.metadata.version, "2.2.7");
+  assert.equal(result.connector_version, "2.2.8");
+  assert.equal(h.metadata.version, "2.2.8");
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, true);
   assert.equal(result.write_switch_enabled, true);
@@ -389,10 +389,12 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.7");
+  assert.equal(result.connector_version, "2.2.8");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
+  assert.equal(Object.hasOwn(result, "geo_location_search"), false);
+  assert.equal(Object.hasOwn(result, "reach_estimate"), false);
   assert.equal(h.calls.length, 1);
   assert.equal(h.calls[0].method, "GET");
   assert.equal(h.calls[0].path, `act_${ACCOUNT}`);
@@ -461,11 +463,105 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.7");
+  assert.equal(result.connector_version, "2.2.8");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
   assert.equal(h.kvWrites.length, 0);
+});
+
+test("city diagnostics use bounded Brazil city GET searches and return only location metadata", async () => {
+  const city = { key: "930001", name: "Chapecó", type: "city", country_code: "BR", country_name: "Brazil", region: "Santa Catarina", region_id: "459" };
+  const h = await harness({
+    respond(call) {
+      if (call.path === "search") return {
+        data: [{ ...city, raw_url: "https://graph.facebook.com/?access_token=FAKE_SECRET_MUST_NOT_RETURN" }],
+        paging: { next: "https://graph.facebook.com/?access_token=FAKE_SECRET_MUST_NOT_RETURN", cursors: { after: "private-cursor" } },
+      };
+    },
+  });
+  const result = toolPayload(await h.invoke("meta_get_ad_account", { geo_location_queries: [" Chapecó ", "Videira"] }));
+  assert.equal(h.calls.length, 3);
+  assert.deepEqual(h.calls.slice(1).map(call => call.params.q), ["Chapecó", "Videira"]);
+  for (const call of h.calls.slice(1)) {
+    assert.equal(call.method, "GET");
+    assert.equal(call.path, "search");
+    assert.deepEqual(call.params, { type: "adgeolocation", location_types: ["city"], country_code: "BR", q: call.params.q, limit: "20" });
+  }
+  assert.deepEqual(result.geo_location_search, [
+    { query: "Chapecó", results: [city] }, { query: "Videira", results: [city] },
+  ]);
+  assert.doesNotMatch(JSON.stringify(result), /FAKE_SECRET|access_token|paging|private-cursor/);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.kvWrites.length, 0);
+  assert.equal(h.kvReads.length, 0);
+});
+
+test("reach estimation preserves nested targeting and normalizes only aggregate data from object or array responses", async () => {
+  const targeting = {
+    age_min: 26, age_max: 54,
+    geo_locations: { cities: [{ key: "930001" }] },
+    flexible_spec: [{ work_positions: [{ id: "910001" }, { id: "910002" }] }],
+    targeting_automation: { advantage_audience: 0 }, user_age_unknown: false,
+  };
+  const estimate = { users_lower_bound: 0, users_upper_bound: 1000, estimate_ready: false };
+  for (const asArray of [false, true]) {
+    const h = await harness({
+      respond(call) {
+        if (call.path === `act_${ACCOUNT}/reachestimate`) return {
+          data: asArray ? [{ ...estimate, access_token: "FAKE_SECRET_MUST_NOT_RETURN" }] : { ...estimate, access_token: "FAKE_SECRET_MUST_NOT_RETURN" },
+          paging: { next: "https://graph.facebook.com/?access_token=FAKE_SECRET_MUST_NOT_RETURN" },
+        };
+      },
+    });
+    const result = toolPayload(await h.invoke("meta_get_ad_account", { reach_estimate_targeting: targeting }));
+    assert.equal(h.calls.length, 2);
+    assert.deepEqual(h.calls[1], { method: "GET", path: `act_${ACCOUNT}/reachestimate`, params: { targeting_spec: targeting } });
+    assert.deepEqual(result.reach_estimate, { results: [estimate] });
+    assert.doesNotMatch(JSON.stringify(result), /FAKE_SECRET|access_token|paging/);
+    assert.equal(postCalls(h).length, 0);
+    assert.equal(h.kvWrites.length, 0);
+    assert.equal(h.kvReads.length, 0);
+  }
+});
+
+test("city and reach input bounds reject oversized diagnostic requests before network access", async () => {
+  for (const input of [
+    { geo_location_queries: [] },
+    { geo_location_queries: Array(6).fill("Chapecó") },
+    { geo_location_queries: [" "] },
+    { geo_location_queries: ["X".repeat(81)] },
+    { reach_estimate_targeting: "not-an-object" },
+    { reach_estimate_targeting: { oversized: "X".repeat(50_000) } },
+  ]) {
+    const h = await harness();
+    await assert.rejects(h.invoke("meta_get_ad_account", input));
+    assert.equal(h.calls.length, 0);
+  }
+});
+
+test("city and reach failures remain isolated diagnostics and preserve the account read", async () => {
+  const h = await harness({
+    respond(call) {
+      if (call.path === "search" && call.params.q === "Chapecó") return {
+        httpStatus: 400, body: { error: { code: 100, message: "Offline city diagnostic failure" } },
+      };
+      if (call.path === "search") return { data: [] };
+      if (call.path.endsWith("/reachestimate")) return {
+        httpStatus: 400, body: { error: { code: 100, message: "Offline reach diagnostic failure" } },
+      };
+    },
+  });
+  const result = toolPayload(await h.invoke("meta_get_ad_account", {
+    geo_location_queries: ["Chapecó", "Videira"], reach_estimate_targeting: { geo_locations: { countries: ["BR"] } },
+  }));
+  assert.equal(result.account.id, `act_${ACCOUNT}`);
+  assert.match(result.geo_location_search[0].diagnostic_error, /Offline city diagnostic failure/);
+  assert.deepEqual(result.geo_location_search[1], { query: "Videira", results: [] });
+  assert.match(result.reach_estimate.diagnostic_error, /Offline reach diagnostic failure/);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.kvWrites.length, 0);
+  assert.equal(h.kvReads.length, 0);
 });
 
 test("saved and custom audience inventories use fixed account GET edges and sanitize pagination", async () => {
@@ -539,7 +635,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.2.7");
+    assert.equal(result.connector_version, "2.2.8");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
