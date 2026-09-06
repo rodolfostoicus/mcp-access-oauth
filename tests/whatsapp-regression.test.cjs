@@ -186,7 +186,7 @@ function adsetInput(overrides = {}) {
     expected_campaign_name: CAMPAIGN_NAME,
     name: ADSET_NAME,
     optimization_goal: "LINK_CLICKS", // existing, legacy-compatible tool input
-    destination_type: "WEBSITE",
+    // Legacy callers did not have destination_type in their tool catalog.
     promoted_object: { page_id: PAGE, whatsapp_phone_number: PHONE },
     targeting: { age_min: 26, age_max: 55, geo_locations: { countries: ["BR"] } },
     request_id: REQUEST_ID,
@@ -233,6 +233,8 @@ test("selected WhatsApp phone survives the actual validate-only Graph payload", 
   assert.deepEqual(posts[0].params.targeting, input.targeting);
   assert.deepEqual(posts[0].params.execution_options, ["validate_only", "include_recommendations"]);
   assert.equal(result.mode, "validate_only");
+  assert.equal(result.resolved_destination_type, posts[0].params.destination_type);
+  assert.equal(result.resolved_optimization_goal, posts[0].params.optimization_goal);
   assert.equal(result.status_for_create, "PAUSED");
   assert.equal(input.promoted_object.whatsapp_phone_number, PHONE);
   assert.equal(h.kvWrites.length, 0);
@@ -249,6 +251,37 @@ test("malformed WhatsApp phone is rejected before any Graph POST", async () => {
   assert.match(result.content[0].text, /10 to 15 digits/);
   assert.equal(postCalls(h).length, 0);
   assert.equal(h.kvWrites.length, 0);
+});
+
+for (const [label, overrides, errorPattern] of [
+  ["conflicting website destination", { destination_type: "WEBSITE" }, /conflicts/],
+  ["missing selected phone", {
+    destination_type: "WHATSAPP", promoted_object: { page_id: PAGE },
+  }, /requires promoted_object.whatsapp_phone_number/],
+  ...["IMPRESSIONS", "LANDING_PAGE_VIEWS", "LEAD_GENERATION", "OFFSITE_CONVERSIONS", "POST_ENGAGEMENT", "REACH"]
+    .map(goal => [`unsupported ${goal} goal`, {
+      destination_type: "WHATSAPP", optimization_goal: goal,
+    }, /requires optimization_goal CONVERSATIONS or LINK_CLICKS/]),
+]) test(`explicit WhatsApp rejects ${label} before any Graph request`, async () => {
+  const h = await harness();
+  const result = await h.invoke("meta_create_adset_draft", adsetInput(overrides));
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, errorPattern);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.kvWrites.length, 0);
+  assert.equal(h.auditEvents.length, 0);
+});
+
+test("legacy IMPRESSIONS input without destination still resolves to WhatsApp conversations", async () => {
+  const h = await harness();
+  const result = toolPayload(await h.invoke("meta_create_adset_draft", adsetInput({
+    optimization_goal: "IMPRESSIONS",
+  })));
+  const { params } = postCalls(h)[0];
+  assert.equal(params.destination_type, "WHATSAPP");
+  assert.equal(params.optimization_goal, "CONVERSATIONS");
+  assert.equal(result.resolved_destination_type, params.destination_type);
+  assert.equal(result.resolved_optimization_goal, params.optimization_goal);
 });
 
 test("missing campaign input is rejected by the actual MCP schema", async () => {
@@ -277,7 +310,7 @@ for (const [label, fixture, errorPattern] of [
 
 test("website ad-set payload remains website and preserves its promoted object", async () => {
   const h = await harness({ campaign: { ...campaignFixture, objective: "OUTCOME_TRAFFIC" } });
-  toolPayload(await h.invoke("meta_create_adset_draft", adsetInput({
+  const result = toolPayload(await h.invoke("meta_create_adset_draft", adsetInput({
     promoted_object: { page_id: PAGE }, destination_type: undefined,
   })));
   const { params } = postCalls(h)[0];
@@ -285,12 +318,14 @@ test("website ad-set payload remains website and preserves its promoted object",
   assert.equal(params.optimization_goal, "LINK_CLICKS");
   assert.deepEqual(params.promoted_object, { page_id: PAGE });
   assert.equal(params.status, "PAUSED");
+  assert.equal(result.resolved_destination_type, params.destination_type);
+  assert.equal(result.resolved_optimization_goal, params.optimization_goal);
   assert.equal(h.kvWrites.length, 0);
 });
 
 test("lead-generation path is unchanged and does not acquire WhatsApp routing", async () => {
   const h = await harness({ campaign: { ...campaignFixture, objective: "OUTCOME_LEADS" } });
-  toolPayload(await h.invoke("meta_create_adset_draft", adsetInput({
+  const result = toolPayload(await h.invoke("meta_create_adset_draft", adsetInput({
     promoted_object: { page_id: PAGE }, destination_type: undefined,
     optimization_goal: "LEAD_GENERATION",
   })));
@@ -299,6 +334,8 @@ test("lead-generation path is unchanged and does not acquire WhatsApp routing", 
   assert.equal(Object.hasOwn(params, "destination_type"), false);
   assert.deepEqual(params.promoted_object, { page_id: PAGE });
   assert.equal(params.status, "PAUSED");
+  assert.equal(result.resolved_destination_type, null);
+  assert.equal(result.resolved_optimization_goal, params.optimization_goal);
   assert.equal(h.kvWrites.length, 0);
 });
 
@@ -348,8 +385,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("Page WhatsApp diagnostics are read-only and report connector version", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.2.9");
-  assert.equal(h.metadata.version, "2.2.9");
+  assert.equal(result.connector_version, "2.2.10");
+  assert.equal(h.metadata.version, "2.2.10");
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, true);
   assert.equal(result.write_switch_enabled, true);
@@ -389,7 +426,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.9");
+  assert.equal(result.connector_version, "2.2.10");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -463,7 +500,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.9");
+  assert.equal(result.connector_version, "2.2.10");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -669,7 +706,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.2.9");
+    assert.equal(result.connector_version, "2.2.10");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -732,6 +769,108 @@ const scheduledInput = (overrides = {}) => adsetInput({
   start_time: "2026-09-07T08:00:00-02:00",
   end_time: "2026-09-14T08:00:00-02:00",
   adset_schedule: [scheduleWindow], ...overrides,
+});
+for (const goal of ["LINK_CLICKS", "CONVERSATIONS"]) {
+  for (const validateOnly of [true, false]) {
+    test(`explicit WhatsApp ${goal} ${validateOnly ? "validation" : "creation"} preserves medical targeting, schedule, phone, budget and pause`, async () => {
+      const h = await harness({ respond(call) {
+        if (call.method === "POST" && call.path === `act_${ACCOUNT}/adsets`) {
+          return validateOnly ? { success: true } : { id: ADSET };
+        }
+      } });
+      const input = scheduledInput({
+        destination_type: "WHATSAPP", optimization_goal: goal,
+        targeting: {
+          age_min: 26, age_max: 54,
+          geo_locations: { cities: [{ key: "249674" }] },
+          excluded_geo_locations: { countries: ["AR"], regions: [{ key: "452" }, { key: "456" }] },
+          flexible_spec: [{ work_positions: [{ id: "125395097503911" }, { id: "138787906146791" }] }],
+          targeting_automation: { advantage_audience: 0 },
+        },
+        validate_only: validateOnly,
+        confirmation_phrase: `CREATE ADSET ${CAMPAIGN} ${ADSET_NAME}`,
+      });
+      const inputSnapshot = JSON.stringify(input);
+      const result = toolPayload(await h.invoke("meta_create_adset_draft", input));
+      const posts = postCalls(h);
+      assert.equal(posts.length, 1);
+      const { params } = posts[0];
+      assert.equal(params.destination_type, "WHATSAPP");
+      assert.equal(params.optimization_goal, goal);
+      assert.equal(params.status, "PAUSED");
+      assert.deepEqual(params.promoted_object, input.promoted_object);
+      assert.deepEqual(params.targeting, input.targeting);
+      assert.deepEqual(params.adset_schedule, input.adset_schedule);
+      assert.deepEqual(params.pacing_type, ["day_parting"]);
+      assert.equal(params.start_time, input.start_time);
+      assert.equal(params.end_time, input.end_time);
+      assert.equal(params.lifetime_budget, "40000");
+      assert.equal(JSON.stringify(input), inputSnapshot);
+      if (validateOnly) {
+        assert.equal(result.resolved_destination_type, params.destination_type);
+        assert.equal(result.resolved_optimization_goal, params.optimization_goal);
+        assert.equal(result.status_for_create, "PAUSED");
+        assert.deepEqual(params.execution_options, ["validate_only", "include_recommendations"]);
+        assert.equal(h.kvWrites.length, 0);
+        assert.equal(h.auditEvents.length, 0);
+      } else {
+        assert.equal(result.result.id, ADSET);
+        assert.equal(result.idempotent_replay, false);
+        assert.equal(Object.hasOwn(params, "execution_options"), false);
+        assert.equal(h.kvWrites.length, 1);
+        assert.equal(h.auditEvents.length, 1);
+      }
+    });
+  }
+}
+test("explicit WhatsApp LINK_CLICKS still requires confirmation before creation", async () => {
+  const h = await harness();
+  const result = await h.invoke("meta_create_adset_draft", scheduledInput({
+    destination_type: "WHATSAPP", optimization_goal: "LINK_CLICKS", validate_only: false,
+  }));
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Confirmation mismatch/);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.kvWrites.length, 0);
+});
+for (const goal of ["POST_ENGAGEMENT", "REACH"]) {
+  test(`ON_POST ${goal} remains independent of WhatsApp routing`, async () => {
+    const h = await harness();
+    const input = scheduledInput({
+      destination_type: "ON_POST", optimization_goal: goal,
+      promoted_object: { page_id: PAGE },
+    });
+    const result = toolPayload(await h.invoke("meta_create_adset_draft", input));
+    const { params } = postCalls(h)[0];
+    assert.equal(params.destination_type, "ON_POST");
+    assert.equal(params.optimization_goal, goal);
+    assert.deepEqual(params.promoted_object, { page_id: PAGE });
+    assert.deepEqual(params.targeting, input.targeting);
+    assert.deepEqual(params.adset_schedule, input.adset_schedule);
+    assert.equal(params.lifetime_budget, "40000");
+    assert.equal(params.status, "PAUSED");
+    assert.equal(result.resolved_destination_type, params.destination_type);
+    assert.equal(result.resolved_optimization_goal, params.optimization_goal);
+    assert.equal(h.kvWrites.length, 0);
+  });
+}
+for (const [label, overrides, pattern] of [
+  ["selected WhatsApp phone", {}, /conflicts/],
+  ["conversations goal", {
+    promoted_object: { page_id: PAGE }, optimization_goal: "CONVERSATIONS",
+  }, /requires optimization_goal POST_ENGAGEMENT or REACH/],
+  ["link-click goal", {
+    promoted_object: { page_id: PAGE }, optimization_goal: "LINK_CLICKS",
+  }, /requires optimization_goal POST_ENGAGEMENT or REACH/],
+]) test(`ON_POST rejects ${label} before any Graph request`, async () => {
+  const h = await harness();
+  const result = await h.invoke("meta_create_adset_draft", adsetInput({
+    destination_type: "ON_POST", optimization_goal: "POST_ENGAGEMENT", ...overrides,
+  }));
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, pattern);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.kvWrites.length, 0);
 });
 test("scheduled WhatsApp validation sends account-timezone windows and preserves phone", async () => {
   const h = await harness();
@@ -831,5 +970,22 @@ for (const [label, budget] of [
       assert.equal(Object.hasOwn(params, "execution_options"), false);
       assert.equal(h.kvWrites.length, 1);
     }
+  });
+}
+
+for (const include of [false, true]) {
+  test(`ad-set targeting expansion diagnostics are opt-in (${include}) and read-only`, async () => {
+    const h = await harness({ respond(call) {
+      if (call.method === "GET" && call.path === `act_${ACCOUNT}/adsets`) {
+        assert.equal(call.params.fields.includes("targeting_optimization_types"), include);
+        return { data: [{ id: ADSET, ...(include ? { targeting_optimization_types: [{ detailed_targeting: 0 }] } : {}) }] };
+      }
+    } });
+    const result = toolPayload(await h.invoke("meta_list_adsets", include ? { include_targeting_diagnostics: true } : {}));
+    assert.equal(result.adsets[0].id, ADSET);
+    assert.equal(Object.hasOwn(result.adsets[0], "targeting_optimization_types"), include);
+    if (include) assert.deepEqual(result.adsets[0].targeting_optimization_types, [{ detailed_targeting: 0 }]);
+    assert.equal(postCalls(h).length, 0);
+    assert.equal(h.kvWrites.length, 0);
   });
 }
