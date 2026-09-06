@@ -348,8 +348,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("Page WhatsApp diagnostics are read-only and report connector version", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.2.6");
-  assert.equal(h.metadata.version, "2.2.6");
+  assert.equal(result.connector_version, "2.2.7");
+  assert.equal(h.metadata.version, "2.2.7");
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, true);
   assert.equal(result.write_switch_enabled, true);
@@ -389,7 +389,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.6");
+  assert.equal(result.connector_version, "2.2.7");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -461,7 +461,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.6");
+  assert.equal(result.connector_version, "2.2.7");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -539,7 +539,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.2.6");
+    assert.equal(result.connector_version, "2.2.7");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -657,3 +657,49 @@ test("unscheduled flow does not gain pacing fields", async () => {
   assert.equal(post.params.adset_schedule, undefined);
   assert.equal(post.params.pacing_type, undefined);
 });
+
+for (const [label, budget] of [
+  ["ad-set budgets", {}],
+  ["campaign daily budget", { daily_budget_minor: 2000 }],
+  ["campaign lifetime budget", { lifetime_budget_minor: 40000 }],
+]) for (const validateOnly of [true, false]) {
+  test(`${label} campaign ${validateOnly ? "validation" : "creation"} preserves budget ownership and PAUSED status`, async () => {
+    const h = await harness({ respond(call) {
+      if (call.method === "POST" && call.path === `act_${ACCOUNT}/campaigns`) {
+        return validateOnly ? { success: true } : { id: CAMPAIGN };
+      }
+    } });
+    const result = toolPayload(await h.invoke("meta_create_campaign_draft", {
+      name: CAMPAIGN_NAME,
+      objective: "OUTCOME_ENGAGEMENT",
+      request_id: REQUEST_ID,
+      validate_only: validateOnly,
+      confirmation_phrase: `CREATE CAMPAIGN ${CAMPAIGN_NAME}`,
+      ...budget,
+    }));
+    const posts = postCalls(h);
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].path, `act_${ACCOUNT}/campaigns`);
+    const params = posts[0].params;
+    assert.equal(params.status, "PAUSED");
+    if (Object.keys(budget).length === 0) {
+      assert.equal(params.is_adset_budget_sharing_enabled, "false");
+      assert.equal(Object.hasOwn(params, "daily_budget"), false);
+      assert.equal(Object.hasOwn(params, "lifetime_budget"), false);
+    } else {
+      assert.equal(Object.hasOwn(params, "is_adset_budget_sharing_enabled"), false);
+      if (budget.daily_budget_minor) assert.equal(params.daily_budget, "2000");
+      if (budget.lifetime_budget_minor) assert.equal(params.lifetime_budget, "40000");
+    }
+    if (validateOnly) {
+      assert.equal(result.mode, "validate_only");
+      assert.deepEqual(params.execution_options, ["validate_only", "include_recommendations"]);
+      assert.equal(h.kvWrites.length, 0);
+    } else {
+      assert.equal(result.result.id, CAMPAIGN);
+      assert.equal(result.idempotent_replay, false);
+      assert.equal(Object.hasOwn(params, "execution_options"), false);
+      assert.equal(h.kvWrites.length, 1);
+    }
+  });
+}

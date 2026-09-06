@@ -11,7 +11,7 @@ const META_GRAPH_ORIGIN = "https://graph.facebook.com";
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
-const CONNECTOR_VERSION = "2.2.6";
+const CONNECTOR_VERSION = "2.2.7";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -1048,6 +1048,9 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					};
 					if (bid_strategy) params.bid_strategy = bid_strategy;
 					setOptionalBudget(params, daily_budget_minor, lifetime_budget_minor);
+					if (daily_budget_minor === undefined && lifetime_budget_minor === undefined) {
+						params.is_adset_budget_sharing_enabled = false;
+					}
 					if (validate_only) {
 						params.execution_options = ["validate_only", "include_recommendations"];
 						const validation = await callMetaGraph(
