@@ -348,8 +348,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("Page WhatsApp diagnostics are read-only and report connector version", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.2.5");
-  assert.equal(h.metadata.version, "2.2.5");
+  assert.equal(result.connector_version, "2.2.6");
+  assert.equal(h.metadata.version, "2.2.6");
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, true);
   assert.equal(result.write_switch_enabled, true);
@@ -389,7 +389,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.5");
+  assert.equal(result.connector_version, "2.2.6");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -461,7 +461,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.5");
+  assert.equal(result.connector_version, "2.2.6");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -539,7 +539,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.2.5");
+    assert.equal(result.connector_version, "2.2.6");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -594,4 +594,66 @@ test("ad inventory exposes auditable creative fields through owned read-only edg
   assert.equal(wrongOwner.calls.length, 1);
   assert.equal(wrongOwner.calls[0].path, ADSET);
   assert.equal(postCalls(wrongOwner).length, 0);
+});
+
+const scheduleWindow = { days: [0, 1, 2, 3, 4, 5, 6], start_minute: 480, end_minute: 1380, timezone_type: "ADVERTISER" };
+const scheduledInput = (overrides = {}) => adsetInput({
+  lifetime_budget_minor: 40000,
+  start_time: "2026-09-07T08:00:00-02:00",
+  end_time: "2026-09-14T08:00:00-02:00",
+  adset_schedule: [scheduleWindow], ...overrides,
+});
+test("scheduled WhatsApp validation sends account-timezone windows and preserves phone", async () => {
+  const h = await harness();
+  const result = await h.invoke("meta_create_adset_draft", scheduledInput());
+  assert.ok(!result.isError);
+  const post = h.calls.find((c) => c.method === "POST");
+  assert.deepEqual(post.params.adset_schedule, [scheduleWindow]);
+  assert.deepEqual(post.params.pacing_type, ["day_parting"]);
+  assert.equal(post.params.promoted_object.whatsapp_phone_number, PHONE);
+  assert.equal(post.params.optimization_goal, "CONVERSATIONS");
+  assert.equal(post.params.status, "PAUSED");
+  assert.equal(post.params.lifetime_budget, "40000");
+  assert.ok(post.params.execution_options.includes("validate_only"));
+  assert.equal(h.kvWrites.length, 0);
+});
+for (const [label, overrides] of [
+  ["daily budget", {daily_budget_minor: 2000}],
+  ["missing lifetime", {lifetime_budget_minor: undefined}],
+  ["missing end", {end_time: undefined}],
+  ["missing zone", {start_time: "2026-09-07T08:00:00"}],
+  ["reversed dates", {end_time: "2026-09-06T08:00:00-02:00"}],
+]) test(`scheduled creation rejects ${label} before POST`, async () => {
+  const h = await harness();
+  const result = await h.invoke("meta_create_adset_draft", scheduledInput(overrides));
+  assert.equal(result.isError, true);
+  assert.equal(h.calls.filter((c) => c.method === "POST").length, 0);
+});
+test("scheduled creation rejects campaign budget before POST", async () => {
+  const h = await harness({campaign: {...campaignFixture, lifetime_budget: "40000"}});
+  const result = await h.invoke("meta_create_adset_draft", scheduledInput());
+  assert.equal(result.isError, true);
+  assert.equal(h.calls.filter((c) => c.method === "POST").length, 0);
+});
+for (const window of [
+  {...scheduleWindow, days: [7]}, {...scheduleWindow, start_minute: 481},
+  {...scheduleWindow, start_minute: 510}, {...scheduleWindow, end_minute: 1350},
+  {...scheduleWindow, start_minute: 480, end_minute: 510},
+  {...scheduleWindow, end_minute: 480}, {...scheduleWindow, timezone_type: "USER"},
+]) test(`invalid schedule ${JSON.stringify(window)} is rejected`, async () => {
+  const h = await harness();
+  await assert.rejects(h.invoke("meta_create_adset_draft", scheduledInput({adset_schedule: [window]})));
+  assert.equal(h.calls.length, 0);
+});
+test("overlapping windows are rejected", async () => {
+  const h = await harness();
+  await assert.rejects(h.invoke("meta_create_adset_draft", scheduledInput({adset_schedule: [scheduleWindow, scheduleWindow]})));
+  assert.equal(h.calls.length, 0);
+});
+test("unscheduled flow does not gain pacing fields", async () => {
+  const h = await harness();
+  await h.invoke("meta_create_adset_draft", adsetInput());
+  const post = h.calls.find((c) => c.method === "POST");
+  assert.equal(post.params.adset_schedule, undefined);
+  assert.equal(post.params.pacing_type, undefined);
 });
