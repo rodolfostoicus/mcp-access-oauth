@@ -348,8 +348,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("Page WhatsApp diagnostics are read-only and report connector version", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.2.8");
-  assert.equal(h.metadata.version, "2.2.8");
+  assert.equal(result.connector_version, "2.2.9");
+  assert.equal(h.metadata.version, "2.2.9");
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, true);
   assert.equal(result.write_switch_enabled, true);
@@ -389,7 +389,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.8");
+  assert.equal(result.connector_version, "2.2.9");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -463,7 +463,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.8");
+  assert.equal(result.connector_version, "2.2.9");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -495,6 +495,40 @@ test("city diagnostics use bounded Brazil city GET searches and return only loca
   assert.equal(postCalls(h).length, 0);
   assert.equal(h.kvWrites.length, 0);
   assert.equal(h.kvReads.length, 0);
+});
+
+test("city diagnostics normalize numeric region identifiers and preserve string identifiers", async () => {
+  for (const regionId of [459, "459"]) {
+    const h = await harness({
+      respond(call) {
+        if (call.path === "search") return {
+          data: [{ key: "248896", name: "Chapecó", type: "city", country_code: "BR", region: "Santa Catarina", region_id: regionId }],
+        };
+      },
+    });
+    const result = toolPayload(await h.invoke("meta_get_ad_account", { geo_location_queries: ["Chapecó"] }));
+    assert.equal(result.geo_location_search[0].results[0].region_id, "459");
+    assert.equal(result.geo_location_search[0].results[0].key, "248896");
+    assert.equal(postCalls(h).length, 0);
+    assert.equal(h.kvWrites.length, 0);
+  }
+});
+
+test("malformed region identifiers fail only the city diagnostic without leaking arbitrary objects", async () => {
+  for (const regionId of [{ access_token: "FAKE_SECRET_MUST_NOT_RETURN" }, -1, 1.5]) {
+    const h = await harness({
+      respond(call) {
+        if (call.path === "search") return { data: [{ key: "248896", name: "Chapecó", region_id: regionId }] };
+      },
+    });
+    const result = toolPayload(await h.invoke("meta_get_ad_account", { geo_location_queries: ["Chapecó"] }));
+    assert.equal(result.account.id, `act_${ACCOUNT}`);
+    assert.match(result.geo_location_search[0].diagnostic_error, /region_id/);
+    assert.equal(Object.hasOwn(result.geo_location_search[0], "results"), false);
+    assert.doesNotMatch(JSON.stringify(result), /FAKE_SECRET|access_token/);
+    assert.equal(postCalls(h).length, 0);
+    assert.equal(h.kvWrites.length, 0);
+  }
 });
 
 test("reach estimation preserves nested targeting and normalizes only aggregate data from object or array responses", async () => {
@@ -635,7 +669,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.2.8");
+    assert.equal(result.connector_version, "2.2.9");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
