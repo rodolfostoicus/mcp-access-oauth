@@ -11,7 +11,7 @@ const META_GRAPH_ORIGIN = "https://graph.facebook.com";
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
-const CONNECTOR_VERSION = "2.2.8";
+const CONNECTOR_VERSION = "2.2.9";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -442,7 +442,8 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 								const response = z.object({ data: z.array(z.object({
 									key: z.string(), name: z.string(), type: z.string().optional(),
 									country_code: z.string().optional(), country_name: z.string().optional(),
-									region: z.string().optional(), region_id: z.string().optional(),
+									region: z.string().optional(),
+									region_id: z.union([z.string(), z.number().int().nonnegative()]).transform(String).optional(),
 								})).max(20) }).parse(await callMetaGraph(env, "GET", "search", {
 									type: "adgeolocation", location_types: ["city"], country_code: "BR", q: query, limit: 20,
 								}));
