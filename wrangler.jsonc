@@ -50,6 +50,7 @@
   "vars": {
     "META_AD_ACCOUNT_ID": "act_3422857277981490",
     "META_API_VERSION": "v26.0",
+    "META_BUSINESS_ID": "644876512865789",
     "META_WRITE_ENABLED": "true"
   },
   "observability": {
