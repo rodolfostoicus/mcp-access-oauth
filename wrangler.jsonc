@@ -15,6 +15,10 @@
     {
       "new_sqlite_classes": ["MetaWriteLock"],
       "tag": "v2"
+    },
+    {
+      "new_sqlite_classes": ["MetaApiGate"],
+      "tag": "v3"
     }
   ],
   "compatibility_flags": ["nodejs_compat"],
@@ -27,6 +31,10 @@
       {
         "class_name": "MetaWriteLock",
         "name": "META_WRITE_LOCK"
+      },
+      {
+        "class_name": "MetaApiGate",
+        "name": "META_API_GATE"
       }
     ]
   },
@@ -57,7 +65,8 @@
       "ACCESS_TOKEN_URL",
       "ACCESS_AUTHORIZATION_URL",
       "ACCESS_JWKS_URL",
-      "COOKIE_ENCRYPTION_KEY"
+      "COOKIE_ENCRYPTION_KEY",
+      "META_ACCESS_TOKEN"
     ]
   }
 }

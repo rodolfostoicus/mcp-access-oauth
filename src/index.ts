@@ -11,12 +11,17 @@ const META_GRAPH_ORIGIN = "https://graph.facebook.com";
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
+const META_GATE_MIN_INTERVAL_MS = 250;
+const META_GET_RETRY_DELAY_MS = 1_000;
+const META_GET_MAX_INLINE_RETRY_DELAY_MS = 5_000;
+const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
-const CONNECTOR_VERSION = "2.3.1";
+const CONNECTOR_VERSION = "2.3.2";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
 	META_AD_ACCOUNT_ID?: string;
+	META_API_GATE?: DurableObjectNamespace;
 	META_API_VERSION?: string;
 	META_WRITE_LOCK?: DurableObjectNamespace;
 	META_WRITE_ENABLED?: string;
@@ -33,7 +38,7 @@ const writeLeaseRequestSchema = z.discriminatedUnion("action", [
 	z.object({
 		action: z.literal("acquire"),
 		holder: z.string().min(1).max(500),
-		operation: z.string().min(1).max(500),
+		operation: z.string().min(1).max(1_000),
 		ttl_ms: z.number().int().min(60_000).max(30 * 60 * 1_000),
 	}).strict(),
 	z.object({
@@ -130,6 +135,25 @@ type MetaPaging = {
 };
 
 type OwnedObjectType = "CAMPAIGN" | "ADSET" | "AD";
+
+type MetaGraphCall = {
+	method: "GET" | "POST";
+	params: Record<string, string | number | boolean | object>;
+	path: string;
+};
+
+class MetaGraphError extends Error {
+	constructor(
+		message: string,
+		readonly httpStatus: number,
+		readonly code?: number,
+		readonly subcode?: number,
+		readonly retryAfterMs?: number,
+	) {
+		super(message);
+		this.name = "MetaGraphError";
+	}
+}
 
 const writeResponseSchema = z
 	.object({ id: z.string().optional(), success: z.boolean().optional() })
@@ -236,6 +260,20 @@ function assertWritesEnabled(env: MetaEnv) {
 	}
 }
 
+function getMetaGateStub(env: MetaEnv) {
+	const metaApiGate = env.META_API_GATE;
+	if (!metaApiGate) {
+		throw new Error(
+			"META_API_GATE is not configured. Meta calls are blocked so concurrent sessions cannot bypass the account-level gate.",
+		);
+	}
+	const { accountNumericId } = getMetaConfig(env);
+	return {
+		accountNumericId,
+		stub: metaApiGate.get(metaApiGate.idFromName(accountNumericId)),
+	};
+}
+
 function getWriteLockStub(env: MetaEnv) {
 	const writeLock = env.META_WRITE_LOCK;
 	if (!writeLock) {
@@ -273,6 +311,9 @@ async function callWriteLock(
 }
 
 async function acquireAccountWriteLease(env: MetaEnv, holder: string, operation: string) {
+	// A real create can reach the lease before its first Graph read. Verify the
+	// request gate first so a missing binding cannot strand an unnecessary lease.
+	getMetaGateStub(env);
 	return callWriteLock(env, {
 		action: "acquire",
 		holder,
@@ -292,7 +333,18 @@ async function getAccountWriteLease(env: MetaEnv) {
 function safeMetaError(payload: MetaGraphErrorPayload, status: number) {
 	const metaError = payload.error;
 	if (!metaError) return `Meta API returned HTTP ${status}.`;
+	const category =
+		(metaError.code !== undefined && [4, 17, 32, 613].includes(metaError.code)) ||
+		metaError.error_subcode === 2446079 ||
+		status === 429
+			? "RATE_LIMIT"
+			: metaError.code === 200 &&
+				/ads_(?:management|read)/i.test(metaError.message || "") &&
+				/permission/i.test(metaError.message || "")
+				? "ACCOUNT_ACCESS_DENIED"
+				: undefined;
 	return [
+		category ? `category=${category}` : undefined,
 		metaError.error_user_title,
 		metaError.error_user_msg,
 		metaError.message,
@@ -311,7 +363,27 @@ function encodeMetaValue(value: string | number | boolean | object) {
 	return typeof value === "object" ? JSON.stringify(value) : String(value);
 }
 
-async function callMetaGraph(
+function parseRetryAfterMs(response: Response) {
+	const value = response.headers.get("Retry-After")?.trim();
+	if (!value) return undefined;
+	const seconds = Number(value);
+	if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
+	const timestamp = Date.parse(value);
+	return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : undefined;
+}
+
+function isMetaRateLimit(error: unknown): error is MetaGraphError {
+	return error instanceof MetaGraphError &&
+		(error.httpStatus === 429 ||
+			(error.code !== undefined && [4, 17, 32, 613].includes(error.code)) ||
+			error.subcode === 2446079);
+}
+
+function delay(ms: number) {
+	return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+async function callMetaGraphDirect(
 	env: MetaEnv,
 	method: "GET" | "POST",
 	path: string,
@@ -345,6 +417,16 @@ async function callMetaGraph(
 	try {
 		payload = JSON.parse(rawBody);
 	} catch {
+		if (!response.ok) {
+			const message = `Meta API returned a non-JSON HTTP ${response.status} response.`;
+			throw new MetaGraphError(
+				response.status === 429 ? `category=RATE_LIMIT | ${message}` : message,
+				response.status,
+				undefined,
+				undefined,
+				parseRetryAfterMs(response),
+			);
+		}
 		throw new Error(`Meta API returned a non-JSON HTTP ${response.status} response.`);
 	}
 
@@ -366,9 +448,144 @@ async function callMetaGraph(
 		.safeParse(payload);
 	const errorPayload = parsedError.success ? parsedError.data : {};
 	if (!response.ok || errorPayload.error) {
-		throw new Error(safeMetaError(errorPayload, response.status));
+		throw new MetaGraphError(
+			safeMetaError(errorPayload, response.status),
+			response.status,
+			errorPayload.error?.code,
+			errorPayload.error?.error_subcode,
+			parseRetryAfterMs(response),
+		);
 	}
 	return payload;
+}
+
+const metaGateCallSchema = z.object({
+	method: z.enum(["GET", "POST"]),
+	params: z.record(z.string(), z.unknown()),
+	path: z.string().min(1).max(1_000),
+}).strict();
+
+const metaGateResponseSchema = z.object({
+	error: z.string().optional(),
+	ok: z.boolean(),
+	payload: z.unknown().optional(),
+	retry_after_seconds: z.number().int().nonnegative().optional(),
+}).strict();
+
+async function callMetaGraph(
+	env: MetaEnv,
+	method: "GET" | "POST",
+	path: string,
+	params: Record<string, string | number | boolean | object>,
+): Promise<unknown> {
+	const { stub } = getMetaGateStub(env);
+	const response = await stub.fetch("https://meta-api-gate.internal/call", {
+		body: JSON.stringify({ method, params, path }),
+		headers: { "Content-Type": "application/json" },
+		method: "POST",
+	});
+	const envelope = metaGateResponseSchema.parse(await response.json());
+	if (!envelope.ok) throw new Error(envelope.error || "Meta API gate rejected the request.");
+	return envelope.payload;
+}
+
+/**
+ * One named instance per ad account serializes individual Meta Graph requests
+ * from every MCP session. This prevents simultaneous request bursts; it does not
+ * make a multi-request business workflow atomic. POST requests are never retried.
+ */
+export class MetaApiGate {
+	private cooldownUntil = 0;
+	private nextStartAt = 0;
+	private queue: Promise<void> = Promise.resolve();
+	private readonly env: MetaEnv;
+
+	constructor(_state: DurableObjectState, env: Env) {
+		this.env = env as MetaEnv;
+	}
+
+	private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+		const result = this.queue.then(operation, operation);
+		this.queue = result.then(() => undefined, () => undefined);
+		return result;
+	}
+
+	private async paceNextAttempt() {
+		const pacingDelay = Math.max(0, this.nextStartAt - Date.now());
+		if (pacingDelay > 0) await delay(pacingDelay);
+		this.nextStartAt = Date.now() + META_GATE_MIN_INTERVAL_MS;
+	}
+
+	async fetch(request: Request): Promise<Response> {
+		if (request.method !== "POST") {
+			return Response.json({ error: "Method not allowed.", ok: false }, { status: 405 });
+		}
+		let call: MetaGraphCall;
+		try {
+			const parsed = metaGateCallSchema.parse(await request.json());
+			call = {
+				method: parsed.method,
+				params: parsed.params as MetaGraphCall["params"],
+				path: parsed.path,
+			};
+		} catch {
+			return Response.json({ error: "Invalid Meta API gate request.", ok: false }, { status: 400 });
+		}
+
+		return this.enqueue(async () => {
+			const now = Date.now();
+			if (this.cooldownUntil > now) {
+				const retryAfterSeconds = Math.ceil((this.cooldownUntil - now) / 1_000);
+				return Response.json({
+					error: `category=RATE_LIMIT_COOLDOWN | wait ${retryAfterSeconds}s and retry from one chat`,
+					ok: false,
+					retry_after_seconds: retryAfterSeconds,
+				}, { status: 429 });
+			}
+
+			const attempts = call.method === "GET" ? 2 : 1;
+			for (let attempt = 1; attempt <= attempts; attempt++) {
+				await this.paceNextAttempt();
+				try {
+					const payload = await callMetaGraphDirect(
+						this.env,
+						call.method,
+						call.path,
+						call.params,
+					);
+					return Response.json({ ok: true, payload });
+				} catch (error) {
+					if (isMetaRateLimit(error)) {
+						const retryDelay = Math.max(
+							error.retryAfterMs ?? META_GET_RETRY_DELAY_MS,
+							META_GET_RETRY_DELAY_MS,
+						);
+						if (
+							call.method === "GET" &&
+							attempt < attempts &&
+							retryDelay <= META_GET_MAX_INLINE_RETRY_DELAY_MS
+						) {
+							await delay(retryDelay);
+							continue;
+						}
+						this.cooldownUntil = Date.now() + Math.max(retryDelay, META_RATE_LIMIT_COOLDOWN_MS);
+					}
+					return Response.json({
+						error: error instanceof Error ? error.message : "Unexpected Meta API error.",
+						ok: false,
+						retry_after_seconds: isMetaRateLimit(error)
+							? Math.ceil(Math.max(
+								error.retryAfterMs ?? META_GET_RETRY_DELAY_MS,
+								META_RATE_LIMIT_COOLDOWN_MS,
+							) / 1_000)
+							: undefined,
+					}, { status: isMetaRateLimit(error) ? 429 : 502 });
+				}
+			}
+
+			return Response.json({ error: "Meta API request failed.", ok: false }, { status: 502 });
+		});
+	}
 }
 
 async function assertAccessiblePage(env: MetaEnv, pageId: string) {
@@ -842,41 +1059,57 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 			{
 				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: true },
 				description:
-					"Read-only. Check token scopes and access to the configured ad account without exposing the Meta token. Readiness reports prerequisites only; no write access is tested.",
+					"Read-only. Check Meta scopes and effective access to the configured ad account without exposing the token. The default is a minimal sequential check; bounded account inventory and asset diagnostics are independent opt-ins.",
 				inputSchema: {
-					include_account_inventory: z.boolean().default(false).describe("Optionally scan up to 75 accessible ad accounts. Only configured-account metadata is returned; scan_complete means pagination was exhausted."),
-					business_access_diagnostic_id: z.string().regex(META_ID_PATTERN).max(30).optional().describe("Opt-in read-only diagnostic for one explicit Business ID. Returns only the token subject and configured ad account; skips Page/WhatsApp and general account inventory fanout."),
+					business_access_diagnostic_id: z.string().regex(META_ID_PATTERN).max(30).optional().describe(
+						"Opt-in read-only diagnostic for one explicit Business ID. Returns only the token subject and configured ad account; skips Page/WhatsApp and general account inventory fanout.",
+					),
+					include_account_inventory: z.boolean().default(false).describe(
+						"Optionally scan up to 75 accessible ad accounts. Only configured-account metadata is returned; scan_complete means pagination was exhausted.",
+					),
+					include_asset_diagnostics: z.boolean().default(false).describe(
+						"Optionally inspect accessible Pages and WhatsApp Business assets. Disabled by default to avoid request bursts.",
+					),
 				},
 			},
-			async ({ include_account_inventory, business_access_diagnostic_id }) => {
+			async ({
+				business_access_diagnostic_id,
+				include_account_inventory,
+				include_asset_diagnostics,
+			}) => {
 				try {
 					const env = this.env as MetaEnv;
 					const { accountId, accountNumericId } = getMetaConfig(env);
-					const [permissionResponse, tokenSubject] = await Promise.all([
-						callMetaGraph(env, "GET", "me/permissions", {}),
-						callMetaGraph(env, "GET", "me", { fields: "id,name" }),
-					]);
+					// Keep the default readiness check deliberately small and sequential.
+					// Three concurrent chats previously multiplied the old fan-out into a
+					// burst against the same Meta token and ad-account quota.
+					const permissionResponse = await callMetaGraph(env, "GET", "me/permissions", {});
+					const tokenSubject = await callMetaGraph(env, "GET", "me", { fields: "id,name" });
 					const payload = graphListSchema.parse(permissionResponse);
 					const accountAccessSchema = z.object({
 						id: z.string().regex(/^act_\d+$/),
-						account_id: z.union([z.string().regex(META_ID_PATTERN), z.number().int().nonnegative()]).transform(String),
+						account_id: z
+							.union([z.string().regex(META_ID_PATTERN), z.number().int().nonnegative()])
+							.transform(String),
 						name: z.string(),
 						account_status: z.number().int(),
 					});
-					let accountAccess: z.infer<typeof accountAccessSchema> | null = null;
+					let configuredAccount: z.infer<typeof accountAccessSchema> | null = null;
 					let accountAccessError: string | null = null;
 					try {
-						const account = accountAccessSchema.parse(await callMetaGraph(env, "GET", accountId, {
-							fields: "id,account_id,name,account_status",
-						}));
+						const account = accountAccessSchema.parse(
+							await callMetaGraph(env, "GET", accountId, {
+								fields: "id,account_id,name,account_status",
+							}),
+						);
 						if (account.id !== accountId || account.account_id !== accountNumericId) {
 							throw new Error("Account access response does not match the configured ad account.");
 						}
-						accountAccess = account;
+						configuredAccount = account;
 					} catch (error) {
 						accountAccessError = asToolError(error).content[0].text;
 					}
-					const accountAccessible = accountAccess !== null;
+					const configuredAccountAccessible = configuredAccount !== null;
 					let accountInventory: Record<string, unknown> | undefined;
 					if (include_account_inventory && !business_access_diagnostic_id) {
 						const inventoryAccountSchema = accountAccessSchema.omit({ account_id: true });
@@ -884,10 +1117,12 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							data: z.array(inventoryAccountSchema).max(25),
 							paging: z.object({
 								next: z.string().optional(),
-								cursors: z.object({ after: z.string().min(1).max(2_000).optional() }).optional(),
+								cursors: z.object({
+									after: z.string().min(1).max(2_000).optional(),
+								}).optional(),
 							}).optional(),
 						});
-						let configuredAccount: z.infer<typeof inventoryAccountSchema> | null = null;
+						let inventoryConfiguredAccount: z.infer<typeof inventoryAccountSchema> | null = null;
 						let scanComplete = false;
 						let accountsScanned = 0;
 						let inventoryError: string | undefined;
@@ -895,15 +1130,21 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						const seenCursors = new Set<string>();
 						try {
 							for (let page = 0; page < 3; page++) {
-								const params: Record<string, string | number> = { fields: "id,name,account_status", limit: 25 };
+								const params: Record<string, string | number> = {
+									fields: "id,name,account_status",
+									limit: 25,
+								};
 								if (after) params.after = after;
-								const parsed = inventoryPageSchema.safeParse(await callMetaGraph(env, "GET", "me/adaccounts", params));
+								const parsed = inventoryPageSchema.safeParse(
+									await callMetaGraph(env, "GET", "me/adaccounts", params),
+								);
 								if (!parsed.success) throw new Error("Invalid ad account inventory response.");
 								const response = parsed.data;
 								accountsScanned += response.data.length;
-								configuredAccount = response.data.find((item) => item.id === accountId) ?? null;
+								inventoryConfiguredAccount =
+									response.data.find((item) => item.id === accountId) ?? null;
 								scanComplete = !response.paging?.next;
-								if (configuredAccount || scanComplete) break;
+								if (inventoryConfiguredAccount || scanComplete) break;
 								const nextAfter = response.paging?.cursors?.after;
 								if (!nextAfter || seenCursors.has(nextAfter)) break;
 								seenCursors.add(nextAfter);
@@ -915,9 +1156,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 								.replace(/(?:after|before|cursor)=[^&\s]+/gi, "[redacted cursor]");
 						}
 						accountInventory = {
-							configured_account_found: configuredAccount !== null,
-							scan_complete: scanComplete, accounts_scanned: accountsScanned,
-							configured_account: configuredAccount, diagnostic_error: inventoryError,
+							configured_account_found: inventoryConfiguredAccount !== null,
+							scan_complete: scanComplete,
+							accounts_scanned: accountsScanned,
+							configured_account: inventoryConfiguredAccount,
+							diagnostic_error: inventoryError,
 						};
 					}
 					if (business_access_diagnostic_id) accountInventory = { skipped: true, reason: "Business access diagnostic replaces general account inventory." };
@@ -928,99 +1171,107 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						: undefined;
 					let accessiblePages: Array<Record<string, unknown>> = [];
 					let pageAccessError: string | undefined;
-					if (!business_access_diagnostic_id) try {
-						const pageResponse = graphListSchema.parse(
-							await callMetaGraph(env, "GET", "me/accounts", {
-								fields: "id,name,tasks",
-								limit: 100,
-							}),
-						);
-						accessiblePages = pageResponse.data;
-					} catch (error) {
-						pageAccessError = error instanceof Error ? error.message : "Unable to list Pages.";
-					}
-					// Inspect only Pages already returned by the configured token. These
-					// read-only diagnostics must never invalidate the permissions result.
-					const pageWhatsappDiagnostics = await Promise.all(
-						accessiblePages.map(async (page) => {
-							const pageId = String(page.id || "");
-							try {
-								const details = await callMetaGraph(env, "GET", pageId, {
-									fields: "id,whatsapp_number,has_whatsapp_number,has_whatsapp_business_number",
-								});
-								return { page_id: pageId, ...z.record(z.string(), z.unknown()).parse(details) };
-							} catch (error) {
-								return {
-									page_id: pageId,
-									diagnostic_error: asToolError(error).content[0].text,
-								};
-							}
-						}),
-					);
-					let whatsappAssetDiagnostics: Record<string, unknown> = {};
-					if (business_access_diagnostic_id) {
-						whatsappAssetDiagnostics = { skipped: true, reason: "Page and WhatsApp diagnostics are skipped in business access diagnostic mode." };
-					} else if (accountAccessible) try {
-						const account = z
-							.object({ business: z.object({ id: z.string(), name: z.string().optional() }).optional() })
-							.passthrough()
-							.parse(
-								await callMetaGraph(env, "GET", accountId, {
-									fields: "business{id,name}",
+					if (include_asset_diagnostics && !business_access_diagnostic_id) {
+						try {
+							const pageResponse = graphListSchema.parse(
+								await callMetaGraph(env, "GET", "me/accounts", {
+									fields: "id,name,tasks",
+									limit: 100,
 								}),
 							);
-						if (account.business) {
-							const [ownedResponse, clientResponse] = await Promise.allSettled([
-								callMetaGraph(
-									env,
-									"GET",
-									`${account.business.id}/owned_whatsapp_business_accounts`,
-									{ fields: "id,name", limit: 100 },
-								),
-								callMetaGraph(
-									env,
-									"GET",
-									`${account.business.id}/client_whatsapp_business_accounts`,
-									{ fields: "id,name", limit: 100 },
-								),
-							]);
+							accessiblePages = pageResponse.data;
+						} catch (error) {
+							pageAccessError = error instanceof Error ? error.message : "Unable to list Pages.";
+						}
+					}
+					// Inspect only Pages already returned by the configured token. These
+					// opt-in diagnostics are sequential and never invalidate readiness.
+					const pageWhatsappDiagnostics: Array<Record<string, unknown>> = [];
+					for (const page of accessiblePages) {
+						const pageId = String(page.id || "");
+						try {
+							const details = await callMetaGraph(env, "GET", pageId, {
+								fields: "id,whatsapp_number,has_whatsapp_number,has_whatsapp_business_number",
+							});
+							pageWhatsappDiagnostics.push({
+								page_id: pageId,
+								...z.record(z.string(), z.unknown()).parse(details),
+							});
+						} catch (error) {
+							pageWhatsappDiagnostics.push({
+								page_id: pageId,
+								diagnostic_error: asToolError(error).content[0].text,
+							});
+						}
+					}
+					let whatsappAssetDiagnostics: Record<string, unknown> = {};
+					if (business_access_diagnostic_id) {
+						whatsappAssetDiagnostics = {
+							skipped: true,
+							reason: "Page and WhatsApp diagnostics are skipped in business access diagnostic mode.",
+						};
+					} else if (include_asset_diagnostics) {
+						if (!configuredAccountAccessible) {
 							whatsappAssetDiagnostics = {
-								business: account.business,
-								owned_whatsapp_business_accounts:
-									ownedResponse.status === "fulfilled"
-										? graphListSchema.parse(ownedResponse.value).data
-										: [],
-								owned_whatsapp_business_accounts_error:
-									ownedResponse.status === "rejected"
-										? ownedResponse.reason instanceof Error
-											? ownedResponse.reason.message
-											: "Unable to list owned WhatsApp Business Accounts."
-										: undefined,
-								client_whatsapp_business_accounts:
-									clientResponse.status === "fulfilled"
-										? graphListSchema.parse(clientResponse.value).data
-										: [],
-								client_whatsapp_business_accounts_error:
-									clientResponse.status === "rejected"
-										? clientResponse.reason instanceof Error
-											? clientResponse.reason.message
-											: "Unable to list shared WhatsApp Business Accounts."
-										: undefined,
+								whatsapp_asset_error:
+									"Skipped Business and WhatsApp asset diagnostics because configured ad account access was not confirmed.",
 							};
 						} else {
-							whatsappAssetDiagnostics = {
-								whatsapp_asset_error: "The configured ad account has no Business Portfolio attached.",
-							};
+							try {
+								const accountBusiness = z.object({
+									id: z.string().regex(/^act_\d+$/),
+									business: z.object({ id: z.string(), name: z.string().optional() }).optional(),
+								}).passthrough().parse(
+									await callMetaGraph(env, "GET", accountId, {
+										fields: "id,business{id,name}",
+									}),
+								);
+								if (accountBusiness.id !== accountId) {
+									throw new Error("Business diagnostic response does not match the configured ad account.");
+								}
+								const business = accountBusiness.business;
+								if (!business) {
+									whatsappAssetDiagnostics = {
+										whatsapp_asset_error:
+											"The configured ad account has no Business Portfolio attached.",
+									};
+								} else {
+									const businessId = business.id;
+									const assets: Record<string, unknown> = {};
+									try {
+										assets.owned_whatsapp_business_accounts = graphListSchema.parse(
+											await callMetaGraph(
+												env,
+												"GET",
+												`${businessId}/owned_whatsapp_business_accounts`,
+												{ fields: "id,name", limit: 100 },
+											),
+										).data;
+									} catch (error) {
+										assets.owned_whatsapp_business_accounts_error =
+											asToolError(error).content[0].text;
+									}
+									try {
+										assets.client_whatsapp_business_accounts = graphListSchema.parse(
+											await callMetaGraph(
+												env,
+												"GET",
+												`${businessId}/client_whatsapp_business_accounts`,
+												{ fields: "id,name", limit: 100 },
+											),
+										).data;
+									} catch (error) {
+										assets.client_whatsapp_business_accounts_error =
+											asToolError(error).content[0].text;
+									}
+									whatsappAssetDiagnostics = { business, ...assets };
+								}
+							} catch (error) {
+								whatsappAssetDiagnostics = {
+									whatsapp_asset_error: asToolError(error).content[0].text,
+								};
+							}
 						}
-					} catch (error) {
-						whatsappAssetDiagnostics = {
-							whatsapp_asset_error:
-								error instanceof Error ? error.message : "Unable to inspect WhatsApp Business assets.",
-						};
-					} else {
-						whatsappAssetDiagnostics = {
-							whatsapp_asset_error: "Skipped Business and WhatsApp asset diagnostics because configured ad account access was not confirmed.",
-						};
 					}
 					const permissions = payload.data.map((item) => ({
 						permission: item.permission,
@@ -1031,26 +1282,36 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							.filter((item) => item.status === "granted")
 							.map((item) => item.permission),
 					);
+					const scopeReadyForReads = granted.has("ads_read") || granted.has("ads_management");
+					const scopeReadyForWrites = granted.has("ads_management");
 					const writeSwitchEnabled = env.META_WRITE_ENABLED?.trim().toLowerCase() === "true";
 					return asToolResult({
-						connector_version: CONNECTOR_VERSION,
 						configured_ad_account_id: accountId,
-						account_accessible: accountAccessible,
+						account_accessible: configuredAccountAccessible,
 						account_access_error: accountAccessError,
-						account: accountAccess,
+						account: configuredAccount,
 						account_inventory: accountInventory,
 						business_access_diagnostic: businessAccessDiagnostic,
 						page_diagnostics_skipped: business_access_diagnostic_id ? true : undefined,
+						asset_diagnostics_included:
+							include_asset_diagnostics && !business_access_diagnostic_id,
+						configured_account: configuredAccount ?? undefined,
+						configured_account_accessible: configuredAccountAccessible,
+						connector_version: CONNECTOR_VERSION,
 						accessible_pages: accessiblePages,
-						page_access_error: pageAccessError,
+						page_access_error: include_asset_diagnostics ? pageAccessError : undefined,
 						page_whatsapp_diagnostics: pageWhatsappDiagnostics,
 						whatsapp_assets: whatsappAssetDiagnostics,
 						permissions,
-						ready_for_reads: accountAccessible && (granted.has("ads_read") || granted.has("ads_management")),
-						ready_for_writes: accountAccessible && granted.has("ads_management") && writeSwitchEnabled,
-						write_switch_enabled: writeSwitchEnabled,
+						ready_for_reads: scopeReadyForReads && configuredAccountAccessible,
+						ready_for_writes:
+							scopeReadyForWrites && configuredAccountAccessible && writeSwitchEnabled,
+						scope_ready_for_reads: scopeReadyForReads,
+						scope_ready_for_writes: scopeReadyForWrites,
 						write_access_verified: false,
-						readiness_explanation: "Readiness reports token scopes, confirmed read access to the configured account, and the write switch. It does not verify permission to mutate ads; no write was attempted.",
+						readiness_explanation:
+							"Readiness reports token scopes, confirmed read access to the configured account, and the write switch. It does not verify permission to mutate ads; no write was attempted.",
+						write_switch_enabled: writeSwitchEnabled,
 						token_subject: tokenSubject,
 					});
 				} catch (error) {

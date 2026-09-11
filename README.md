@@ -28,7 +28,10 @@ wrangler secret put ACCESS_TOKEN_URL
 wrangler secret put ACCESS_AUTHORIZATION_URL
 wrangler secret put ACCESS_JWKS_URL
 wrangler secret put COOKIE_ENCRYPTION_KEY # add any random string here e.g. openssl rand -hex 32
+wrangler secret put META_ACCESS_TOKEN # paste only in Wrangler's hidden prompt
 ```
+
+Never put a real Meta token in this repository, a shell command, a support ticket, or a chat. `META_ACCESS_TOKEN` must exist only as a Cloudflare Worker secret.
 
 #### Set up a KV namespace
 
@@ -39,7 +42,7 @@ wrangler secret put COOKIE_ENCRYPTION_KEY # add any random string here e.g. open
 #### Deploy & Test
 
 Deploy the MCP server to make it available on your workers.dev domain
-` wrangler deploy`
+`wrangler deploy --keep-vars`
 
 Test the remote server using [Inspector](https://modelcontextprotocol.io/docs/tools/inspector):
 
@@ -102,6 +105,7 @@ ACCESS_TOKEN_URL=<your Access for SaaS token url>
 ACCESS_AUTHORIZATION_URL=<your Access for SaaS authorization url>
 ACCESS_JWKS_URL=<your Access for SaaS JWKS url>
 COOKIE_ENCRYPTION_KEY=COOKIE_ENCRYPTION_KEY
+META_ACCESS_TOKEN=<Meta Graph access token; never commit a real token>
 ```
 
 #### Develop & Test
@@ -122,6 +126,30 @@ To connect Cursor with your MCP server, choose `Type`: "Command" and in the `Com
 Note that while Cursor supports HTTP+SSE servers, it doesn't support authentication, so you still need to use `mcp-remote` (and to use a STDIO server, not an HTTP one).
 
 You can connect your MCP server to other MCP clients like Windsurf by opening the client's configuration file, adding the same JSON that was used for the Claude setup, and restarting the MCP client.
+
+## Meta Ads authentication and operational safety
+
+The connector has two independent authentication layers:
+
+- **Cloudflare Access OAuth** authenticates ChatGPT or another MCP client to this Worker. Reconnecting the MCP client refreshes this layer only.
+- **Meta Graph authentication** uses the separate `META_ACCESS_TOKEN` Worker secret. Reconnecting ChatGPT, signing in to Facebook, or changing a human Facebook password does not update this secret.
+
+Version 2.3.2 routes Meta Graph requests through `META_API_GATE`, one named Durable Object per configured ad account. The gate serializes requests across MCP sessions and spaces every request attempt by at least 250 ms. A rate-limited `GET` receives at most one automatic retry when the required wait is no more than five seconds. A longer wait or a persistent limit starts a cooldown of at least 60 seconds and returns immediately. `POST` requests are never retried automatically, so an ambiguous write is not repeated. If the binding is missing, Meta calls fail closed instead of bypassing the gate.
+
+The separate `META_WRITE_LOCK` Durable Object grants the first real-write attempt an exclusive, renewable 10-minute account lease. Another session fails closed with `WRITE_LOCKED` before its Meta mutation; validate-only requests do not acquire the lease. The lease is acquired or renewed before the Meta call and deliberately remains active if that call fails or has an ambiguous outcome. The owning session can release it with `meta_release_write_lease`, or let it expire.
+
+The gate protects the API from concurrent bursts and the lease prevents simultaneous writers, but neither makes a multi-request business workflow atomic. Keep **one logical write operator per campaign**. Other chats may inspect unrelated work, but only one chat should create, edit, pause, or activate objects in the same campaign until its read-after-write audit is complete.
+
+### Recovering access after a password, security, or asset-access change
+
+1. Stop Meta writes and run the minimal permission diagnostic. Both OAuth scopes and access to the configured ad account must pass; a scope-only success is not write readiness.
+2. When administrative evidence is needed, provide one explicit `business_access_diagnostic_id`. This bounded, read-only mode returns only matches for the token subject and configured account, skips general inventory and Page/WhatsApp fan-out, and never proves write authority by itself.
+3. In Meta Business Manager, verify the confirmed identity's assignment to the configured account and relevant Page/WhatsApp assets. Do not identify it only by display name, and do not treat an observed `ADMIN` role as proof of account authorization.
+4. Generate a replacement system-user token only if Meta invalidated the token or access remains denied after the asset assignment and business/app restrictions are verified.
+5. Replace the secret through Cloudflare's hidden prompt: `wrangler secret put META_ACCESS_TOKEN`. Never paste the token into chat, logs, source code, `.dev.vars.example`, or Git.
+6. Deploy with `wrangler deploy --keep-vars`, then rerun the permission diagnostic. Resume reads or writes only when the configured account is accessible and the diagnostic reports the corresponding readiness flag as true.
+
+Rate limits are handled by waiting and reducing concurrency, not by repeatedly reconnecting or regenerating credentials. If a cooldown is reported, let it expire and retry from one chat.
 
 ## How does it work?
 
