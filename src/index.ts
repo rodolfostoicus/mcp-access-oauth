@@ -11,14 +11,107 @@ const META_GRAPH_ORIGIN = "https://graph.facebook.com";
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
-const CONNECTOR_VERSION = "2.2.12";
+const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
+const CONNECTOR_VERSION = "2.3.0";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
 	META_AD_ACCOUNT_ID?: string;
 	META_API_VERSION?: string;
+	META_WRITE_LOCK?: DurableObjectNamespace;
 	META_WRITE_ENABLED?: string;
 };
+
+type WriteLease = {
+	acquired_at: string;
+	expires_at: string;
+	holder: string;
+	operation: string;
+};
+
+const writeLeaseRequestSchema = z.discriminatedUnion("action", [
+	z.object({
+		action: z.literal("acquire"),
+		holder: z.string().min(1).max(500),
+		operation: z.string().min(1).max(500),
+		ttl_ms: z.number().int().min(60_000).max(30 * 60 * 1_000),
+	}).strict(),
+	z.object({
+		action: z.literal("release"),
+		holder: z.string().min(1).max(500),
+	}).strict(),
+	z.object({ action: z.literal("status") }).strict(),
+]);
+
+function jsonResponse(value: unknown, status = 200) {
+	return new Response(JSON.stringify(value), {
+		headers: { "Content-Type": "application/json;charset=UTF-8", "Cache-Control": "no-store" },
+		status,
+	});
+}
+
+export class MetaWriteLock {
+	constructor(private readonly state: DurableObjectState) {}
+
+	async fetch(request: Request): Promise<Response> {
+		if (request.method !== "POST") {
+			return new Response("Method Not Allowed", { headers: { Allow: "POST" }, status: 405 });
+		}
+
+		let parsed: z.infer<typeof writeLeaseRequestSchema>;
+		try {
+			parsed = writeLeaseRequestSchema.parse(await request.json());
+		} catch {
+			return jsonResponse({ code: "INVALID_WRITE_LEASE_REQUEST" }, 400);
+		}
+
+		return this.state.blockConcurrencyWhile(async () => {
+			const now = Date.now();
+			const current = await this.state.storage.get<WriteLease>("lease");
+			const currentExpiry = current ? Date.parse(current.expires_at) : 0;
+			const active = current && Number.isFinite(currentExpiry) && currentExpiry > now;
+
+			if (parsed.action === "status") {
+				return jsonResponse(active
+					? { active: true, expires_at: current.expires_at, operation: current.operation }
+					: { active: false });
+			}
+
+			if (parsed.action === "release") {
+				if (!active) {
+					await this.state.storage.delete("lease");
+					return jsonResponse({ active: false, released: false });
+				}
+				if (current.holder !== parsed.holder) {
+					return jsonResponse({
+						code: "WRITE_LOCKED",
+						expires_at: current.expires_at,
+						operation: current.operation,
+					}, 409);
+				}
+				await this.state.storage.delete("lease");
+				return jsonResponse({ active: false, released: true });
+			}
+
+			if (active && current.holder !== parsed.holder) {
+				return jsonResponse({
+					code: "WRITE_LOCKED",
+					expires_at: current.expires_at,
+					operation: current.operation,
+				}, 409);
+			}
+
+			const lease: WriteLease = {
+				acquired_at: active ? current.acquired_at : new Date(now).toISOString(),
+				expires_at: new Date(now + parsed.ttl_ms).toISOString(),
+				holder: parsed.holder,
+				operation: parsed.operation,
+			};
+			await this.state.storage.put("lease", lease);
+			return jsonResponse({ active: true, acquired: !active, expires_at: lease.expires_at });
+		});
+	}
+}
 
 type MetaGraphErrorPayload = {
 	error?: {
@@ -141,6 +234,59 @@ function assertWritesEnabled(env: MetaEnv) {
 			"Meta write tools are disabled by META_WRITE_ENABLED. Enable only after ads_management is granted.",
 		);
 	}
+}
+
+function getWriteLockStub(env: MetaEnv) {
+	const writeLock = env.META_WRITE_LOCK;
+	if (!writeLock) {
+		throw new Error("Meta writes are blocked because META_WRITE_LOCK is not configured.");
+	}
+	const { accountId } = getMetaConfig(env);
+	return { accountId, stub: writeLock.get(writeLock.idFromName(accountId)) };
+}
+
+async function callWriteLock(
+	env: MetaEnv,
+	payload: z.infer<typeof writeLeaseRequestSchema>,
+) {
+	const { stub } = getWriteLockStub(env);
+	const response = await stub.fetch("https://meta-write-lock.internal/lease", {
+		body: JSON.stringify(payload),
+		headers: { "Content-Type": "application/json" },
+		method: "POST",
+	});
+	let result: Record<string, unknown> = {};
+	try {
+		result = z.record(z.string(), z.unknown()).parse(await response.json());
+	} catch {
+		throw new Error(`Write-lock service returned an invalid HTTP ${response.status} response.`);
+	}
+	if (!response.ok) {
+		if (result.code === "WRITE_LOCKED") {
+			throw new Error(
+				`WRITE_LOCKED: another MCP session currently owns Meta writes for this account until ${String(result.expires_at || "the lease expires")}. Active operation: ${String(result.operation || "not disclosed")}. Read-only tools remain available.`,
+			);
+		}
+		throw new Error(`Write-lock service rejected the request with HTTP ${response.status}.`);
+	}
+	return result;
+}
+
+async function acquireAccountWriteLease(env: MetaEnv, holder: string, operation: string) {
+	return callWriteLock(env, {
+		action: "acquire",
+		holder,
+		operation,
+		ttl_ms: WRITE_LEASE_TTL_MS,
+	});
+}
+
+async function releaseAccountWriteLease(env: MetaEnv, holder: string) {
+	return callWriteLock(env, { action: "release", holder });
+}
+
+async function getAccountWriteLease(env: MetaEnv) {
+	return callWriteLock(env, { action: "status" });
 }
 
 function safeMetaError(payload: MetaGraphErrorPayload, status: number) {
@@ -408,6 +554,48 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 	server = new McpServer({ name: "Meta Ads Stoicus Secure", version: CONNECTOR_VERSION });
 
 	async init() {
+		this.server.registerTool(
+			"meta_get_write_lease",
+			{
+				annotations: { destructiveHint: false, openWorldHint: false, readOnlyHint: true },
+				description:
+					"Read-only. Report whether another MCP session currently owns the exclusive write lease for the configured Meta ad account. Does not reveal session identifiers.",
+				inputSchema: {},
+			},
+			async () => {
+				try {
+					const env = this.env as MetaEnv;
+					const { accountId } = getWriteLockStub(env);
+					const lease = await getAccountWriteLease(env);
+					return asToolResult({ account_id: accountId, ...lease });
+				} catch (error) {
+					return asToolError(error);
+				}
+			},
+		);
+
+		this.server.registerTool(
+			"meta_release_write_lease",
+			{
+				annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false, readOnlyHint: false },
+				description:
+					"CONTROL WRITE. Release the configured Meta ad account's exclusive write lease only when it belongs to this MCP session. Exact confirmation is required. Does not change any Meta object.",
+				inputSchema: { confirmation_phrase: z.string().max(500) },
+			},
+			async ({ confirmation_phrase }) => {
+				try {
+					const env = this.env as MetaEnv;
+					assertWritesEnabled(env);
+					const { accountId } = getWriteLockStub(env);
+					assertConfirmation(confirmation_phrase, `RELEASE WRITE LEASE ${accountId}`);
+					const result = await releaseAccountWriteLease(env, this.ctx.id.toString());
+					return asToolResult({ account_id: accountId, ...result });
+				} catch (error) {
+					return asToolError(error);
+				}
+			},
+		);
+
 		this.server.registerTool(
 			"meta_get_ad_account",
 			{
@@ -1038,6 +1226,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						confirmation_phrase,
 						`SET ${object_type} ${object_id} ${status}`,
 					);
+					await acquireAccountWriteLease(
+						env,
+						this.ctx.id.toString(),
+						`SET ${object_type} ${object_id} ${status}`,
+					);
 					const result = writeResponseSchema.parse(
 						await callMetaGraph(env, "POST", object_id, { status }),
 					);
@@ -1107,6 +1300,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					if (validate_only) {
 						return asToolResult({ mode: "validate_only", before, proposed: expected, validation, verified_unchanged: true, required_confirmation: requiredConfirmation });
 					}
+					await acquireAccountWriteLease(
+						env,
+						this.ctx.id.toString(),
+						requiredConfirmation,
+					);
 					writeAttempted = true;
 					const result = writeResponseSchema.parse(await callMetaGraph(env, "POST", adset_id, params));
 					const after = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
@@ -1166,6 +1364,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					assertExpectedName(before, expected_name);
 					assertConfirmation(
 						confirmation_phrase,
+						`SET BUDGET ${object_type} ${object_id} ${budget_type} ${budget_minor}`,
+					);
+					await acquireAccountWriteLease(
+						env,
+						this.ctx.id.toString(),
 						`SET BUDGET ${object_type} ${object_id} ${budget_type} ${budget_minor}`,
 					);
 					const budgetField = budget_type === "DAILY" ? "daily_budget" : "lifetime_budget";
@@ -1281,6 +1484,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						});
 					}
 					assertConfirmation(confirmation_phrase || "", `CREATE CAMPAIGN ${name}`);
+					await acquireAccountWriteLease(
+						env,
+						this.ctx.id.toString(),
+						`CREATE CAMPAIGN ${name}`,
+					);
 					const created = await runIdempotentCreate(
 						env,
 						"campaign",
@@ -1474,6 +1682,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						confirmation_phrase || "",
 						`CREATE ADSET ${campaign_id} ${name}`,
 					);
+					await acquireAccountWriteLease(
+						env,
+						this.ctx.id.toString(),
+						`CREATE ADSET ${campaign_id} ${name}`,
+					);
 					const created = await runIdempotentCreate(
 						env,
 						"adset",
@@ -1612,6 +1825,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						confirmation_phrase || "",
 						`CREATE AD ${adset_id} ${name}`,
 					);
+					await acquireAccountWriteLease(
+						env,
+						this.ctx.id.toString(),
+						`CREATE AD ${adset_id} ${name}`,
+					);
 					const created = await runIdempotentCreate(
 						env,
 						"ad",
@@ -1731,6 +1949,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						confirmation_phrase || "",
 						`CREATE WHATSAPP VIDEO AD ${adset_id} ${name}`,
 					);
+					await acquireAccountWriteLease(
+						env,
+						this.ctx.id.toString(),
+						`CREATE WHATSAPP VIDEO AD ${adset_id} ${name}`,
+					);
 					const created = await runIdempotentCreate(
 						env,
 						"whatsapp-video-ad",
@@ -1838,6 +2061,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					assertWritesEnabled(env);
 					await assertAccessiblePage(env, page_id);
 					assertConfirmation(confirmation_phrase, `CREATE LEAD FORM ${page_id} ${name}`);
+					await acquireAccountWriteLease(
+						env,
+						this.ctx.id.toString(),
+						`CREATE LEAD FORM ${page_id} ${name}`,
+					);
 					for (const question of questions.filter((item) => item.type === "CUSTOM")) {
 						if (!question.label || !question.options || !question.key) {
 							throw new Error("CUSTOM questions require key, label, and at least two options.");
@@ -1952,6 +2180,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						confirmation_phrase || "",
 						`CREATE LEAD FORM VIDEO AD ${adset_id} ${name}`,
 					);
+					await acquireAccountWriteLease(
+						env,
+						this.ctx.id.toString(),
+						`CREATE LEAD FORM VIDEO AD ${adset_id} ${name}`,
+					);
 					const created = await runIdempotentCreate(
 						env,
 						"lead-form-video-ad",
@@ -2001,6 +2234,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					assertExpectedName(before, expected_campaign_name);
 					assertConfirmation(
 						confirmation_phrase,
+						`DELETE CAMPAIGN ${campaign_id} ${expected_campaign_name}`,
+					);
+					await acquireAccountWriteLease(
+						env,
+						this.ctx.id.toString(),
 						`DELETE CAMPAIGN ${campaign_id} ${expected_campaign_name}`,
 					);
 					const result = writeResponseSchema.parse(
