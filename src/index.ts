@@ -12,7 +12,7 @@ const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
-const CONNECTOR_VERSION = "2.3.0";
+const CONNECTOR_VERSION = "2.3.1";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -490,6 +490,127 @@ function asToolError(error: unknown) {
 	};
 }
 
+// Administrative diagnostics return only the requested subject/account. Raw
+// Graph error messages may contain unrelated asset IDs or names, so retain only
+// machine-readable error codes and never echo messages, URLs, or cursors.
+function businessDiagnosticError(error: unknown) {
+	const message = error instanceof Error ? error.message : "";
+	const code = message.match(/(?:^|[| ])code=(\d+)/)?.[1];
+	const subcode = message.match(/(?:^|[| ])subcode=(\d+)/)?.[1];
+	return `Administrative read failed${code ? ` (code=${code}${subcode ? `, subcode=${subcode}` : ""})` : ""}.`;
+}
+
+async function scanBusinessEdge(
+	env: MetaEnv,
+	businessId: string,
+	edge: "system_users" | "owned_ad_accounts" | "client_ad_accounts",
+	matchId: string | null,
+) {
+	const accountEdge = edge !== "system_users";
+	const pageSchema = z.object({
+		data: z.array(z.object({ id: z.string().regex(accountEdge ? /^act_\d+$/ : META_ID_PATTERN) }).passthrough()).max(25),
+		paging: z.object({
+			next: z.string().optional(),
+			cursors: z.object({ after: z.string().min(1).max(2_000).optional() }).optional(),
+		}).optional(),
+	});
+	const systemUserSchema = z.object({ id: z.string().regex(META_ID_PATTERN), name: z.string(), role: z.string() });
+	const accountSchema = z.object({
+		id: z.string().regex(/^act_\d+$/),
+		account_id: z.union([z.string().regex(META_ID_PATTERN), z.number().int().safe().nonnegative()]).transform(String),
+		name: z.string(),
+		business: z.object({ id: z.string().regex(META_ID_PATTERN) }).optional(),
+		user_tasks: z.array(z.string()).optional(),
+	});
+	let match: Record<string, unknown> | null = null;
+	let scanComplete = false;
+	let recordsScanned = 0;
+	let pagesRead = 0;
+	let diagnosticError: string | undefined;
+	let unsafeSystemUserIdOmitted = false;
+	let after: string | undefined;
+	const seenCursors = new Set<string>();
+	try {
+		for (let page = 0; page < 3; page++) {
+			const params: Record<string, string | number | boolean> = {
+				fields: accountEdge ? "id,account_id,name,business,user_tasks" : "id,system_user_id,name,role",
+				limit: 25,
+			};
+			if (edge === "owned_ad_accounts") params.include_shared_ad_accounts = false;
+			if (after) params.after = after;
+			const response = pageSchema.safeParse(await callMetaGraph(env, "GET", `${businessId}/${edge}`, params));
+			if (!response.success) throw new Error("Invalid administrative edge response.");
+			pagesRead += 1;
+			recordsScanned += response.data.data.length;
+			const rows = response.data.data.map((item) => {
+				if (accountEdge || item.system_user_id === undefined) return { row: item, systemUserId: undefined };
+				const systemId = z.union([z.string().regex(META_ID_PATTERN), z.number().int().safe().nonnegative()]).transform(String).safeParse(item.system_user_id);
+				if (!systemId.success) unsafeSystemUserIdOmitted = true;
+				return { row: item, systemUserId: systemId.success ? systemId.data : undefined };
+			});
+			const matched = matchId ? rows.find((item) => item.row.id === matchId || item.systemUserId === matchId) : undefined;
+			const row = matched?.row;
+			if (row) {
+				if (accountEdge) {
+					const account = accountSchema.parse(row);
+					if (`act_${account.account_id}` !== matchId) throw new Error("Account identity mismatch.");
+					// A business object can describe another portfolio on client edges.
+					// Return only equality evidence; never reveal its other ID or name.
+					match = {
+						id: account.id, account_id: account.account_id, name: account.name,
+						business_matches_requested: account.business ? account.business.id === businessId : null,
+						user_tasks: account.user_tasks,
+					};
+				} else {
+					match = { ...systemUserSchema.parse(row), system_user_id: matched?.systemUserId };
+				}
+			}
+			scanComplete = !response.data.paging?.next;
+			if (match || scanComplete) break;
+			const nextAfter = response.data.paging?.cursors?.after;
+			if (!nextAfter || seenCursors.has(nextAfter)) {
+				diagnosticError = "Pagination did not provide a new cursor; result is incomplete.";
+				break;
+			}
+			seenCursors.add(nextAfter);
+			after = nextAfter;
+		}
+	} catch (error) {
+		diagnosticError = businessDiagnosticError(error);
+	}
+	return {
+		match_found: match !== null, match, scan_complete: scanComplete,
+		records_scanned: recordsScanned, pages_read: pagesRead, diagnostic_error: diagnosticError,
+		identity_warning: unsafeSystemUserIdOmitted ? "Invalid or unsafe numeric system_user_id values were omitted; identity matching may be incomplete." : undefined,
+	};
+}
+
+async function inspectBusinessAccess(env: MetaEnv, businessId: string, tokenSubject: unknown) {
+	const subject = z.object({ id: z.string().regex(META_ID_PATTERN), name: z.string().optional() }).safeParse(tokenSubject);
+	const { accountId } = getMetaConfig(env);
+	// Each edge is independently bounded and read once per page. A failed system
+	// user lookup must not prevent ownership evidence from being inspected.
+	const systemUsers = await scanBusinessEdge(env, businessId, "system_users", subject.success ? subject.data.id : null);
+	const isRateLimited = (error?: string) => /code=(?:4|17|32|613)\b/.test(error || "");
+	const ownedAccounts = isRateLimited(systemUsers.diagnostic_error)
+		? { skipped: true, reason: "Stopped after a rate-limit response." }
+		: await scanBusinessEdge(env, businessId, "owned_ad_accounts", accountId);
+	const clientAccounts = "skipped" in ownedAccounts || isRateLimited(ownedAccounts.diagnostic_error)
+		? { skipped: true, reason: "Stopped after a rate-limit response." }
+		: ownedAccounts.match_found
+			? { skipped: true, reason: "Configured account was found in owned_ad_accounts." }
+			: await scanBusinessEdge(env, businessId, "client_ad_accounts", accountId);
+	return {
+		business_id: businessId,
+		token_subject: subject.success ? subject.data : null,
+		system_users: systemUsers,
+		owned_ad_accounts: ownedAccounts,
+		client_ad_accounts: clientAccounts,
+		assigned_ad_accounts: { skipped: true, reason: "Assignment reads are outside this bounded diagnostic." },
+		access_explanation: "System-user role and account user_tasks are observed metadata only. They do not establish administrative authorization or permission to mutate the account. No write was attempted.",
+	};
+}
+
 function isoDateDaysAgo(daysAgo: number) {
 	const date = new Date();
 	date.setUTCDate(date.getUTCDate() - daysAgo);
@@ -724,9 +845,10 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					"Read-only. Check token scopes and access to the configured ad account without exposing the Meta token. Readiness reports prerequisites only; no write access is tested.",
 				inputSchema: {
 					include_account_inventory: z.boolean().default(false).describe("Optionally scan up to 75 accessible ad accounts. Only configured-account metadata is returned; scan_complete means pagination was exhausted."),
+					business_access_diagnostic_id: z.string().regex(META_ID_PATTERN).max(30).optional().describe("Opt-in read-only diagnostic for one explicit Business ID. Returns only the token subject and configured ad account; skips Page/WhatsApp and general account inventory fanout."),
 				},
 			},
-			async ({ include_account_inventory }) => {
+			async ({ include_account_inventory, business_access_diagnostic_id }) => {
 				try {
 					const env = this.env as MetaEnv;
 					const { accountId, accountNumericId } = getMetaConfig(env);
@@ -756,7 +878,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					}
 					const accountAccessible = accountAccess !== null;
 					let accountInventory: Record<string, unknown> | undefined;
-					if (include_account_inventory) {
+					if (include_account_inventory && !business_access_diagnostic_id) {
 						const inventoryAccountSchema = accountAccessSchema.omit({ account_id: true });
 						const inventoryPageSchema = z.object({
 							data: z.array(inventoryAccountSchema).max(25),
@@ -798,9 +920,15 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							configured_account: configuredAccount, diagnostic_error: inventoryError,
 						};
 					}
+					if (business_access_diagnostic_id) accountInventory = { skipped: true, reason: "Business access diagnostic replaces general account inventory." };
+					const businessAccessDiagnostic = business_access_diagnostic_id
+						? /code=(?:4|17|32|613)\b/.test(accountAccessError || "")
+							? { skipped: true, reason: "Stopped after the account read returned a rate-limit response." }
+							: await inspectBusinessAccess(env, business_access_diagnostic_id, tokenSubject)
+						: undefined;
 					let accessiblePages: Array<Record<string, unknown>> = [];
 					let pageAccessError: string | undefined;
-					try {
+					if (!business_access_diagnostic_id) try {
 						const pageResponse = graphListSchema.parse(
 							await callMetaGraph(env, "GET", "me/accounts", {
 								fields: "id,name,tasks",
@@ -830,7 +958,9 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						}),
 					);
 					let whatsappAssetDiagnostics: Record<string, unknown> = {};
-					if (accountAccessible) try {
+					if (business_access_diagnostic_id) {
+						whatsappAssetDiagnostics = { skipped: true, reason: "Page and WhatsApp diagnostics are skipped in business access diagnostic mode." };
+					} else if (accountAccessible) try {
 						const account = z
 							.object({ business: z.object({ id: z.string(), name: z.string().optional() }).optional() })
 							.passthrough()
@@ -909,6 +1039,8 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						account_access_error: accountAccessError,
 						account: accountAccess,
 						account_inventory: accountInventory,
+						business_access_diagnostic: businessAccessDiagnostic,
+						page_diagnostics_skipped: business_access_diagnostic_id ? true : undefined,
 						accessible_pages: accessiblePages,
 						page_access_error: pageAccessError,
 						page_whatsapp_diagnostics: pageWhatsappDiagnostics,
