@@ -32,6 +32,7 @@ const ACCOUNT = "900001";
 const CAMPAIGN = "900002";
 const ADSET = "900003";
 const PAGE = "900004";
+const BUSINESS = "900006";
 const PHONE = "5511990000000";
 const CAMPAIGN_NAME = "BREVAR isolated test campaign";
 const ADSET_NAME = "BREVAR isolated test ad set";
@@ -169,6 +170,7 @@ async function harness(options = {}) {
     META_ACCESS_TOKEN: "OFFLINE_TEST_ONLY_NOT_A_CREDENTIAL",
     META_AD_ACCOUNT_ID: ACCOUNT,
     META_API_VERSION: "v26.0",
+    META_BUSINESS_ID: BUSINESS,
     META_WRITE_ENABLED: "true",
     OAUTH_KV: {
       async get(...args) { kvReads.push(args); return null; },
@@ -737,8 +739,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.2");
-  assert.equal(h.metadata.version, "2.3.2");
+  assert.equal(result.connector_version, "2.3.3");
+  assert.equal(h.metadata.version, "2.3.3");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -764,8 +766,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.2");
-  assert.equal(h.metadata.version, "2.3.2");
+  assert.equal(result.connector_version, "2.3.3");
+  assert.equal(h.metadata.version, "2.3.3");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1244,10 +1246,10 @@ test("inventory cannot promote failed direct configured-account access to readin
   assertReadOnlyDiagnostic(h);
 });
 
-const BUSINESS = "900006";
 const businessInput = { business_access_diagnostic_id: BUSINESS };
 const businessAccount = { id: `act_${ACCOUNT}`, account_id: ACCOUNT, name: "Configured account", business: { id: BUSINESS }, user_tasks: ["ANALYZE", "ADVERTISE"] };
 const systemUser = { id: "900005", name: "Offline test subject", role: "ADMIN" };
+const assignedSystemUser = { id: systemUser.id, name: systemUser.name, user_type: "SYSTEM_USER", tasks: ["ANALYZE", "ADVERTISE"] };
 const otherSystemUser = { id: "888881", name: "PRIVATE_OTHER_SUBJECT", role: "ADMIN" };
 const otherBusinessAccount = { id: "act_888882", account_id: "888882", name: "PRIVATE_OTHER_ACCOUNT" };
 
@@ -1257,7 +1259,8 @@ function businessFixtures(overrides = {}) {
     if (override) return typeof override === "function" ? override(call) : override;
     if (call.path === `${BUSINESS}/system_users`) return { data: [otherSystemUser, systemUser] };
     if (call.path === `${BUSINESS}/owned_ad_accounts`) return { data: [otherBusinessAccount, businessAccount] };
-    if (call.path === `${BUSINESS}/client_ad_accounts`) return { data: [] };
+    if (call.path === `${BUSINESS}/client_ad_accounts`) return { data: [businessAccount] };
+    if (call.method === "GET" && call.path === `act_${ACCOUNT}/assigned_users`) return { data: [assignedSystemUser] };
   };
 }
 
@@ -1271,6 +1274,442 @@ function assertBoundedBusinessRead(h) {
     for (const call of calls) assert.equal(call.params.limit, "25");
   }
 }
+
+const SELF_ASSIGNMENT_CONFIRMATION =
+  `ASSIGN SYSTEM USER 900005 ADVERTISE ANALYZE ON act_${ACCOUNT} VIA BUSINESS ${BUSINESS}`;
+
+test("self-assignment preflight is read-only and exposes one exact bounded confirmation", async () => {
+  const h = await harness({ respond: businessFixtures({
+    [`${BUSINESS}/system_users`]: { data: [systemUser] },
+    [`act_${ACCOUNT}/assigned_users`]: { data: [] },
+  }) });
+  const result = toolPayload(await h.invoke("meta_recovery_assign_self_to_configured_account"));
+  assert.equal(result.mode, "preflight");
+  assert.equal(result.business_id, BUSINESS);
+  assert.equal(result.token_subject.id, "900005");
+  assert.deepEqual(result.required_tasks, ["ADVERTISE", "ANALYZE"]);
+  assert.equal(result.required_confirmation, SELF_ASSIGNMENT_CONFIRMATION);
+  assert.equal(result.scope.system_user.role, "ADMIN");
+  assert.equal(result.scope.account.id, `act_${ACCOUNT}`);
+  assert.equal(result.before.match_found, false);
+  assert.equal(result.before.required_tasks_present, false);
+  assert.equal(result.write_attempted, false);
+  assert.equal(h.lockCalls.length, 0);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.auditEvents.length, 0);
+  assert.equal(h.calls.some(call => call.path.endsWith("/owned_ad_accounts")), false);
+  const assignedRead = h.calls.find(call => call.path === `act_${ACCOUNT}/assigned_users`);
+  assert.deepEqual(assignedRead.params, {
+    business: BUSINESS,
+    fields: "id,name,user_type,tasks",
+    limit: "25",
+  });
+});
+
+test("self-assignment is a verified no-op when both tasks and direct access already exist", async () => {
+  const h = await harness({ respond: businessFixtures() });
+  const result = toolPayload(await h.invoke("meta_recovery_assign_self_to_configured_account", {
+    confirmation_phrase: SELF_ASSIGNMENT_CONFIRMATION,
+    validate_only: false,
+  }));
+  assert.equal(result.mode, "no_change");
+  assert.equal(result.verified, true);
+  assert.deepEqual(result.before.current_tasks, ["ANALYZE", "ADVERTISE"]);
+  assert.equal(result.account_access_before.accessible, true);
+  assert.equal(h.lockCalls.length, 0);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.auditEvents.length, 0);
+});
+
+test("self-assignment posts only the live subject and fixed partial tasks, then verifies twice", async () => {
+  let assigned = false;
+  const h = await harness({ respond(call) {
+    if (call.path === `${BUSINESS}/system_users`) return { data: [systemUser] };
+    if (call.path === `${BUSINESS}/client_ad_accounts`) return { data: [businessAccount] };
+    if (call.path === `act_${ACCOUNT}/assigned_users` && call.method === "GET") {
+      return { data: assigned ? [{ ...assignedSystemUser, tasks: ["ADVERTISE", "ANALYZE"] }] : [] };
+    }
+    if (call.path === `act_${ACCOUNT}` && call.method === "GET") {
+      if (!assigned) return { httpStatus: 403, body: { error: { code: 200, message: "Offline access denied" } } };
+      return { id: `act_${ACCOUNT}`, account_id: ACCOUNT, name: "Offline account", account_status: 1 };
+    }
+    if (call.path === `act_${ACCOUNT}/assigned_users` && call.method === "POST") {
+      assert.deepEqual(call.params, {
+        tasks: ["ADVERTISE", "ANALYZE"],
+        user: "900005",
+      });
+      assigned = true;
+      return { success: true };
+    }
+  } });
+  const result = toolPayload(await h.invoke("meta_recovery_assign_self_to_configured_account", {
+    confirmation_phrase: SELF_ASSIGNMENT_CONFIRMATION,
+    validate_only: false,
+  }));
+  assert.equal(result.mode, "assigned");
+  assert.equal(result.verified, true);
+  assert.equal(result.write_response_confirmed, true);
+  assert.equal(result.account_access_before.accessible, false);
+  assert.equal(result.account_access_after.accessible, true);
+  assert.deepEqual(result.after.current_tasks, ["ADVERTISE", "ANALYZE"]);
+  assert.equal(postCalls(h).length, 1);
+  assert.equal(h.lockCalls.length, 1);
+  assert.deepEqual(h.lockCalls[0].payload, {
+    action: "acquire",
+    holder: "offline-session-1",
+    operation: SELF_ASSIGNMENT_CONFIRMATION,
+    ttl_ms: 600000,
+  });
+  assert.equal(h.auditEvents.length, 1);
+  const audit = JSON.parse(h.auditEvents[0]);
+  assert.equal(audit.operation, "assign_self_system_user");
+  assert.equal(audit.verified, true);
+  assert.deepEqual(audit.tasks, ["ADVERTISE", "ANALYZE"]);
+  assert.equal(JSON.stringify(h.calls).includes("MANAGE"), false);
+});
+
+test("alternate Business row ID maps to /me and the POST uses that app-scoped row ID", async () => {
+  let assigned = false;
+  const appScopedId = "777777";
+  const confirmation =
+    `ASSIGN SYSTEM USER ${appScopedId} ADVERTISE ANALYZE ON act_${ACCOUNT} VIA BUSINESS ${BUSINESS}`;
+  const h = await harness({ respond(call) {
+    if (call.path === `${BUSINESS}/system_users`) {
+      return { data: [{ id: appScopedId, system_user_id: "900005", name: "Mapped subject", role: "ADMIN" }] };
+    }
+    if (call.path === `${BUSINESS}/client_ad_accounts`) return { data: [businessAccount] };
+    if (call.path === `act_${ACCOUNT}/assigned_users` && call.method === "GET") {
+      return { data: assigned ? [{ id: appScopedId, name: "Mapped subject", user_type: "SYSTEM_USER", tasks: ["ADVERTISE", "ANALYZE"] }] : [] };
+    }
+    if (call.path === `act_${ACCOUNT}/assigned_users`) {
+      assert.equal(call.params.user, appScopedId);
+      assigned = true;
+      return { success: true };
+    }
+  } });
+  const result = toolPayload(await h.invoke("meta_recovery_assign_self_to_configured_account", {
+    confirmation_phrase: confirmation,
+    validate_only: false,
+  }));
+  assert.equal(result.verified, true);
+  assert.equal(result.scope.system_user.id, appScopedId);
+  assert.equal(result.scope.system_user.system_user_id, "900005");
+  assert.equal(postCalls(h)[0].params.user, appScopedId);
+});
+
+test("self-assignment fails closed when two Business rows map to /me across bounded pages", async () => {
+  let systemUserReads = 0;
+  const h = await harness({ respond: businessFixtures({
+    [`${BUSINESS}/system_users`]: (call) => {
+      systemUserReads += 1;
+      if (systemUserReads === 1) {
+        return {
+          data: [systemUser],
+          paging: { next: "https://never-follow.invalid/system-users", cursors: { after: "SYSTEM_CURSOR_1" } },
+        };
+      }
+      assert.equal(call.params.after, "SYSTEM_CURSOR_1");
+      return {
+        data: [{ id: "777777", system_user_id: systemUser.id, name: "Duplicate mapping", role: "ADMIN" }],
+      };
+    },
+  }) });
+  const result = await h.invoke("meta_recovery_assign_self_to_configured_account");
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /More than one Business system-user row maps/i);
+  assert.equal(systemUserReads, 2);
+  assert.equal(h.calls.some(call => call.path.endsWith("/client_ad_accounts")), false);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.lockCalls.length, 0);
+});
+
+for (const [label, env, respond, expected] of [
+  ["missing configured Business", { META_BUSINESS_ID: undefined }, undefined, /META_BUSINESS_ID/],
+  ["invalid configured Business", { META_BUSINESS_ID: "../900006" }, undefined, /META_BUSINESS_ID/],
+  ["subject absent from Business", {}, businessFixtures({ [`${BUSINESS}/system_users`]: { data: [] } }), /not a system user/],
+  ["subject is not ADMIN", {}, businessFixtures({ [`${BUSINESS}/system_users`]: { data: [{ ...systemUser, role: "EMPLOYEE" }] } }), /not an ADMIN/],
+  ["unsafe system-user identity metadata", {}, businessFixtures({ [`${BUSINESS}/system_users`]: { data: [{ ...systemUser, system_user_id: "unsafe" }] } }), /Invalid or unsafe numeric system_user_id/],
+  ["account absent from client edge", {}, businessFixtures({ [`${BUSINESS}/client_ad_accounts`]: { data: [] } }), /not a client ad account/],
+]) test(`self-assignment fails closed for ${label}`, async () => {
+  const h = await harness({ env, respond });
+  const result = await h.invoke("meta_recovery_assign_self_to_configured_account");
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, expected);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.lockCalls.length, 0);
+  assert.equal(h.auditEvents.length, 0);
+});
+
+test("wrong self-assignment confirmation stops before assigned-user reads, locks, or writes", async () => {
+  const h = await harness({ respond: businessFixtures() });
+  const result = await h.invoke("meta_recovery_assign_self_to_configured_account", {
+    confirmation_phrase: "ASSIGN SOMETHING ELSE",
+    validate_only: false,
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Confirmation mismatch/);
+  assert.deepEqual(h.calls.map(call => call.path), [
+    "me",
+    `${BUSINESS}/system_users`,
+    `${BUSINESS}/client_ad_accounts`,
+  ]);
+  assert.equal(h.lockCalls.length, 0);
+  assert.equal(postCalls(h).length, 0);
+});
+
+test("write lock blocks self-assignment before the Meta POST", async () => {
+  const h = await harness({
+    respond: businessFixtures({
+      [`${BUSINESS}/system_users`]: { data: [systemUser] },
+      [`act_${ACCOUNT}/assigned_users`]: { data: [] },
+    }),
+    writeLockRespond(call) {
+      if (call.payload.action === "acquire") return {
+        httpStatus: 409,
+        body: { code: "WRITE_LOCKED", expires_at: "2099-01-01T00:00:00.000Z", operation: "another write" },
+      };
+    },
+  });
+  const result = await h.invoke("meta_recovery_assign_self_to_configured_account", {
+    confirmation_phrase: SELF_ASSIGNMENT_CONFIRMATION,
+    validate_only: false,
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_LOCKED/);
+  assert.equal(h.lockCalls.length, 1);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.auditEvents.length, 0);
+});
+
+for (const [label, response] of [
+  ["empty success body", {}],
+  ["inactive lease", { active: false, acquired: false, expires_at: "2099-01-01T00:00:00.000Z" }],
+  ["expired active lease", { active: true, acquired: true, expires_at: "2000-01-01T00:00:00.000Z" }],
+]) test(`self-assignment rejects a write-lock ${label} before the Meta POST`, async () => {
+  const h = await harness({
+    respond: businessFixtures({
+      [`${BUSINESS}/system_users`]: { data: [systemUser] },
+      [`act_${ACCOUNT}/assigned_users`]: { data: [] },
+    }),
+    writeLockRespond(call) {
+      if (call.payload.action === "acquire") return { body: response };
+    },
+  });
+  const result = await h.invoke("meta_recovery_assign_self_to_configured_account", {
+    confirmation_phrase: SELF_ASSIGNMENT_CONFIRMATION,
+    validate_only: false,
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /did not confirm an active account lease/i);
+  assert.equal(h.lockCalls.length, 1);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.auditEvents.length, 0);
+});
+
+test("self-assignment never repeats the POST when tasks exist but direct access is unconfirmed", async () => {
+  const h = await harness({ respond: businessFixtures({
+    [`act_${ACCOUNT}`]: { httpStatus: 403, body: { error: { code: 200, message: "Offline access denied" } } },
+  }) });
+  const result = await h.invoke("meta_recovery_assign_self_to_configured_account", {
+    confirmation_phrase: SELF_ASSIGNMENT_CONFIRMATION,
+    validate_only: false,
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /already contains ADVERTISE \+ ANALYZE/i);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.lockCalls.length, 0);
+  assert.equal(h.auditEvents.length, 0);
+});
+
+test("self-assignment never replaces an existing task outside the bounded partial-access set", async () => {
+  const h = await harness({ respond: businessFixtures({
+    [`act_${ACCOUNT}/assigned_users`]: {
+      data: [{ ...assignedSystemUser, tasks: ["ANALYZE", "MANAGE"] }],
+    },
+  }) });
+  const result = await h.invoke("meta_recovery_assign_self_to_configured_account", {
+    confirmation_phrase: SELF_ASSIGNMENT_CONFIRMATION,
+    validate_only: false,
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /tasks outside the bounded ADVERTISE \+ ANALYZE scope/i);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.lockCalls.length, 0);
+  assert.equal(h.auditEvents.length, 0);
+  assert.equal(h.calls.some(call => call.path === `act_${ACCOUNT}`), false);
+});
+
+test("an ambiguous assignment response is reconciled only by exact live read-back and never retried", async () => {
+  let assigned = false;
+  const h = await harness({ respond(call) {
+    if (call.path === `${BUSINESS}/system_users`) return { data: [systemUser] };
+    if (call.path === `${BUSINESS}/client_ad_accounts`) return { data: [businessAccount] };
+    if (call.path === `act_${ACCOUNT}/assigned_users` && call.method === "GET") {
+      return { data: assigned ? [assignedSystemUser] : [] };
+    }
+    if (call.path === `act_${ACCOUNT}` && call.method === "GET") {
+      if (!assigned) return { httpStatus: 403, body: { error: { code: 200, message: "Offline denied" } } };
+      return { id: `act_${ACCOUNT}`, account_id: ACCOUNT, name: "Offline account", account_status: 1 };
+    }
+    if (call.path === `act_${ACCOUNT}/assigned_users` && call.method === "POST") {
+      assigned = true;
+      return { httpStatus: 500, body: { error: { code: 1, message: "Offline ambiguous response" } } };
+    }
+  } });
+  const result = toolPayload(await h.invoke("meta_recovery_assign_self_to_configured_account", {
+    confirmation_phrase: SELF_ASSIGNMENT_CONFIRMATION,
+    validate_only: false,
+  }));
+  assert.equal(result.mode, "reconciled");
+  assert.equal(result.verified, true);
+  assert.equal(result.reconciled_after_ambiguous_write, true);
+  assert.equal(result.write_response_confirmed, false);
+  assert.equal(postCalls(h).length, 1);
+  assert.equal(h.auditEvents.length, 1);
+});
+
+test("self-assignment reports an unverified write once when read-back lacks the tasks", async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === `${BUSINESS}/system_users`) return { data: [systemUser] };
+    if (call.path === `${BUSINESS}/client_ad_accounts`) return { data: [businessAccount] };
+    if (call.path === `act_${ACCOUNT}/assigned_users` && call.method === "GET") return { data: [] };
+    if (call.path === `act_${ACCOUNT}/assigned_users` && call.method === "POST") return { success: true };
+  } });
+  const result = await h.invoke("meta_recovery_assign_self_to_configured_account", {
+    confirmation_phrase: SELF_ASSIGNMENT_CONFIRMATION,
+    validate_only: false,
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /were not both confirmed afterward/i);
+  assert.equal(postCalls(h).length, 1);
+  assert.equal(h.auditEvents.length, 1);
+  const audit = JSON.parse(h.auditEvents[0]);
+  assert.equal(audit.operation, "assign_self_system_user");
+  assert.equal(audit.verified, false);
+});
+
+test("post-write read-back rejects tasks outside the exact bounded partial-access set", async () => {
+  let assignedReads = 0;
+  const h = await harness({ respond(call) {
+    if (call.path === `${BUSINESS}/system_users`) return { data: [systemUser] };
+    if (call.path === `${BUSINESS}/client_ad_accounts`) return { data: [businessAccount] };
+    if (call.path === `act_${ACCOUNT}/assigned_users` && call.method === "GET") {
+      assignedReads += 1;
+      return assignedReads === 1
+        ? { data: [] }
+        : { data: [{ ...assignedSystemUser, tasks: ["ADVERTISE", "ANALYZE", "MANAGE"] }] };
+    }
+    if (call.path === `act_${ACCOUNT}/assigned_users` && call.method === "POST") return { success: true };
+  } });
+  const result = await h.invoke("meta_recovery_assign_self_to_configured_account", {
+    confirmation_phrase: SELF_ASSIGNMENT_CONFIRMATION,
+    validate_only: false,
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /exact bounded ADVERTISE \+ ANALYZE task set/i);
+  assert.equal(postCalls(h).length, 1);
+  assert.equal(assignedReads, 2);
+  assert.equal(JSON.parse(h.auditEvents[0]).verified, false);
+});
+
+test("self-assignment follows only bounded assigned_users cursors and fails closed on an incomplete scan", async () => {
+  let assignedReads = 0;
+  const h = await harness({ respond(call) {
+    if (call.path === `${BUSINESS}/system_users`) return { data: [systemUser] };
+    if (call.path === `${BUSINESS}/client_ad_accounts`) return { data: [businessAccount] };
+    if (call.path === `act_${ACCOUNT}/assigned_users` && call.method === "GET") {
+      assignedReads += 1;
+      if (assignedReads > 1) assert.equal(call.params.after, `ASSIGNED_CURSOR_${assignedReads - 1}`);
+      return {
+        data: [{ id: `88888${assignedReads}`, name: "PRIVATE_OTHER", user_type: "SYSTEM_USER", tasks: ["ANALYZE"] }],
+        paging: { next: "https://never-follow.invalid/private", cursors: { after: `ASSIGNED_CURSOR_${assignedReads}` } },
+      };
+    }
+  } });
+  const result = await h.invoke("meta_recovery_assign_self_to_configured_account");
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /bounded assigned-user scan was incomplete/i);
+  assert.equal(assignedReads, 3);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.lockCalls.length, 0);
+  assert.doesNotMatch(result.content[0].text, /PRIVATE_OTHER|never-follow|ASSIGNED_CURSOR/);
+});
+
+test("self-assignment rejects malformed assigned_users rows before any lock or POST", async () => {
+  const h = await harness({ respond: businessFixtures({
+    [`act_${ACCOUNT}/assigned_users`]: {
+      data: [{ id: systemUser.id, name: systemUser.name, tasks: ["ANALYZE"] }],
+    },
+  }) });
+  const result = await h.invoke("meta_recovery_assign_self_to_configured_account");
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /current assigned-user tasks/i);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.lockCalls.length, 0);
+});
+
+test("self-assignment requires the exact assigned-user match to be a SYSTEM_USER", async () => {
+  const h = await harness({ respond: businessFixtures({
+    [`act_${ACCOUNT}/assigned_users`]: {
+      data: [{ ...assignedSystemUser, user_type: "BUSINESS_USER" }],
+    },
+  }) });
+  const result = await h.invoke("meta_recovery_assign_self_to_configured_account");
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /current assigned-user tasks/i);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.lockCalls.length, 0);
+});
+
+test("unrelated BUSINESS_USER rows do not invalidate an exact SYSTEM_USER read-back", async () => {
+  const h = await harness({ respond: businessFixtures({
+    [`act_${ACCOUNT}/assigned_users`]: {
+      data: [
+        { id: "888887", name: "Unrelated human", user_type: "BUSINESS_USER", tasks: ["ANALYZE"] },
+        assignedSystemUser,
+      ],
+    },
+  }) });
+  const result = toolPayload(await h.invoke("meta_recovery_assign_self_to_configured_account", {
+    confirmation_phrase: SELF_ASSIGNMENT_CONFIRMATION,
+    validate_only: false,
+  }));
+  assert.equal(result.mode, "no_change");
+  assert.equal(result.verified, true);
+  assert.equal(postCalls(h).length, 0);
+});
+
+test("post-write read-back must match the exact app-scoped system-user row", async () => {
+  let assignedReads = 0;
+  const h = await harness({ respond(call) {
+    if (call.path === `${BUSINESS}/system_users`) return { data: [systemUser] };
+    if (call.path === `${BUSINESS}/client_ad_accounts`) return { data: [businessAccount] };
+    if (call.path === `act_${ACCOUNT}/assigned_users` && call.method === "GET") {
+      assignedReads += 1;
+      return assignedReads === 1
+        ? { data: [] }
+        : { data: [{ ...assignedSystemUser, id: "888889", tasks: ["ADVERTISE", "ANALYZE"] }] };
+    }
+    if (call.path === `act_${ACCOUNT}/assigned_users` && call.method === "POST") return { success: true };
+  } });
+  const result = await h.invoke("meta_recovery_assign_self_to_configured_account", {
+    confirmation_phrase: SELF_ASSIGNMENT_CONFIRMATION,
+    validate_only: false,
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /were not both confirmed afterward/i);
+  assert.equal(postCalls(h).length, 1);
+  assert.equal(assignedReads, 2);
+});
+
+test("self-assignment honors META_WRITE_ENABLED before any Graph read", async () => {
+  const h = await harness({ env: { META_WRITE_ENABLED: "false" } });
+  const result = await h.invoke("meta_recovery_assign_self_to_configured_account");
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /META_WRITE_ENABLED/);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.lockCalls.length, 0);
+});
 
 test("business diagnostic observes ADMIN and ownership without promoting denied account access or disclosing unrelated assets", async () => {
   const h = await harness({ respond: businessFixtures({
@@ -1464,7 +1903,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.2");
+  assert.equal(result.connector_version, "2.3.3");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1538,7 +1977,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.2");
+  assert.equal(result.connector_version, "2.3.3");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1744,7 +2183,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.2");
+    assert.equal(result.connector_version, "2.3.3");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
