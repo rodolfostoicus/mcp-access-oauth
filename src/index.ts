@@ -11,7 +11,7 @@ const META_GRAPH_ORIGIN = "https://graph.facebook.com";
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
-const CONNECTOR_VERSION = "2.2.10";
+const CONNECTOR_VERSION = "2.2.11";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -245,6 +245,7 @@ async function getOwnedObject(
 	env: MetaEnv,
 	objectType: OwnedObjectType,
 	objectId: string,
+	additionalFields = "",
 ) {
 	if (!META_ID_PATTERN.test(objectId)) {
 		throw new Error(`${objectType.toLowerCase()}_id must contain only digits.`);
@@ -258,7 +259,7 @@ async function getOwnedObject(
 	};
 	const snapshot = objectSchema.parse(
 		await callMetaGraph(env, "GET", objectId, {
-			fields: fieldsByType[objectType],
+			fields: fieldsByType[objectType] + (additionalFields ? `,${additionalFields}` : ""),
 		}),
 	);
 	const { accountNumericId } = getMetaConfig(env);
@@ -268,6 +269,26 @@ async function getOwnedObject(
 		);
 	}
 	return snapshot;
+}
+
+const ADSET_AGE_AUDIT_FIELDS = "targeting,targeting_optimization_types,start_time,end_time,adset_schedule,pacing_type,bid_strategy,bid_amount";
+
+// Compare JSON objects without relying on Graph's object-key order. Array order
+// is intentionally retained: an unexplained difference must stop the operation.
+function canonicalJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	if (value && typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+	}
+	return JSON.stringify(value) ?? "undefined";
+}
+
+function adsetAgeDifferences(expected: Record<string, unknown>, actual: Record<string, unknown>) {
+	// effective_status is a live delivery/review result, not a setting. Preserve
+	// configured status, and return effective_status in the snapshots for review.
+	return [...new Set([...Object.keys(expected), ...Object.keys(actual)])]
+		.filter((key) => key !== "effective_status" && canonicalJson(expected[key]) !== canonicalJson(actual[key]));
 }
 
 function assertExpectedName(snapshot: z.infer<typeof objectSchema>, expectedName: string) {
@@ -952,6 +973,83 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					});
 					return asToolResult({ before, result, after });
 				} catch (error) {
+					return asToolError(error);
+				}
+			},
+		);
+
+		this.server.registerTool(
+			"meta_update_adset_age",
+			{
+				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: false },
+				description:
+					"WRITE/PREVIEW. Update only age_min/age_max and optionally the name of one owned ad set. Defaults to validate_only. Requires exact current name and exact confirmation for a real write. Preserves the complete existing targeting, expansion settings, budget, schedule, destination, optimization, and configured status. Validates with Meta, checks for concurrent changes, and verifies the saved result. Never activates or creates objects.",
+				inputSchema: {
+					adset_id: z.string().regex(META_ID_PATTERN),
+					age_min: z.number().int().min(18).max(65),
+					age_max: z.number().int().min(18).max(65),
+					confirmation_phrase: z.string().max(1_000).optional(),
+					expected_name: z.string().min(1).max(500),
+					name: z.string().trim().min(1).max(500).optional(),
+					validate_only: z.boolean().default(true),
+				},
+			},
+			async ({ adset_id, age_min, age_max, confirmation_phrase, expected_name, name, validate_only }) => {
+				let writeAttempted = false;
+				try {
+					const env = this.env as MetaEnv;
+					assertWritesEnabled(env);
+					if (age_min > age_max) throw new Error("age_min must not exceed age_max.");
+					const before = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
+					assertExpectedName(before, expected_name);
+					if (before.id !== adset_id) throw new Error("Ad-set ID did not match the requested object.");
+					if (before.status !== "ACTIVE" && before.status !== "PAUSED") {
+						throw new Error("Only ACTIVE or PAUSED ad sets may have their age updated.");
+					}
+					const targeting = targetingSchema.parse(before.targeting);
+					if (!Number.isInteger(targeting.age_min) || !Number.isInteger(targeting.age_max)) {
+						throw new Error("Cannot update ages without a complete current age_min/age_max snapshot.");
+					}
+					const nextTargeting = { ...targeting, age_min, age_max };
+					const params: Record<string, string | number | boolean | object> = { targeting: nextTargeting };
+					if (name !== undefined) params.name = name;
+					const expected = { ...before, targeting: nextTargeting, name: name ?? before.name };
+					const requiredConfirmation = `UPDATE ADSET AGE ${adset_id} ${age_min} ${age_max}${name !== undefined ? ` NAME ${name}` : ""}`;
+					if (!validate_only) assertConfirmation(confirmation_phrase || "", requiredConfirmation);
+					if (adsetAgeDifferences(expected, before).length === 0) {
+						return asToolResult({ mode: "no_change", before, after: before, verified: true, required_confirmation: requiredConfirmation });
+					}
+					const validation = writeResponseSchema.parse(await callMetaGraph(env, "POST", adset_id, {
+						...params, execution_options: ["validate_only"],
+					}));
+					if (validation.success !== true) throw new Error("Meta did not confirm successful age-update validation; no real write attempted.");
+					const rechecked = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
+					const concurrentChanges = adsetAgeDifferences(before, rechecked);
+					if (concurrentChanges.length > 0) {
+						throw new Error(`Ad set changed during validation (${concurrentChanges.join(", ")}); no real write attempted. Read current settings and validate again.`);
+					}
+					if (validate_only) {
+						return asToolResult({ mode: "validate_only", before, proposed: expected, validation, verified_unchanged: true, required_confirmation: requiredConfirmation });
+					}
+					writeAttempted = true;
+					const result = writeResponseSchema.parse(await callMetaGraph(env, "POST", adset_id, params));
+					const after = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
+					const mismatches = adsetAgeDifferences(expected, after);
+					const verified = result.success === true && mismatches.length === 0;
+					auditMutation("update_adset_age", {
+						adset_id, age_min, age_max, previous_age_min: targeting.age_min,
+						previous_age_max: targeting.age_max, renamed: name !== undefined,
+						verified, mismatches,
+					});
+					const response = asToolResult({ mode: "updated", before, result, after, verified, mismatches,
+						...(!verified ? { warning: "Write attempted but saved settings did not pass verification. Inspect the returned snapshots before any further mutation; no automatic retry or rollback was performed." } : {}),
+					});
+					return verified ? response : { ...response, isError: true };
+				} catch (error) {
+					if (writeAttempted) {
+						auditMutation("update_adset_age_unverified", { adset_id, age_min, age_max });
+						return asToolError(new Error(`Real update was attempted; its final state is unverified. Read the ad set before retrying. ${error instanceof Error ? error.message : "Unknown error."}`));
+					}
 					return asToolError(error);
 				}
 			},
