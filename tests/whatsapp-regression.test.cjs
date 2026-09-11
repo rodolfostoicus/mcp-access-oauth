@@ -71,6 +71,7 @@ async function harness(options = {}) {
   const calls = [];
   const kvWrites = [];
   const kvReads = [];
+  const lockCalls = [];
   const auditEvents = [];
   class MockServer {
     constructor(metadata) { this.metadata = metadata; }
@@ -156,6 +157,9 @@ async function harness(options = {}) {
   };
   vm.runInNewContext(compiled, context, { filename: sourcePath });
   const agent = new moduleObject.exports.MyMCP();
+  agent.ctx = {
+    id: { toString() { return options.sessionId ?? "offline-session-1"; } },
+  };
   agent.env = {
     META_ACCESS_TOKEN: "OFFLINE_TEST_ONLY_NOT_A_CREDENTIAL",
     META_AD_ACCOUNT_ID: ACCOUNT,
@@ -165,11 +169,31 @@ async function harness(options = {}) {
       async get(...args) { kvReads.push(args); return null; },
       async put(...args) { kvWrites.push(args); },
     },
+    META_WRITE_LOCK: {
+      idFromName(name) { return `lock:${name}`; },
+      get(id) {
+        return {
+          async fetch(url, init) {
+            const call = { id, url: String(url), payload: JSON.parse(String(init.body)) };
+            lockCalls.push(call);
+            const override = options.writeLockRespond && await options.writeLockRespond(call);
+            const response = override ?? (call.payload.action === "status"
+              ? { body: { active: false } }
+              : { body: { active: call.payload.action === "acquire", acquired: call.payload.action === "acquire", released: call.payload.action === "release", expires_at: "2099-01-01T00:00:00.000Z" } });
+            return new Response(JSON.stringify(response.body ?? response), {
+              status: response.httpStatus ?? 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          },
+        };
+      },
+    },
     ...options.env,
   };
   await agent.init();
   return {
-    calls, kvWrites, kvReads, auditEvents, metadata: agent.server.metadata,
+    calls, kvWrites, kvReads, lockCalls, auditEvents, metadata: agent.server.metadata,
+    MetaWriteLock: moduleObject.exports.MetaWriteLock,
     async invoke(name, input = {}) {
       const tool = registered.get(name);
       assert.ok(tool, `Tool must be registered: ${name}`);
@@ -261,6 +285,7 @@ test("age update defaults to a Meta validation with unchanged read-back, complet
   assert.deepEqual(result.before, initial);
   assert.deepEqual(result.proposed, { ...initial, targeting: post.params.targeting });
   assert.equal(h.kvWrites.length, 0);
+  assert.equal(h.lockCalls.length, 0);
   assert.equal(h.auditEvents.length, 0);
 });
 
@@ -287,7 +312,83 @@ for (const rename of [false, true]) test(`age update verifies an existing active
   assert.deepEqual(h.calls.map(c => c.method), ["GET", "POST", "GET", "POST", "GET"]);
   assert.equal(h.auditEvents.length, 1);
   assert.equal(JSON.parse(h.auditEvents[0]).operation, "update_adset_age");
+  assert.equal(h.lockCalls.length, 1);
+  assert.deepEqual(h.lockCalls[0].payload, {
+    action: "acquire",
+    holder: "offline-session-1",
+    operation: `UPDATE ADSET AGE ${ADSET} 25 50${rename ? ` NAME ${requestedName}` : ""}`,
+    ttl_ms: 600000,
+  });
   assert.equal(h.kvWrites.length, 0);
+});
+
+test("a competing MCP session is blocked before the real age mutation", async () => {
+  const h = await harness({ adset: ageFixture(), writeLockRespond(call) {
+    if (call.payload.action === "acquire") {
+      return {
+        httpStatus: 409,
+        body: {
+          code: "WRITE_LOCKED",
+          expires_at: "2099-01-01T00:00:00.000Z",
+          operation: "CREATE CAMPAIGN from another chat",
+        },
+      };
+    }
+  } });
+  const result = await h.invoke("meta_update_adset_age", ageInput({
+    validate_only: false,
+    confirmation_phrase: `UPDATE ADSET AGE ${ADSET} 25 50`,
+  }));
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_LOCKED/);
+  assert.equal(h.lockCalls.length, 1);
+  assert.deepEqual(postCalls(h).map(call => call.params.execution_options), [["validate_only"]]);
+  assert.equal(h.auditEvents.length, 0);
+});
+
+test("write-lease tools report status and only release the current session lease", async () => {
+  const h = await harness();
+  const status = toolPayload(await h.invoke("meta_get_write_lease"));
+  assert.equal(status.account_id, `act_${ACCOUNT}`);
+  assert.equal(status.active, false);
+  const released = toolPayload(await h.invoke("meta_release_write_lease", {
+    confirmation_phrase: `RELEASE WRITE LEASE act_${ACCOUNT}`,
+  }));
+  assert.equal(released.released, true);
+  assert.deepEqual(h.lockCalls.map(call => call.payload.action), ["status", "release"]);
+  assert.equal(h.calls.length, 0);
+});
+
+test("account write lease is exclusive, renewable by its holder, and explicitly releasable", async () => {
+  const h = await harness();
+  const values = new Map();
+  const state = {
+    async blockConcurrencyWhile(callback) { return callback(); },
+    storage: {
+      async get(key) { return values.get(key); },
+      async put(key, value) { values.set(key, value); },
+      async delete(key) { return values.delete(key); },
+    },
+  };
+  const lock = new h.MetaWriteLock(state);
+  const invoke = (payload) => lock.fetch(new Request("https://lock.example/lease", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }));
+  const first = await invoke({ action: "acquire", holder: "chat-a", operation: "write A", ttl_ms: 600000 });
+  assert.equal(first.status, 200);
+  const competing = await invoke({ action: "acquire", holder: "chat-b", operation: "write B", ttl_ms: 600000 });
+  assert.equal(competing.status, 409);
+  assert.equal((await competing.json()).code, "WRITE_LOCKED");
+  const renewed = await invoke({ action: "acquire", holder: "chat-a", operation: "write A2", ttl_ms: 600000 });
+  assert.equal(renewed.status, 200);
+  assert.equal((await renewed.json()).acquired, false);
+  const wrongRelease = await invoke({ action: "release", holder: "chat-b" });
+  assert.equal(wrongRelease.status, 409);
+  const released = await invoke({ action: "release", holder: "chat-a" });
+  assert.equal(released.status, 200);
+  assert.equal((await released.json()).released, true);
 });
 
 for (const [label, initial, input] of [
@@ -565,8 +666,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("Page WhatsApp diagnostics are read-only and report connector version", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.2.12");
-  assert.equal(h.metadata.version, "2.2.12");
+  assert.equal(result.connector_version, "2.3.0");
+  assert.equal(h.metadata.version, "2.3.0");
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, true);
   assert.equal(result.write_switch_enabled, true);
@@ -768,7 +869,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.12");
+  assert.equal(result.connector_version, "2.3.0");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -842,7 +943,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.12");
+  assert.equal(result.connector_version, "2.3.0");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1048,7 +1149,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.2.12");
+    assert.equal(result.connector_version, "2.3.0");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);

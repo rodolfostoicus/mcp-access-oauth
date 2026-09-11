@@ -11,6 +11,10 @@
     {
       "new_sqlite_classes": ["MyMCP"],
       "tag": "v1"
+    },
+    {
+      "new_sqlite_classes": ["MetaWriteLock"],
+      "tag": "v2"
     }
   ],
   "compatibility_flags": ["nodejs_compat"],
@@ -19,6 +23,10 @@
       {
         "class_name": "MyMCP",
         "name": "MCP_OBJECT"
+      },
+      {
+        "class_name": "MetaWriteLock",
+        "name": "META_WRITE_LOCK"
       }
     ]
   },
