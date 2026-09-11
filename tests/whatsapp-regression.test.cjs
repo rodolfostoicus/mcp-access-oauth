@@ -98,9 +98,13 @@ async function harness(options = {}) {
     calls.push(call);
     const override = options.respond && await options.respond(call);
     if (override !== undefined) {
-      return new Response(JSON.stringify(override.body ?? override), {
+      const hasRawBody = Object.hasOwn(override, "rawBody");
+      return new Response(hasRawBody ? override.rawBody : JSON.stringify(override.body ?? override), {
         status: override.httpStatus ?? 200,
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": hasRawBody ? "text/plain" : "application/json",
+          ...override.headers,
+        },
       });
     }
     let body;
@@ -153,6 +157,7 @@ async function harness(options = {}) {
     Request,
     Response,
     Error,
+    setTimeout,
     console: { log(value) { auditEvents.push(value); } },
   };
   vm.runInNewContext(compiled, context, { filename: sourcePath });
@@ -190,9 +195,70 @@ async function harness(options = {}) {
     },
     ...options.env,
   };
+  if (options.useGate) {
+    const gate = new moduleObject.exports.MetaApiGate({}, agent.env);
+    agent.env.META_API_GATE = {
+      idFromName(name) { return name; },
+      get(id) {
+        assert.equal(id, ACCOUNT);
+        return {
+          fetch(url, init) { return gate.fetch(new Request(url, init)); },
+        };
+      },
+    };
+  } else if (!options.omitGate) {
+    // Most handler tests need the production binding to exist but do not need
+    // real pacing delays. This in-memory stub preserves the gate envelope while
+    // forwarding exactly one request to the existing Graph fixture.
+    agent.env.META_API_GATE = {
+      idFromName(name) { return name; },
+      get(id) {
+        assert.equal(id, ACCOUNT);
+        return {
+          async fetch(_url, init) {
+            const call = JSON.parse(String(init.body));
+            const graphUrl = new URL(`/v26.0/${call.path}`, "https://graph.facebook.com");
+            const graphInit = { method: call.method, headers: new Headers() };
+            if (call.method === "GET") {
+              for (const [key, value] of Object.entries(call.params)) {
+                graphUrl.searchParams.set(key, typeof value === "object" ? JSON.stringify(value) : String(value));
+              }
+            } else {
+              const body = new URLSearchParams();
+              for (const [key, value] of Object.entries(call.params)) {
+                body.set(key, typeof value === "object" ? JSON.stringify(value) : String(value));
+              }
+              graphInit.body = body;
+            }
+            const response = await mockFetch(graphUrl, graphInit);
+            const rawBody = await response.text();
+            let payload;
+            try {
+              payload = JSON.parse(rawBody);
+            } catch {
+              return Response.json({
+                ok: false,
+                error: `Meta API returned a non-JSON HTTP ${response.status} response.`,
+              }, { status: response.ok ? 502 : response.status });
+            }
+            if (!response.ok || payload.error) {
+              const metaError = payload.error || {};
+              return Response.json({
+                ok: false,
+                error: [metaError.message, metaError.type && `type=${metaError.type}`, metaError.code !== undefined && `code=${metaError.code}`]
+                  .filter(Boolean).join(" | ") || `Meta API returned HTTP ${response.status}.`,
+              }, { status: response.status });
+            }
+            return Response.json({ ok: true, payload });
+          },
+        };
+      },
+    };
+  }
   await agent.init();
   return {
     calls, kvWrites, kvReads, lockCalls, auditEvents, metadata: agent.server.metadata,
+    MetaApiGate: moduleObject.exports.MetaApiGate,
     MetaWriteLock: moduleObject.exports.MetaWriteLock,
     async invoke(name, input = {}) {
       const tool = registered.get(name);
@@ -663,11 +729,42 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
   }
 });
 
-test("Page WhatsApp diagnostics are read-only and report connector version", async () => {
+test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.0");
-  assert.equal(h.metadata.version, "2.3.0");
+  assert.equal(result.connector_version, "2.3.1");
+  assert.equal(h.metadata.version, "2.3.1");
+  assert.equal(result.asset_diagnostics_included, false);
+  assert.equal(result.configured_account_accessible, true);
+  assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
+  assert.equal(result.account_accessible, true);
+  assert.equal(result.account.id, `act_${ACCOUNT}`);
+  assert.equal(result.scope_ready_for_reads, true);
+  assert.equal(result.scope_ready_for_writes, true);
+  assert.equal(result.ready_for_reads, true);
+  assert.equal(result.ready_for_writes, true);
+  assert.equal(result.write_switch_enabled, true);
+  assert.equal(result.write_access_verified, false);
+  assert.deepEqual(result.accessible_pages, []);
+  assert.deepEqual(result.page_whatsapp_diagnostics, []);
+  assert.deepEqual(result.whatsapp_assets, {});
+  assert.equal(Object.hasOwn(result, "account_inventory"), false);
+  assert.deepEqual(h.calls.map(call => call.path), ["me/permissions", "me", `act_${ACCOUNT}`]);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.kvWrites.length, 0);
+});
+
+test("Page WhatsApp diagnostics are opt-in, read-only, and report connector version", async () => {
+  const h = await harness();
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", {
+    include_asset_diagnostics: true,
+  }));
+  assert.equal(result.connector_version, "2.3.1");
+  assert.equal(h.metadata.version, "2.3.1");
+  assert.equal(result.asset_diagnostics_included, true);
+  assert.equal(result.configured_account_accessible, true);
+  assert.equal(result.scope_ready_for_reads, true);
+  assert.equal(result.scope_ready_for_writes, true);
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, true);
   assert.equal(result.write_switch_enabled, true);
@@ -677,19 +774,32 @@ test("Page WhatsApp diagnostics are read-only and report connector version", asy
   assert.equal(page.whatsapp_number, PHONE);
   assert.equal(page.has_whatsapp_number, true);
   assert.equal(page.has_whatsapp_business_number, true);
+  assert.deepEqual(h.calls.map(call => call.path), [
+    "me/permissions", "me", `act_${ACCOUNT}`, "me/accounts", PAGE, `act_${ACCOUNT}`,
+  ]);
   assert.equal(postCalls(h).length, 0);
   assert.equal(h.kvWrites.length, 0);
 });
 
 test("Page and WABA diagnostic failures preserve baseline permissions and identity", async () => {
+  const businessId = "900006";
   const h = await harness({
     respond(call) {
-      if (call.path === PAGE || (call.path === `act_${ACCOUNT}` && call.params.fields === "business{id,name}")) {
+      if (call.path === `act_${ACCOUNT}`) {
+        return {
+          id: `act_${ACCOUNT}`, account_id: ACCOUNT, name: "Offline account", account_status: 1,
+          business: { id: businessId, name: "Offline business" },
+        };
+      }
+      if (call.path === PAGE || call.path.startsWith(`${businessId}/`)) {
         return { httpStatus: 400, body: { error: { code: 100, message: "Offline unsupported diagnostic field" } } };
       }
     },
   });
-  const result = toolPayload(await h.invoke("meta_get_token_permissions"));
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", {
+    include_asset_diagnostics: true,
+  }));
+  assert.equal(result.configured_account_accessible, true);
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, true);
   assert.equal(result.token_subject.id, "900005");
@@ -698,9 +808,35 @@ test("Page and WABA diagnostic failures preserve baseline permissions and identi
   const page = result.page_whatsapp_diagnostics.find(item => item.page_id === PAGE);
   assert.ok(page);
   assert.match(page.diagnostic_error, /Offline unsupported diagnostic field/);
-  assert.match(result.whatsapp_assets.whatsapp_asset_error, /Offline unsupported diagnostic field/);
+  assert.match(result.whatsapp_assets.owned_whatsapp_business_accounts_error, /Offline unsupported diagnostic field/);
+  assert.match(result.whatsapp_assets.client_whatsapp_business_accounts_error, /Offline unsupported diagnostic field/);
   assert.equal(postCalls(h).length, 0);
   assert.equal(h.kvWrites.length, 0);
+});
+
+test("asset diagnostics and account inventory compose independently in one read-only request", async () => {
+  const h = await harness({
+    respond(call) {
+      if (call.path === "me/adaccounts") {
+        return { data: [{ id: `act_${ACCOUNT}`, name: "Offline account", account_status: 1 }] };
+      }
+    },
+  });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", {
+    include_asset_diagnostics: true,
+    include_account_inventory: true,
+  }));
+  assert.equal(result.asset_diagnostics_included, true);
+  assert.equal(result.account_inventory.configured_account_found, true);
+  assert.equal(result.configured_account_accessible, true);
+  assert.equal(result.account_accessible, true);
+  assert.equal(result.ready_for_reads, true);
+  assert.equal(result.page_whatsapp_diagnostics[0].page_id, PAGE);
+  assert.deepEqual(h.calls.map(call => call.path), [
+    "me/permissions", "me", `act_${ACCOUNT}`, "me/adaccounts", "me/accounts", PAGE,
+    `act_${ACCOUNT}`,
+  ]);
+  assertReadOnlyDiagnostic(h);
 });
 
 function assertReadOnlyDiagnostic(h) {
@@ -709,6 +845,213 @@ function assertReadOnlyDiagnostic(h) {
   assert.equal(h.kvWrites.length, 0);
   assert.equal(h.auditEvents.length, 0);
 }
+
+test("code 200 account denial keeps granted scope diagnostics but makes real readiness false", async () => {
+  const h = await harness({
+    useGate: true,
+    respond(call) {
+      if (call.path === `act_${ACCOUNT}`) {
+        return {
+          httpStatus: 400,
+          body: {
+            error: {
+              code: 200,
+              message: "Ad account owner has NOT grant ads_management or ads_read permission",
+              type: "OAuthException",
+            },
+          },
+        };
+      }
+    },
+  });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions"));
+  assert.equal(result.scope_ready_for_reads, true);
+  assert.equal(result.scope_ready_for_writes, true);
+  assert.equal(result.configured_account_accessible, false);
+  assert.equal(result.account_accessible, false);
+  assert.equal(result.ready_for_reads, false);
+  assert.equal(result.ready_for_writes, false);
+  assert.equal(result.write_switch_enabled, true);
+  assert.equal(result.configured_account, undefined);
+  assert.equal(result.account, null);
+  assert.match(result.account_access_error, /category=ACCOUNT_ACCESS_DENIED/);
+  assert.match(result.account_access_error, /code=200/);
+  assert.deepEqual(h.calls.map(call => call.path), ["me/permissions", "me", `act_${ACCOUNT}`]);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.kvWrites.length, 0);
+});
+
+test("Meta calls fail closed before network access when the account gate binding is absent", async () => {
+  const h = await harness({ omitGate: true });
+  const result = await h.invoke("meta_get_ad_account");
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /META_API_GATE is not configured/);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.kvReads.length, 0);
+  assert.equal(h.kvWrites.length, 0);
+});
+
+test("a real create checks the API gate before acquiring an account write lease", async () => {
+  const h = await harness({ omitGate: true });
+  const result = await h.invoke("meta_create_campaign_draft", {
+    confirmation_phrase: `CREATE CAMPAIGN ${CAMPAIGN_NAME}`,
+    name: CAMPAIGN_NAME,
+    objective: "OUTCOME_ENGAGEMENT",
+    request_id: REQUEST_ID,
+    validate_only: false,
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /META_API_GATE is not configured/);
+  assert.equal(h.lockCalls.length, 0);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.kvReads.length, 0);
+  assert.equal(h.kvWrites.length, 0);
+});
+
+for (const [label, account, errorPattern] of [
+  ["wrong account identity", {
+    id: "act_999999", account_id: "999999", name: "Wrong account", account_status: 1,
+  }, /does not match/],
+  ["empty account object", {}, /./],
+]) {
+  test(`${label} makes effective readiness false despite granted scopes`, async () => {
+    const h = await harness({
+      respond(call) {
+        if (call.path === `act_${ACCOUNT}`) return account;
+      },
+    });
+    const result = toolPayload(await h.invoke("meta_get_token_permissions"));
+    assert.equal(result.scope_ready_for_reads, true);
+    assert.equal(result.scope_ready_for_writes, true);
+    assert.equal(result.configured_account_accessible, false);
+    assert.equal(result.ready_for_reads, false);
+    assert.equal(result.ready_for_writes, false);
+    assert.equal(Object.hasOwn(result, "configured_account"), false);
+    assert.match(result.account_access_error, errorPattern);
+    assert.deepEqual(h.calls.map(call => call.path), ["me/permissions", "me", `act_${ACCOUNT}`]);
+    assert.equal(postCalls(h).length, 0);
+  });
+}
+
+test("global account gate serializes concurrent Graph calls from separate tool invocations", async () => {
+  let active = 0;
+  let maxActive = 0;
+  const h = await harness({
+    useGate: true,
+    async respond(call) {
+      if (call.path === `act_${ACCOUNT}`) {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise(resolve => setTimeout(resolve, 20));
+        active -= 1;
+        return { id: `act_${ACCOUNT}`, name: "Offline account" };
+      }
+    },
+  });
+  const results = await Promise.all([
+    h.invoke("meta_get_ad_account"),
+    h.invoke("meta_get_ad_account"),
+    h.invoke("meta_get_ad_account"),
+  ]);
+  assert.equal(maxActive, 1);
+  assert.equal(h.calls.length, 3);
+  for (const result of results) {
+    assert.equal(toolPayload(result).account.id, `act_${ACCOUNT}`);
+  }
+  assert.equal(postCalls(h).length, 0);
+});
+
+test("global account gate retries a rate-limited GET exactly once", async () => {
+  let accountAttempts = 0;
+  const h = await harness({
+    useGate: true,
+    respond(call) {
+      if (call.path === `act_${ACCOUNT}`) {
+        accountAttempts += 1;
+        if (accountAttempts === 1) {
+          return {
+            httpStatus: 429,
+            body: {
+              error: {
+                code: 17,
+                error_subcode: 2446079,
+                message: "User request limit reached",
+              },
+            },
+          };
+        }
+        return { id: `act_${ACCOUNT}`, name: "Offline account" };
+      }
+    },
+  });
+  const result = toolPayload(await h.invoke("meta_get_ad_account"));
+  assert.equal(result.account.id, `act_${ACCOUNT}`);
+  assert.equal(accountAttempts, 2);
+  assert.deepEqual(h.calls.map(call => call.method), ["GET", "GET"]);
+  assert.equal(postCalls(h).length, 0);
+});
+
+test("non-JSON 429 with a long Retry-After enters cooldown without an inline retry", async () => {
+  let accountAttempts = 0;
+  const h = await harness({
+    useGate: true,
+    respond(call) {
+      if (call.path === `act_${ACCOUNT}`) {
+        accountAttempts += 1;
+        return {
+          httpStatus: 429,
+          headers: { "Retry-After": "10" },
+          rawBody: "upstream rate limit without JSON",
+        };
+      }
+    },
+  });
+  const first = await h.invoke("meta_get_ad_account");
+  assert.equal(first.isError, true);
+  assert.match(first.content[0].text, /category=RATE_LIMIT/);
+  assert.match(first.content[0].text, /non-JSON HTTP 429/);
+  assert.equal(accountAttempts, 1, "Retry-After above the inline cap must not be slept and retried");
+
+  const second = await h.invoke("meta_get_ad_account");
+  assert.equal(second.isError, true);
+  assert.match(second.content[0].text, /category=RATE_LIMIT_COOLDOWN/);
+  assert.equal(accountAttempts, 1, "cooldown must reject before another Graph request");
+  assert.equal(h.calls.length, 1);
+});
+
+test("global account gate never retries a rate-limited POST", async () => {
+  let postAttempts = 0;
+  const h = await harness({
+    useGate: true,
+    respond(call) {
+      if (call.method === "POST" && call.path === CAMPAIGN) {
+        postAttempts += 1;
+        return {
+          httpStatus: 429,
+          body: {
+            error: {
+              code: 17,
+              error_subcode: 2446079,
+              message: "User request limit reached",
+            },
+          },
+        };
+      }
+    },
+  });
+  const result = await h.invoke("meta_set_delivery_status", {
+    confirmation_phrase: `SET CAMPAIGN ${CAMPAIGN} ACTIVE`,
+    expected_name: CAMPAIGN_NAME,
+    object_id: CAMPAIGN,
+    object_type: "CAMPAIGN",
+    status: "ACTIVE",
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /category=RATE_LIMIT/);
+  assert.equal(postAttempts, 1);
+  assert.deepEqual(h.calls.map(call => call.method), ["GET", "POST"]);
+  assert.equal(h.auditEvents.length, 0);
+});
 
 test("granted scopes cannot report readiness when configured account returns permission error 200", async () => {
   const h = await harness({ respond(call) {
@@ -719,6 +1062,7 @@ test("granted scopes cannot report readiness when configured account returns per
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
   assert.equal(result.account_accessible, false);
   assert.equal(result.account, null);
+  assert.equal(result.configured_account_accessible, false);
   assert.match(result.account_access_error, /200/);
   assert.equal(result.ready_for_reads, false);
   assert.equal(result.ready_for_writes, false);
@@ -731,7 +1075,7 @@ test("granted scopes cannot report readiness when configured account returns per
 
 test("readiness reports a successful minimal account read independently of WhatsApp diagnostics", async () => {
   const h = await harness({ respond(call) {
-    if (call.path === `act_${ACCOUNT}` && call.params.fields === "business{id,name}") {
+    if (call.path === "me/accounts" || call.path === PAGE || call.path.includes("whatsapp_business_accounts")) {
       throw new Error("Offline business diagnostic unavailable");
     }
   } });
@@ -742,7 +1086,11 @@ test("readiness reports a successful minimal account read independently of Whats
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, true);
   assert.equal(result.write_access_verified, false);
-  assert.match(result.whatsapp_assets.whatsapp_asset_error, /unavailable/);
+  assert.equal(result.asset_diagnostics_included, false);
+  assert.deepEqual(result.accessible_pages, []);
+  assert.deepEqual(result.page_whatsapp_diagnostics, []);
+  assert.deepEqual(result.whatsapp_assets, {});
+  assert.deepEqual(h.calls.map(call => call.path), ["me/permissions", "me", `act_${ACCOUNT}`]);
   assertReadOnlyDiagnostic(h);
 });
 
@@ -755,6 +1103,7 @@ for (const [label, options] of [
   const h = await harness(options);
   const result = toolPayload(await h.invoke("meta_get_token_permissions", { include_account_inventory: false }));
   assert.equal(result.account_accessible, true);
+  assert.equal(result.configured_account_accessible, true);
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, false);
   assert.equal(result.write_access_verified, false);
@@ -769,6 +1118,7 @@ for (const [label, response] of [
   const h = await harness({ respond(call) { if (call.path === `act_${ACCOUNT}`) return response(); } });
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
   assert.equal(result.account_accessible, false);
+  assert.equal(result.configured_account_accessible, false);
   assert.equal(result.ready_for_reads, false);
   assert.equal(result.ready_for_writes, false);
   assert.equal(result.account, null);
@@ -860,6 +1210,7 @@ test("inventory cannot promote failed direct configured-account access to readin
   const result = toolPayload(await h.invoke("meta_get_token_permissions", { include_account_inventory: true }));
   assert.equal(result.account_inventory.configured_account_found, true);
   assert.equal(result.account_accessible, false);
+  assert.equal(result.configured_account_accessible, false);
   assert.equal(result.ready_for_reads, false);
   assert.equal(result.ready_for_writes, false);
   assertReadOnlyDiagnostic(h);
@@ -869,7 +1220,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.0");
+  assert.equal(result.connector_version, "2.3.1");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -943,7 +1294,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.0");
+  assert.equal(result.connector_version, "2.3.1");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1149,7 +1500,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.0");
+    assert.equal(result.connector_version, "2.3.1");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);

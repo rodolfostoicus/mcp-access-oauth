@@ -32,12 +32,17 @@ Do not change the user's Meta password again solely to repair this connector. Er
 
 ## Concurrent ChatGPT sessions
 
-Connector version 2.3.0 adds an account-scoped Durable Object lease:
+Connector version 2.3.1 combines two account-scoped Durable Objects:
+
+- `META_API_GATE` serializes all Meta Graph requests across chats, spaces attempts by at least 250 ms, applies one bounded retry only to a short rate-limited `GET`, and enters cooldown after a persistent or long limit. It never retries a `POST`.
+- `META_WRITE_LOCK` provides the exclusive write lease described below.
+
+The write lease behaves as follows:
 
 - Read-only tools remain available to every chat.
-- The first session that performs a real write receives an exclusive 10-minute lease for the configured ad account.
+- The first session that attempts a real write receives an exclusive 10-minute lease for the configured ad account.
 - A write from another session fails closed with `WRITE_LOCKED` before the real Meta mutation.
-- A successful write by the same session renews the lease.
+- A real-write attempt by the same session renews the lease before the Meta call; the lease remains active after a failed or ambiguous call as a safety measure.
 - The owning session may release it with `meta_release_write_lease`; otherwise it expires automatically.
 - Validate-only requests do not acquire the lease.
 
@@ -47,9 +52,9 @@ Operationally, keep one control chat for mutations and use any additional chats 
 
 After deployment, verify:
 
-1. `meta_get_write_lease` returns an inactive lease.
-2. A validate-only request succeeds without acquiring a lease.
-3. A confirmed write from one MCP session acquires the lease.
-4. A second MCP session receives `WRITE_LOCKED` and performs no Meta mutation.
-5. The owning session can read back the changed Meta object and release the lease.
-
+1. `meta_get_token_permissions` performs the minimal three-read check unless an optional diagnostic is requested, and effective readiness requires access to the configured account.
+2. `meta_get_write_lease` returns an inactive lease.
+3. A validate-only request succeeds without acquiring a lease.
+4. A confirmed write from one MCP session acquires the lease.
+5. A second MCP session receives `WRITE_LOCKED` and performs no Meta mutation.
+6. The owning session can read back the changed Meta object and release the lease.
