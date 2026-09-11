@@ -119,7 +119,7 @@ async function harness(options = {}) {
     } else if (graphPath === "me/accounts") {
       body = { data: [{ id: PAGE, name: "Offline Stoicus page", tasks: ["ADVERTISE", "MANAGE_LEADS"] }] };
     } else if (graphPath === `act_${ACCOUNT}`) {
-      body = { id: `act_${ACCOUNT}`, name: "Offline account" };
+      body = { id: `act_${ACCOUNT}`, account_id: ACCOUNT, name: "Offline account", account_status: 1 };
     } else if (graphPath === PAGE) {
       body = { id: PAGE, whatsapp_number: PHONE, has_whatsapp_number: true, has_whatsapp_business_number: true };
     } else {
@@ -565,8 +565,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("Page WhatsApp diagnostics are read-only and report connector version", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.2.11");
-  assert.equal(h.metadata.version, "2.2.11");
+  assert.equal(result.connector_version, "2.2.12");
+  assert.equal(h.metadata.version, "2.2.12");
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, true);
   assert.equal(result.write_switch_enabled, true);
@@ -583,7 +583,7 @@ test("Page WhatsApp diagnostics are read-only and report connector version", asy
 test("Page and WABA diagnostic failures preserve baseline permissions and identity", async () => {
   const h = await harness({
     respond(call) {
-      if (call.path === PAGE || call.path === `act_${ACCOUNT}`) {
+      if (call.path === PAGE || (call.path === `act_${ACCOUNT}` && call.params.fields === "business{id,name}")) {
         return { httpStatus: 400, body: { error: { code: 100, message: "Offline unsupported diagnostic field" } } };
       }
     },
@@ -602,11 +602,173 @@ test("Page and WABA diagnostic failures preserve baseline permissions and identi
   assert.equal(h.kvWrites.length, 0);
 });
 
+function assertReadOnlyDiagnostic(h) {
+  assert.ok(h.calls.every(call => call.method === "GET"));
+  assert.equal(h.kvReads.length, 0);
+  assert.equal(h.kvWrites.length, 0);
+  assert.equal(h.auditEvents.length, 0);
+}
+
+test("granted scopes cannot report readiness when configured account returns permission error 200", async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === `act_${ACCOUNT}`) return { httpStatus: 403, body: {
+      error: { code: 200, message: "Ad account owner has NOT grant ads_management or ads_read permission" },
+    } };
+  } });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions"));
+  assert.equal(result.account_accessible, false);
+  assert.equal(result.account, null);
+  assert.match(result.account_access_error, /200/);
+  assert.equal(result.ready_for_reads, false);
+  assert.equal(result.ready_for_writes, false);
+  assert.equal(result.write_access_verified, false);
+  assert.equal(result.permissions.every(item => item.status === "granted"), true);
+  assert.equal(h.calls.filter(call => call.path === `act_${ACCOUNT}`).length, 1);
+  assert.equal(Object.hasOwn(result, "account_inventory"), false);
+  assertReadOnlyDiagnostic(h);
+});
+
+test("readiness reports a successful minimal account read independently of WhatsApp diagnostics", async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === `act_${ACCOUNT}` && call.params.fields === "business{id,name}") {
+      throw new Error("Offline business diagnostic unavailable");
+    }
+  } });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions"));
+  assert.equal(result.account_accessible, true);
+  assert.equal(result.account.account_id, ACCOUNT);
+  assert.equal(result.account_access_error, null);
+  assert.equal(result.ready_for_reads, true);
+  assert.equal(result.ready_for_writes, true);
+  assert.equal(result.write_access_verified, false);
+  assert.match(result.whatsapp_assets.whatsapp_asset_error, /unavailable/);
+  assertReadOnlyDiagnostic(h);
+});
+
+for (const [label, options] of [
+  ["disabled write switch", { env: { META_WRITE_ENABLED: "false" } }],
+  ["missing management scope", { respond(call) {
+    if (call.path === "me/permissions") return { data: [{ permission: "ads_read", status: "granted" }] };
+  } }],
+]) test(`${label} prevents write readiness without denying confirmed read access`, async () => {
+  const h = await harness(options);
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", { include_account_inventory: false }));
+  assert.equal(result.account_accessible, true);
+  assert.equal(result.ready_for_reads, true);
+  assert.equal(result.ready_for_writes, false);
+  assert.equal(result.write_access_verified, false);
+  assert.equal(h.calls.some(call => call.path === "me/adaccounts"), false);
+  assertReadOnlyDiagnostic(h);
+});
+
+for (const [label, response] of [
+  ["mismatched account identity", () => ({ id: "act_999999", account_id: "999999", name: "Other", account_status: 1 })],
+  ["network failure", () => { throw new Error("Offline network failure"); }],
+]) test(`${label} cannot report configured-account readiness`, async () => {
+  const h = await harness({ respond(call) { if (call.path === `act_${ACCOUNT}`) return response(); } });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions"));
+  assert.equal(result.account_accessible, false);
+  assert.equal(result.ready_for_reads, false);
+  assert.equal(result.ready_for_writes, false);
+  assert.equal(result.account, null);
+  assert.ok(result.account_access_error);
+  assertReadOnlyDiagnostic(h);
+});
+
+const expectedInventoryAccount = { id: `act_${ACCOUNT}`, name: "Offline account", account_status: 1 };
+const unrelatedInventoryAccount = { id: "act_999999", name: "UNRELATED_PRIVATE_NAME", account_status: 1 };
+
+test("opt-in account inventory stops at configured account and exposes only its whitelisted metadata", async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === "me/adaccounts") return {
+      data: [unrelatedInventoryAccount, { ...expectedInventoryAccount, access_token: "UNEXPECTED_PRIVATE_FIELD" }],
+      paging: { next: "https://example.invalid/PRIVATE_NEXT", cursors: { after: "PRIVATE_CURSOR" } },
+    };
+  } });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", { include_account_inventory: true }));
+  assert.deepEqual(result.account_inventory, {
+    configured_account_found: true, scan_complete: false, accounts_scanned: 2, configured_account: expectedInventoryAccount,
+  });
+  const calls = h.calls.filter(call => call.path === "me/adaccounts");
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].params, { fields: "id,name,account_status", limit: "25" });
+  assert.doesNotMatch(JSON.stringify(result), /UNRELATED_PRIVATE_NAME|UNEXPECTED_PRIVATE_FIELD|PRIVATE_NEXT|PRIVATE_CURSOR/);
+  assertReadOnlyDiagnostic(h);
+});
+
+test("account inventory follows only bounded after cursors and finds configured account on a later page", async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === "me/adaccounts") return call.params.after
+      ? { data: [expectedInventoryAccount] }
+      : { data: [unrelatedInventoryAccount], paging: { next: "https://not-requested.invalid/private", cursors: { after: "NEXT_PAGE" } } };
+  } });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", { include_account_inventory: true }));
+  assert.deepEqual(result.account_inventory, {
+    configured_account_found: true, scan_complete: true, accounts_scanned: 2, configured_account: expectedInventoryAccount,
+  });
+  const calls = h.calls.filter(call => call.path === "me/adaccounts");
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].params, { fields: "id,name,account_status", limit: "25", after: "NEXT_PAGE" });
+  assert.doesNotMatch(JSON.stringify(result.account_inventory), /UNRELATED_PRIVATE_NAME|NEXT_PAGE|https:/);
+  assertReadOnlyDiagnostic(h);
+});
+
+test("account inventory distinguishes exhausted absence from a truncated 75-account scan", async () => {
+  for (const hasMore of [false, true]) {
+    let pages = 0;
+    const h = await harness({ respond(call) {
+      if (call.path !== "me/adaccounts") return;
+      pages++;
+      return { data: Array.from({ length: 25 }, (_, i) => ({ ...unrelatedInventoryAccount, id: `act_${800000 + pages * 25 + i}` })),
+        ...(hasMore ? { paging: { next: "https://not-requested.invalid/private", cursors: { after: `NEXT_${pages}` } } } : {}) };
+    } });
+    const result = toolPayload(await h.invoke("meta_get_token_permissions", { include_account_inventory: true }));
+    assert.deepEqual(result.account_inventory, {
+      configured_account_found: false, scan_complete: !hasMore, accounts_scanned: hasMore ? 75 : 25, configured_account: null,
+    });
+    assert.equal(pages, hasMore ? 3 : 1);
+    assertReadOnlyDiagnostic(h);
+  }
+});
+
+test("inventory errors are isolated and stop scanning without changing configured account readiness", async () => {
+  let pages = 0;
+  const h = await harness({ respond(call) {
+    if (call.path !== "me/adaccounts") return;
+    pages++;
+    if (pages === 1) return { data: [unrelatedInventoryAccount], paging: { next: "https://not-requested.invalid/", cursors: { after: "NEXT" } } };
+    return { httpStatus: 403, body: { error: { code: 200, message: "Inventory denied https://private.invalid/?after=PRIVATE_CURSOR" } } };
+  } });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", { include_account_inventory: true }));
+  assert.equal(pages, 2);
+  assert.equal(result.account_inventory.configured_account_found, false);
+  assert.equal(result.account_inventory.scan_complete, false);
+  assert.equal(result.account_inventory.accounts_scanned, 1);
+  assert.match(result.account_inventory.diagnostic_error, /200/);
+  assert.doesNotMatch(JSON.stringify(result.account_inventory), /https:|PRIVATE_CURSOR|UNRELATED_PRIVATE_NAME/);
+  assert.equal(result.account_accessible, true);
+  assert.equal(result.ready_for_reads, true);
+  assertReadOnlyDiagnostic(h);
+});
+
+test("inventory cannot promote failed direct configured-account access to readiness", async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === `act_${ACCOUNT}`) return { httpStatus: 403, body: { error: { code: 200, message: "Access denied" } } };
+    if (call.path === "me/adaccounts") return { data: [expectedInventoryAccount] };
+  } });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", { include_account_inventory: true }));
+  assert.equal(result.account_inventory.configured_account_found, true);
+  assert.equal(result.account_accessible, false);
+  assert.equal(result.ready_for_reads, false);
+  assert.equal(result.ready_for_writes, false);
+  assertReadOnlyDiagnostic(h);
+});
+
 test("account reads remain single-request by default and omit unrequested targeting diagnostics", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.11");
+  assert.equal(result.connector_version, "2.2.12");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -680,7 +842,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.11");
+  assert.equal(result.connector_version, "2.2.12");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -886,7 +1048,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.2.11");
+    assert.equal(result.connector_version, "2.2.12");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
