@@ -165,6 +165,7 @@ async function harness(options = {}) {
       async get(...args) { kvReads.push(args); return null; },
       async put(...args) { kvWrites.push(args); },
     },
+    ...options.env,
   };
   await agent.init();
   return {
@@ -218,6 +219,185 @@ function toolPayload(result) {
 }
 
 function postCalls(h) { return h.calls.filter(call => call.method === "POST"); }
+
+function ageFixture(overrides = {}) {
+  return {
+    ...adsetFixture, status: "ACTIVE", effective_status: "ACTIVE",
+    lifetime_budget: "40000", optimization_goal: "POST_ENGAGEMENT",
+    billing_event: "IMPRESSIONS", destination_type: "ON_POST",
+    bid_strategy: "LOWEST_COST_WITHOUT_CAP", bid_amount: "0",
+    start_time: "2026-09-07T08:00:00-0200", end_time: "2026-09-13T23:00:00-0200",
+    adset_schedule: [{ days: [0, 1, 2, 3, 4, 5, 6], start_minute: 480, end_minute: 1380, timezone_type: "ADVERTISER" }],
+    pacing_type: ["day_parting"], targeting_optimization_types: [{ detailed_targeting: 0 }],
+    targeting: {
+      age_min: 26, age_max: 54,
+      flexible_spec: [{ work_positions: [{ id: "123", name: "Physician" }, { id: "456", name: "Surgeon" }] }],
+      geo_locations: { cities: [{ key: "100", radius: 10, distance_unit: "kilometer" }], location_types: ["home", "recent"] },
+      excluded_geo_locations: { regions: [{ key: "200" }] },
+      targeting_automation: { advantage_audience: 0 },
+      publisher_platforms: ["facebook", "instagram"],
+    },
+    ...overrides,
+  };
+}
+
+function ageInput(overrides = {}) {
+  return { adset_id: ADSET, expected_name: ADSET_NAME, age_min: 25, age_max: 50, ...overrides };
+}
+
+test("age update defaults to a Meta validation with unchanged read-back, complete targeting, and no real write", async () => {
+  const initial = ageFixture();
+  const h = await harness({ adset: initial });
+  const result = toolPayload(await h.invoke("meta_update_adset_age", ageInput()));
+  assert.equal(result.mode, "validate_only");
+  assert.equal(result.verified_unchanged, true);
+  assert.equal(result.required_confirmation, `UPDATE ADSET AGE ${ADSET} 25 50`);
+  assert.deepEqual(h.calls.map(c => c.method), ["GET", "POST", "GET"]);
+  const post = postCalls(h)[0];
+  assert.equal(post.path, ADSET);
+  assert.deepEqual(Object.keys(post.params).sort(), ["execution_options", "targeting"]);
+  assert.deepEqual(post.params.execution_options, ["validate_only"]);
+  assert.deepEqual(post.params.targeting, { ...initial.targeting, age_min: 25, age_max: 50 });
+  assert.deepEqual(result.before, initial);
+  assert.deepEqual(result.proposed, { ...initial, targeting: post.params.targeting });
+  assert.equal(h.kvWrites.length, 0);
+  assert.equal(h.auditEvents.length, 0);
+});
+
+for (const rename of [false, true]) test(`age update verifies an existing active ad set and preserves delivery configuration (rename=${rename})`, async () => {
+  let state = ageFixture();
+  const initial = structuredClone(state);
+  const requestedName = `${ADSET_NAME} | 25-50`;
+  const h = await harness({ respond(call) {
+    if (call.method === "GET" && call.path === ADSET) return state;
+    if (call.method === "POST" && call.path === ADSET && !call.params.execution_options) {
+      assert.deepEqual(Object.keys(call.params).sort(), rename ? ["name", "targeting"] : ["targeting"]);
+      state = { ...state, targeting: call.params.targeting, ...(rename ? { name: call.params.name } : {}) };
+      return { success: true };
+    }
+  } });
+  const result = toolPayload(await h.invoke("meta_update_adset_age", ageInput({
+    validate_only: false,
+    confirmation_phrase: `UPDATE ADSET AGE ${ADSET} 25 50${rename ? ` NAME ${requestedName}` : ""}`,
+    ...(rename ? { name: requestedName } : {}),
+  })));
+  assert.equal(result.verified, true);
+  assert.deepEqual(result.mismatches, []);
+  assert.deepEqual(result.after, { ...initial, targeting: { ...initial.targeting, age_min: 25, age_max: 50 }, ...(rename ? { name: requestedName } : {}) });
+  assert.deepEqual(h.calls.map(c => c.method), ["GET", "POST", "GET", "POST", "GET"]);
+  assert.equal(h.auditEvents.length, 1);
+  assert.equal(JSON.parse(h.auditEvents[0]).operation, "update_adset_age");
+  assert.equal(h.kvWrites.length, 0);
+});
+
+for (const [label, initial, input] of [
+  ["wrong account", ageFixture({ account_id: "999999" }), ageInput()],
+  ["wrong object ID", ageFixture({ id: "999999" }), ageInput()],
+  ["stale name", ageFixture({ name: "Different name" }), ageInput()],
+  ["archived object", ageFixture({ status: "ARCHIVED" }), ageInput()],
+  ["missing targeting", ageFixture({ targeting: undefined }), ageInput()],
+  ["missing age maximum", ageFixture({ targeting: { age_min: 26 } }), ageInput()],
+  ["missing confirmation", ageFixture(), ageInput({ validate_only: false })],
+  ["wrong confirmation", ageFixture(), ageInput({ validate_only: false, confirmation_phrase: `UPDATE ADSET AGE ${ADSET} 24 55` })],
+  ["rename absent from confirmation", ageFixture(), ageInput({ validate_only: false, name: "New name", confirmation_phrase: `UPDATE ADSET AGE ${ADSET} 25 50` })],
+  ["reversed ages", ageFixture(), ageInput({ age_min: 51, age_max: 50 })],
+]) test(`age update rejects ${label} without any POST`, async () => {
+  const h = await harness({ adset: initial });
+  const result = await h.invoke("meta_update_adset_age", input);
+  assert.equal(result.isError, true);
+  assert.equal(postCalls(h).length, 0);
+});
+
+test("age update honors META_WRITE_ENABLED before reads or preview requests", async () => {
+  const h = await harness({ env: { META_WRITE_ENABLED: "false" }, adset: ageFixture() });
+  const result = await h.invoke("meta_update_adset_age", ageInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /META_WRITE_ENABLED/);
+  assert.equal(h.calls.length, 0);
+});
+
+for (const input of [ageInput({ age_min: 17 }), ageInput({ age_max: 66 }), ageInput({ age_min: 25.5 }), ageInput({ adset_id: "../campaigns" })]) {
+  test(`age update schema rejects invalid input ${JSON.stringify(input)}`, async () => {
+    const h = await harness();
+    await assert.rejects(h.invoke("meta_update_adset_age", input));
+    assert.equal(h.calls.length, 0);
+  });
+}
+
+test("age update rejects a concurrent targeting change after validation without real write", async () => {
+  let reads = 0;
+  const h = await harness({ respond(call) {
+    if (call.method === "GET" && call.path === ADSET) {
+      const state = ageFixture();
+      if (++reads > 1) state.targeting.flexible_spec = [{ work_positions: [{ id: "789" }] }];
+      return state;
+    }
+  } });
+  const result = await h.invoke("meta_update_adset_age", ageInput({ validate_only: false, confirmation_phrase: `UPDATE ADSET AGE ${ADSET} 25 50` }));
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /changed during validation \(targeting\)/);
+  assert.equal(postCalls(h).length, 1);
+  assert.deepEqual(postCalls(h)[0].params.execution_options, ["validate_only"]);
+});
+
+for (const invalidValidation of [
+  { success: false },
+  { error: { message: "Unsupported targeting", code: 100 } },
+]) test(`age update stops at a failed Meta validation: ${JSON.stringify(invalidValidation)}`, async () => {
+  const h = await harness({ adset: ageFixture(), respond(call) {
+    if (call.method === "POST") return invalidValidation;
+  } });
+  const result = await h.invoke("meta_update_adset_age", ageInput({ validate_only: false, confirmation_phrase: `UPDATE ADSET AGE ${ADSET} 25 50` }));
+  assert.equal(result.isError, true);
+  assert.equal(postCalls(h).length, 1);
+  assert.deepEqual(postCalls(h)[0].params.execution_options, ["validate_only"]);
+});
+
+for (const drift of ["targeting", "targeting_optimization_types", "lifetime_budget", "status", "adset_schedule"]) {
+  test(`age update reports post-write ${drift} drift without a retry or rollback`, async () => {
+    let state = ageFixture();
+    const h = await harness({ respond(call) {
+      if (call.method === "GET" && call.path === ADSET) return state;
+      if (call.method === "POST" && !call.params.execution_options) {
+        state = { ...state, targeting: call.params.targeting };
+        if (drift === "targeting") state.targeting.flexible_spec = [];
+        if (drift === "targeting_optimization_types") state.targeting_optimization_types = [{ detailed_targeting: 1 }];
+        if (drift === "lifetime_budget") state.lifetime_budget = "50000";
+        if (drift === "status") state.status = "PAUSED";
+        if (drift === "adset_schedule") state.adset_schedule = [];
+        return { success: true };
+      }
+    } });
+    const result = await h.invoke("meta_update_adset_age", ageInput({ validate_only: false, confirmation_phrase: `UPDATE ADSET AGE ${ADSET} 25 50` }));
+    assert.equal(result.isError, true);
+    const payload = JSON.parse(result.content[0].text);
+    assert.equal(payload.verified, false);
+    assert.deepEqual(payload.mismatches, [drift]);
+    assert.equal(postCalls(h).length, 2);
+    assert.equal(JSON.parse(h.auditEvents[0]).verified, false);
+  });
+}
+
+test("age update exposes an unverified outcome when post-write read-back fails, and never retries", async () => {
+  let realWrite = false;
+  const h = await harness({ adset: ageFixture(), respond(call) {
+    if (call.method === "POST" && !call.params.execution_options) realWrite = true;
+    if (call.method === "GET" && realWrite) return { error: { message: "Read failed", code: 2 } };
+  } });
+  const result = await h.invoke("meta_update_adset_age", ageInput({ validate_only: false, confirmation_phrase: `UPDATE ADSET AGE ${ADSET} 25 50` }));
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Real update was attempted; its final state is unverified/);
+  assert.equal(postCalls(h).length, 2);
+  assert.equal(JSON.parse(h.auditEvents[0]).operation, "update_adset_age_unverified");
+});
+
+test("age update safely treats an already matching range and name as a no-op", async () => {
+  const h = await harness({ adset: ageFixture() });
+  const result = toolPayload(await h.invoke("meta_update_adset_age", ageInput({ age_min: 26, age_max: 54 })));
+  assert.equal(result.mode, "no_change");
+  assert.equal(result.verified, true);
+  assert.equal(postCalls(h).length, 0);
+});
 
 test("selected WhatsApp phone survives the actual validate-only Graph payload", async () => {
   const h = await harness();
@@ -385,8 +565,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("Page WhatsApp diagnostics are read-only and report connector version", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.2.10");
-  assert.equal(h.metadata.version, "2.2.10");
+  assert.equal(result.connector_version, "2.2.11");
+  assert.equal(h.metadata.version, "2.2.11");
   assert.equal(result.ready_for_reads, true);
   assert.equal(result.ready_for_writes, true);
   assert.equal(result.write_switch_enabled, true);
@@ -426,7 +606,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.10");
+  assert.equal(result.connector_version, "2.2.11");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -500,7 +680,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.2.10");
+  assert.equal(result.connector_version, "2.2.11");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -706,7 +886,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.2.10");
+    assert.equal(result.connector_version, "2.2.11");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
