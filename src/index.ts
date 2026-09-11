@@ -11,7 +11,7 @@ const META_GRAPH_ORIGIN = "https://graph.facebook.com";
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
-const CONNECTOR_VERSION = "2.2.11";
+const CONNECTOR_VERSION = "2.2.12";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -533,18 +533,83 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 			{
 				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: true },
 				description:
-					"Read-only. Check ads_read and ads_management without exposing the Meta token.",
-				inputSchema: {},
+					"Read-only. Check token scopes and access to the configured ad account without exposing the Meta token. Readiness reports prerequisites only; no write access is tested.",
+				inputSchema: {
+					include_account_inventory: z.boolean().default(false).describe("Optionally scan up to 75 accessible ad accounts. Only configured-account metadata is returned; scan_complete means pagination was exhausted."),
+				},
 			},
-			async () => {
+			async ({ include_account_inventory }) => {
 				try {
 					const env = this.env as MetaEnv;
-					const { accountId } = getMetaConfig(env);
+					const { accountId, accountNumericId } = getMetaConfig(env);
 					const [permissionResponse, tokenSubject] = await Promise.all([
 						callMetaGraph(env, "GET", "me/permissions", {}),
 						callMetaGraph(env, "GET", "me", { fields: "id,name" }),
 					]);
 					const payload = graphListSchema.parse(permissionResponse);
+					const accountAccessSchema = z.object({
+						id: z.string().regex(/^act_\d+$/),
+						account_id: z.union([z.string().regex(META_ID_PATTERN), z.number().int().nonnegative()]).transform(String),
+						name: z.string(),
+						account_status: z.number().int(),
+					});
+					let accountAccess: z.infer<typeof accountAccessSchema> | null = null;
+					let accountAccessError: string | null = null;
+					try {
+						const account = accountAccessSchema.parse(await callMetaGraph(env, "GET", accountId, {
+							fields: "id,account_id,name,account_status",
+						}));
+						if (account.id !== accountId || account.account_id !== accountNumericId) {
+							throw new Error("Account access response does not match the configured ad account.");
+						}
+						accountAccess = account;
+					} catch (error) {
+						accountAccessError = asToolError(error).content[0].text;
+					}
+					const accountAccessible = accountAccess !== null;
+					let accountInventory: Record<string, unknown> | undefined;
+					if (include_account_inventory) {
+						const inventoryAccountSchema = accountAccessSchema.omit({ account_id: true });
+						const inventoryPageSchema = z.object({
+							data: z.array(inventoryAccountSchema).max(25),
+							paging: z.object({
+								next: z.string().optional(),
+								cursors: z.object({ after: z.string().min(1).max(2_000).optional() }).optional(),
+							}).optional(),
+						});
+						let configuredAccount: z.infer<typeof inventoryAccountSchema> | null = null;
+						let scanComplete = false;
+						let accountsScanned = 0;
+						let inventoryError: string | undefined;
+						let after: string | undefined;
+						const seenCursors = new Set<string>();
+						try {
+							for (let page = 0; page < 3; page++) {
+								const params: Record<string, string | number> = { fields: "id,name,account_status", limit: 25 };
+								if (after) params.after = after;
+								const parsed = inventoryPageSchema.safeParse(await callMetaGraph(env, "GET", "me/adaccounts", params));
+								if (!parsed.success) throw new Error("Invalid ad account inventory response.");
+								const response = parsed.data;
+								accountsScanned += response.data.length;
+								configuredAccount = response.data.find((item) => item.id === accountId) ?? null;
+								scanComplete = !response.paging?.next;
+								if (configuredAccount || scanComplete) break;
+								const nextAfter = response.paging?.cursors?.after;
+								if (!nextAfter || seenCursors.has(nextAfter)) break;
+								seenCursors.add(nextAfter);
+								after = nextAfter;
+							}
+						} catch (error) {
+							inventoryError = asToolError(error).content[0].text
+								.replace(/https?:\/\/[^\s]+/gi, "[redacted URL]")
+								.replace(/(?:after|before|cursor)=[^&\s]+/gi, "[redacted cursor]");
+						}
+						accountInventory = {
+							configured_account_found: configuredAccount !== null,
+							scan_complete: scanComplete, accounts_scanned: accountsScanned,
+							configured_account: configuredAccount, diagnostic_error: inventoryError,
+						};
+					}
 					let accessiblePages: Array<Record<string, unknown>> = [];
 					let pageAccessError: string | undefined;
 					try {
@@ -577,7 +642,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						}),
 					);
 					let whatsappAssetDiagnostics: Record<string, unknown> = {};
-					try {
+					if (accountAccessible) try {
 						const account = z
 							.object({ business: z.object({ id: z.string(), name: z.string().optional() }).optional() })
 							.passthrough()
@@ -634,6 +699,10 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							whatsapp_asset_error:
 								error instanceof Error ? error.message : "Unable to inspect WhatsApp Business assets.",
 						};
+					} else {
+						whatsappAssetDiagnostics = {
+							whatsapp_asset_error: "Skipped Business and WhatsApp asset diagnostics because configured ad account access was not confirmed.",
+						};
 					}
 					const permissions = payload.data.map((item) => ({
 						permission: item.permission,
@@ -644,17 +713,24 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							.filter((item) => item.status === "granted")
 							.map((item) => item.permission),
 					);
+					const writeSwitchEnabled = env.META_WRITE_ENABLED?.trim().toLowerCase() === "true";
 					return asToolResult({
 						connector_version: CONNECTOR_VERSION,
+						configured_ad_account_id: accountId,
+						account_accessible: accountAccessible,
+						account_access_error: accountAccessError,
+						account: accountAccess,
+						account_inventory: accountInventory,
 						accessible_pages: accessiblePages,
 						page_access_error: pageAccessError,
 						page_whatsapp_diagnostics: pageWhatsappDiagnostics,
 						whatsapp_assets: whatsappAssetDiagnostics,
 						permissions,
-						ready_for_reads: granted.has("ads_read") || granted.has("ads_management"),
-						ready_for_writes: granted.has("ads_management"),
-						write_switch_enabled:
-							env.META_WRITE_ENABLED?.trim().toLowerCase() === "true",
+						ready_for_reads: accountAccessible && (granted.has("ads_read") || granted.has("ads_management")),
+						ready_for_writes: accountAccessible && granted.has("ads_management") && writeSwitchEnabled,
+						write_switch_enabled: writeSwitchEnabled,
+						write_access_verified: false,
+						readiness_explanation: "Readiness reports token scopes, confirmed read access to the configured account, and the write switch. It does not verify permission to mutate ads; no write was attempted.",
 						token_subject: tokenSubject,
 					});
 				} catch (error) {
