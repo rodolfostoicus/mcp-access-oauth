@@ -245,7 +245,12 @@ async function harness(options = {}) {
               const metaError = payload.error || {};
               return Response.json({
                 ok: false,
-                error: [metaError.message, metaError.type && `type=${metaError.type}`, metaError.code !== undefined && `code=${metaError.code}`]
+                error: [
+                  metaError.message,
+                  metaError.type && `type=${metaError.type}`,
+                  metaError.code !== undefined && `code=${metaError.code}`,
+                  metaError.error_subcode !== undefined && `subcode=${metaError.error_subcode}`,
+                ]
                   .filter(Boolean).join(" | ") || `Meta API returned HTTP ${response.status}.`,
               }, { status: response.status });
             }
@@ -732,8 +737,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.1");
-  assert.equal(h.metadata.version, "2.3.1");
+  assert.equal(result.connector_version, "2.3.2");
+  assert.equal(h.metadata.version, "2.3.2");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -759,8 +764,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.1");
-  assert.equal(h.metadata.version, "2.3.1");
+  assert.equal(result.connector_version, "2.3.2");
+  assert.equal(h.metadata.version, "2.3.2");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -991,6 +996,29 @@ test("global account gate retries a rate-limited GET exactly once", async () => 
   assert.equal(postCalls(h).length, 0);
 });
 
+test("global account gate recognizes a Meta code 613 rate limit returned as HTTP 400", async () => {
+  let accountAttempts = 0;
+  const h = await harness({
+    useGate: true,
+    respond(call) {
+      if (call.path === `act_${ACCOUNT}`) {
+        accountAttempts += 1;
+        if (accountAttempts === 1) {
+          return {
+            httpStatus: 400,
+            body: { error: { code: 613, message: "Calls to this API have exceeded the rate limit" } },
+          };
+        }
+        return { id: `act_${ACCOUNT}`, name: "Offline account" };
+      }
+    },
+  });
+  const result = toolPayload(await h.invoke("meta_get_ad_account"));
+  assert.equal(result.account.id, `act_${ACCOUNT}`);
+  assert.equal(accountAttempts, 2);
+  assert.deepEqual(h.calls.map(call => call.method), ["GET", "GET"]);
+});
+
 test("non-JSON 429 with a long Retry-After enters cooldown without an inline retry", async () => {
   let accountAttempts = 0;
   const h = await harness({
@@ -1216,11 +1244,227 @@ test("inventory cannot promote failed direct configured-account access to readin
   assertReadOnlyDiagnostic(h);
 });
 
+const BUSINESS = "900006";
+const businessInput = { business_access_diagnostic_id: BUSINESS };
+const businessAccount = { id: `act_${ACCOUNT}`, account_id: ACCOUNT, name: "Configured account", business: { id: BUSINESS }, user_tasks: ["ANALYZE", "ADVERTISE"] };
+const systemUser = { id: "900005", name: "Offline test subject", role: "ADMIN" };
+const otherSystemUser = { id: "888881", name: "PRIVATE_OTHER_SUBJECT", role: "ADMIN" };
+const otherBusinessAccount = { id: "act_888882", account_id: "888882", name: "PRIVATE_OTHER_ACCOUNT" };
+
+function businessFixtures(overrides = {}) {
+  return (call) => {
+    const override = overrides[call.path];
+    if (override) return typeof override === "function" ? override(call) : override;
+    if (call.path === `${BUSINESS}/system_users`) return { data: [otherSystemUser, systemUser] };
+    if (call.path === `${BUSINESS}/owned_ad_accounts`) return { data: [otherBusinessAccount, businessAccount] };
+    if (call.path === `${BUSINESS}/client_ad_accounts`) return { data: [] };
+  };
+}
+
+function assertBoundedBusinessRead(h) {
+  assertReadOnlyDiagnostic(h);
+  assert.equal(h.lockCalls.length, 0);
+  assert.equal(h.calls.some(call => /assigned_ad_accounts|whatsapp|me\/accounts|me\/adaccounts/.test(call.path)), false);
+  for (const edge of ["system_users", "owned_ad_accounts", "client_ad_accounts"]) {
+    const calls = h.calls.filter(call => call.path.endsWith(`/${edge}`));
+    assert.ok(calls.length <= 3);
+    for (const call of calls) assert.equal(call.params.limit, "25");
+  }
+}
+
+test("business diagnostic observes ADMIN and ownership without promoting denied account access or disclosing unrelated assets", async () => {
+  const h = await harness({ respond: businessFixtures({
+    [`act_${ACCOUNT}`]: { httpStatus: 403, body: { error: { code: 200, message: "Access denied" } } },
+    [`${BUSINESS}/system_users`]: { data: [otherSystemUser, { ...systemUser, private_field: "PRIVATE_FIELD" }] },
+    [`${BUSINESS}/owned_ad_accounts`]: { data: [otherBusinessAccount, { ...businessAccount, private_field: "PRIVATE_FIELD" }] },
+  }) });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", {
+    ...businessInput,
+    include_account_inventory: true,
+    include_asset_diagnostics: true,
+  }));
+  const d = result.business_access_diagnostic;
+  assert.equal(d.system_users.match.role, "ADMIN");
+  assert.equal(d.owned_ad_accounts.match_found, true);
+  assert.equal(d.owned_ad_accounts.match.business_matches_requested, true);
+  assert.equal(d.client_ad_accounts.skipped, true);
+  assert.equal(result.ready_for_reads, false);
+  assert.equal(result.ready_for_writes, false);
+  assert.equal(result.write_access_verified, false);
+  assert.equal(result.page_diagnostics_skipped, true);
+  assert.equal(result.asset_diagnostics_included, false);
+  assert.equal(result.whatsapp_assets.skipped, true);
+  assert.equal(result.account_inventory.skipped, true);
+  assert.equal(Object.hasOwn(d, "admin_authorized"), false);
+  assert.doesNotMatch(JSON.stringify(result), /888881|888882|PRIVATE_OTHER|PRIVATE_FIELD/);
+  assert.deepEqual(h.calls.filter(call => call.path.startsWith(`${BUSINESS}/`)).map(call => call.params), [
+    { fields: "id,system_user_id,name,role", limit: "25" },
+    { fields: "id,account_id,name,business,user_tasks", limit: "25", include_shared_ad_accounts: "false" },
+  ]);
+  assertBoundedBusinessRead(h);
+});
+
+test("business diagnostic still reads ownership after denied system-user access and does not repeat the failed edge", async () => {
+  const h = await harness({ respond: businessFixtures({
+    [`${BUSINESS}/system_users`]: { httpStatus: 403, body: { error: { code: 200, error_subcode: 123, message: "PRIVATE_PERSON 888884 https://secret.invalid/?access_token=PRIVATE_TOKEN" } } },
+  }) });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", businessInput));
+  const d = result.business_access_diagnostic;
+  assert.equal(d.system_users.match_found, false);
+  assert.equal(d.system_users.scan_complete, false);
+  assert.match(d.system_users.diagnostic_error, /code=200, subcode=123/);
+  assert.equal(d.owned_ad_accounts.match_found, true);
+  assert.equal(h.calls.filter(call => call.path === `${BUSINESS}/system_users`).length, 1);
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_PERSON|888884|secret.invalid|PRIVATE_TOKEN/);
+  assertBoundedBusinessRead(h);
+});
+
+test("business diagnostic finds a shared configured account only on the client edge without exposing the owner's identity", async () => {
+  const h = await harness({ respond: businessFixtures({
+    [`${BUSINESS}/system_users`]: { data: [otherSystemUser] },
+    [`${BUSINESS}/owned_ad_accounts`]: { data: [otherBusinessAccount] },
+    [`${BUSINESS}/client_ad_accounts`]: { data: [{ ...businessAccount, business: { id: "888885", name: "PRIVATE_OWNER" } }] },
+  }) });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", businessInput));
+  const d = result.business_access_diagnostic;
+  assert.equal(d.system_users.match_found, false);
+  assert.equal(d.system_users.scan_complete, true);
+  assert.equal(d.owned_ad_accounts.match_found, false);
+  assert.equal(d.client_ad_accounts.match_found, true);
+  assert.equal(d.client_ad_accounts.match.business_matches_requested, false);
+  assert.doesNotMatch(JSON.stringify(result), /888885|PRIVATE_OWNER|PRIVATE_OTHER/);
+  assertBoundedBusinessRead(h);
+});
+
+for (const systemId of [900005, "900005"]) test(`system-user alternate ID matches the token subject when supplied safely as ${typeof systemId}`, async () => {
+  const h = await harness({ respond: businessFixtures({
+    [`${BUSINESS}/system_users`]: { data: [{ id: "122098925067456170", system_user_id: systemId, name: "Mapped subject", role: "ADMIN" }] },
+  }) });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", businessInput));
+  assert.equal(result.business_access_diagnostic.system_users.match_found, true);
+  assert.equal(result.business_access_diagnostic.system_users.match.system_user_id, "900005");
+  assert.equal(result.business_access_diagnostic.system_users.match.id, "122098925067456170");
+  assertBoundedBusinessRead(h);
+});
+
+test("large string business and system-user IDs preserve exact digits beyond JavaScript's safe range", async () => {
+  const business = "123456789012345678901234567890";
+  const subject = "122098925067456170";
+  const h = await harness({ respond(call) {
+    if (call.path === "me") return { id: subject, name: "Token subject" };
+    if (call.path === `${business}/system_users`) return { data: [{ ...systemUser, id: "61593685101326", system_user_id: subject }] };
+    if (call.path === `${business}/owned_ad_accounts`) return { data: [{ ...businessAccount, business: { id: business } }] };
+  } });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", { business_access_diagnostic_id: business }));
+  assert.equal(result.business_access_diagnostic.business_id, business);
+  assert.equal(result.business_access_diagnostic.system_users.match.system_user_id, subject);
+  assert.equal(result.business_access_diagnostic.system_users.match.id, "61593685101326");
+  assertBoundedBusinessRead(h);
+});
+
+for (const unsafeId of [Number.MAX_SAFE_INTEGER + 1, -1, 1.5, "not-a-number"]) test(`unsafe optional system-user ID ${unsafeId} is omitted without discarding a valid ID match`, async () => {
+  const h = await harness({ respond: businessFixtures({
+    [`${BUSINESS}/system_users`]: { data: [{ ...systemUser, system_user_id: unsafeId }] },
+  }) });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", businessInput));
+  const d = result.business_access_diagnostic.system_users;
+  assert.equal(d.match_found, true);
+  assert.equal(d.match.id, systemUser.id);
+  assert.equal(Object.hasOwn(d.match, "system_user_id"), false);
+  assert.match(d.identity_warning, /omitted/);
+  assertBoundedBusinessRead(h);
+});
+
+test("imprecise alternate IDs never prove system-user identity", async () => {
+  const h = await harness({ respond: businessFixtures({
+    me: { id: String(Number.MAX_SAFE_INTEGER + 1), name: "Subject" },
+    [`${BUSINESS}/system_users`]: { data: [{ ...otherSystemUser, system_user_id: Number.MAX_SAFE_INTEGER + 1 }] },
+  }) });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", businessInput));
+  assert.equal(result.business_access_diagnostic.system_users.match_found, false);
+  assert.match(result.business_access_diagnostic.system_users.identity_warning, /incomplete/);
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_OTHER_SUBJECT|888881/);
+  assertBoundedBusinessRead(h);
+});
+
+test("business scans use only returned cursors, stop after three pages per edge, and distinguish incomplete results", async () => {
+  const counts = {};
+  const h = await harness({ respond(call) {
+    if (!call.path.startsWith(`${BUSINESS}/`)) return;
+    const n = counts[call.path] = (counts[call.path] || 0) + 1;
+    if (n > 1) assert.equal(call.params.after, `CURSOR_${n - 1}`);
+    const isUser = call.path.endsWith("system_users");
+    return { data: Array.from({ length: 25 }, (_, i) => ({ id: `${isUser ? "" : "act_"}${700000 + n * 25 + i}`, name: "PRIVATE_OTHER" })),
+      paging: { next: "https://never-fetch.invalid/PRIVATE_URL", cursors: { after: `CURSOR_${n}` } } };
+  } });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", businessInput));
+  for (const edge of ["system_users", "owned_ad_accounts", "client_ad_accounts"]) {
+    assert.equal(counts[`${BUSINESS}/${edge}`], 3);
+    assert.equal(result.business_access_diagnostic[edge].scan_complete, false);
+    assert.equal(result.business_access_diagnostic[edge].records_scanned, 75);
+    assert.equal(result.business_access_diagnostic[edge].match_found, false);
+  }
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_OTHER|PRIVATE_URL|CURSOR_|7000/);
+  assertBoundedBusinessRead(h);
+});
+
+for (const paging of [{ next: "https://ignored.invalid/" }, { next: "https://ignored.invalid/", cursors: { after: "REPEATED" } }]) test("business scanning stops on missing or repeated cursors without claiming complete absence", async () => {
+  const h = await harness({ respond: businessFixtures({ [`${BUSINESS}/system_users`]: { data: [], paging } }) });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", businessInput));
+  const d = result.business_access_diagnostic.system_users;
+  assert.equal(d.scan_complete, false);
+  assert.match(d.diagnostic_error, /incomplete/);
+  assert.ok(h.calls.filter(call => call.path === `${BUSINESS}/system_users`).length <= 2);
+  assertBoundedBusinessRead(h);
+});
+
+for (const [label, body] of [
+  ["missing data", { paging: {} }],
+  ["too many rows", { data: Array.from({ length: 26 }, () => otherBusinessAccount) }],
+  ["mismatched configured account_id", { data: [{ ...businessAccount, account_id: "888888" }] }],
+  ["imprecise account_id", { data: [{ ...businessAccount, account_id: Number.MAX_SAFE_INTEGER + 1 }] }],
+]) test(`business ${label} returns incomplete sanitized diagnostics and still checks the client edge`, async () => {
+  const h = await harness({ respond: businessFixtures({ [`${BUSINESS}/owned_ad_accounts`]: body }) });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", businessInput));
+  const d = result.business_access_diagnostic;
+  assert.equal(d.owned_ad_accounts.match_found, false);
+  assert.equal(d.owned_ad_accounts.scan_complete, false);
+  assert.ok(d.owned_ad_accounts.diagnostic_error);
+  assert.equal(d.client_ad_accounts.scan_complete, true);
+  assertBoundedBusinessRead(h);
+});
+
+test("a rate-limited direct account read skips all business edges", async () => {
+  const h = await harness({ respond: businessFixtures({ [`act_${ACCOUNT}`]: { httpStatus: 429, body: { error: { code: 17, message: "Rate limited" } } } }) });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", businessInput));
+  assert.equal(result.business_access_diagnostic.skipped, true);
+  assert.equal(h.calls.some(call => call.path.startsWith(`${BUSINESS}/`)), false);
+  assert.equal(h.calls.filter(call => call.path === `act_${ACCOUNT}`).length, 1);
+  assertBoundedBusinessRead(h);
+});
+
+for (const edge of ["system_users", "owned_ad_accounts"]) test(`persistent rate limit returned by the gate on ${edge} stops subsequent business edges`, async () => {
+  const h = await harness({ respond: businessFixtures({ [`${BUSINESS}/${edge}`]: { httpStatus: 429, body: { error: { code: 613, message: "Rate limited" } } } }) });
+  const result = toolPayload(await h.invoke("meta_get_token_permissions", businessInput));
+  assert.equal(result.business_access_diagnostic.client_ad_accounts.skipped, true);
+  assert.equal(h.calls.some(call => call.path === `${BUSINESS}/client_ad_accounts`), false);
+  if (edge === "system_users") assert.equal(h.calls.some(call => call.path === `${BUSINESS}/owned_ad_accounts`), false);
+  assert.equal(h.calls.filter(call => call.path === `${BUSINESS}/${edge}`).length, 1);
+  assertBoundedBusinessRead(h);
+});
+
+for (const businessId of ["", "../me", "act_123", "123/owned_ad_accounts", "1".repeat(31), 900006]) test(`invalid business ID ${businessId} is rejected before any network activity`, async () => {
+  const h = await harness();
+  await assert.rejects(h.invoke("meta_get_token_permissions", { business_access_diagnostic_id: businessId }));
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.lockCalls.length, 0);
+});
+
 test("account reads remain single-request by default and omit unrequested targeting diagnostics", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.1");
+  assert.equal(result.connector_version, "2.3.2");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1294,7 +1538,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.1");
+  assert.equal(result.connector_version, "2.3.2");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1500,7 +1744,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.1");
+    assert.equal(result.connector_version, "2.3.2");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
