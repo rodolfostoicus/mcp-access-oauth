@@ -3,6 +3,7 @@
 // Exercise the real asset handler and Worker entrypoint with an in-memory
 // manifest. These fixtures are never written to the production asset manifest.
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
@@ -18,6 +19,13 @@ const fixtureManifest = {
   [JPEG_PATH]: { mimeType: "image/jpeg", base64: JPEG_BYTES.toString("base64") },
   [PNG_PATH]: { mimeType: "image/png", base64: PNG_BYTES.toString("base64") },
 };
+
+const AHA_VERTICAL_ASSETS = [
+  ["aha-acls-ritmo-stories-v1", "ecff9ec7929ee2a2590176f13f94f2ba041ed41aa010543aace90c101964db0d", 363350],
+  ["aha-pals-avaliacao-stories-v1", "928962364e3ed8b7bb50dcc576a92e5f5123c7f7cd6297ccd4552d155fdb147a", 345258],
+  ["aha-acls-conheca-stories-v1", "e1e1bcf01bacb44e27743c71b9e14f7bfb8103cb9ac8c2e44c0983728604e258", 391728],
+  ["aha-pals-conheca-stories-v1", "35531c8ecae9945a9cba661cea660075776ae610730c87d0285038f5cb24aa38", 357274],
+];
 
 function loadModule(relativePath, moduleResolver) {
   const filename = path.resolve(__dirname, relativePath);
@@ -62,6 +70,21 @@ test("allowlisted raster GET responses preserve exact bytes and raster headers",
     assert.equal(response.headers.get("Cache-Control"), "public, max-age=31536000, immutable");
     assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff");
     assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes);
+  }
+});
+
+test("reviewed AHA vertical modules and immutable manifest entries preserve exact JPEG bytes", () => {
+  const manifest = fs.readFileSync(path.resolve(__dirname, "../src/creative-manifest.ts"), "utf8");
+  for (const [label, digest, expectedBytes] of AHA_VERTICAL_ASSETS) {
+    const moduleSource = fs.readFileSync(path.resolve(__dirname, `../src/creative-data/${label}.ts`), "utf8");
+    const encoded = moduleSource.match(/export default ("[A-Za-z0-9+/=]+");/);
+    assert.ok(encoded, `${label} must export one base64 string`);
+    const bytes = Buffer.from(JSON.parse(encoded[1]), "base64");
+    assert.equal(bytes.length, expectedBytes);
+    assert.deepEqual([...bytes.subarray(0, 3)], [0xff, 0xd8, 0xff]);
+    assert.deepEqual([...bytes.subarray(-2)], [0xff, 0xd9]);
+    assert.equal(crypto.createHash("sha256").update(bytes).digest("hex"), digest);
+    assert.match(manifest, new RegExp(`/creative-assets/${label}-${digest.slice(0, 16)}\\.jpg`));
   }
 });
 
