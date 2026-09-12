@@ -17,7 +17,19 @@ import asset12 from "./creative-data/brevar-oeste-regional-feed";
 import asset13 from "./creative-data/brevar-oeste-regional-stories";
 import brevarSulConvite from "./creative-data/brevar-sul-convite-feed";
 
+import ahaAclsRitmoStoriesV1 from "./creative-data/aha-acls-ritmo-stories-v1";
+
+import ahaPalsAvaliacaoStoriesV1 from "./creative-data/aha-pals-avaliacao-stories-v1";
+
+import ahaAclsConhecaStoriesV1 from "./creative-data/aha-acls-conheca-stories-v1";
+
+import ahaPalsConhecaStoriesV1 from "./creative-data/aha-pals-conheca-stories-v1";
+
 export const CREATIVE_ASSETS: Record<string, { mimeType: "image/jpeg" | "image/png"; base64: string }> = {
+  "/creative-assets/aha-acls-ritmo-stories-v1-ecff9ec7929ee2a2.jpg": { mimeType: "image/jpeg", base64: ahaAclsRitmoStoriesV1 },
+  "/creative-assets/aha-pals-avaliacao-stories-v1-928962364e3ed8b7.jpg": { mimeType: "image/jpeg", base64: ahaPalsAvaliacaoStoriesV1 },
+  "/creative-assets/aha-acls-conheca-stories-v1-e1e1bcf01bacb44e.jpg": { mimeType: "image/jpeg", base64: ahaAclsConhecaStoriesV1 },
+  "/creative-assets/aha-pals-conheca-stories-v1-35531c8ecae9945a.jpg": { mimeType: "image/jpeg", base64: ahaPalsConhecaStoriesV1 },
   "/creative-assets/brevar-sul-convite-feed-efb12cc4d8d25aef.jpg": { mimeType: "image/jpeg", base64: brevarSulConvite },
   "/creative-assets/brevar-preparo-feed-e0ab576a73501a45.jpg": { mimeType: "image/jpeg", base64: asset0 },
   "/creative-assets/brevar-fundamentos-feed-e25c570dca600000.jpg": { mimeType: "image/jpeg", base64: asset1 },
