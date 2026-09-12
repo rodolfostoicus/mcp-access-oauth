@@ -803,8 +803,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.15");
-  assert.equal(h.metadata.version, "2.3.15");
+  assert.equal(result.connector_version, "2.3.16");
+  assert.equal(h.metadata.version, "2.3.16");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -830,8 +830,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.15");
-  assert.equal(h.metadata.version, "2.3.15");
+  assert.equal(result.connector_version, "2.3.16");
+  assert.equal(h.metadata.version, "2.3.16");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1529,7 +1529,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.15");
+  assert.equal(result.connector_version, "2.3.16");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1603,7 +1603,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.15");
+  assert.equal(result.connector_version, "2.3.16");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1809,7 +1809,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.15");
+    assert.equal(result.connector_version, "2.3.16");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -4324,7 +4324,7 @@ test("creative asset upload accepts documented hash-only response and reports Me
 // represent a successful create whose original administrative label changed.
 async function seededCreativeResume(options = {}) {
   const h = await creativeReplacementHarness(options);
-  const preview = toolPayload(await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput()));
+  const preview = toolPayload(await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput(options.inputOverride)));
   const fingerprint = preview.required_confirmation.match(/SHA256 ([a-f0-9]{64})$/)[1];
   const journal = { ad_id: BREVAR_AD, request_id: REQUEST_ID, fingerprint, stage: "CREATIVE_CREATED", creative_id: BREVAR_NEW_CREATIVE, before: preview.before, proposed: preview.proposed };
   h.state.newCreative = { ...structuredClone(preview.proposed), id: BREVAR_NEW_CREATIVE, account_id: ACCOUNT, name: "Meta generated administrative label" };
@@ -4559,3 +4559,112 @@ for (const [name, modify] of [
     assert.equal(postCalls(h).length, posts); assert.equal(h.runtime.storageWrites.length, writes);
   });
 }
+
+
+// v2.3.16 observed ON_POST has two tracking rows and exactly one Page/post
+// conversion. This is a separate closed profile, not generic post substitution.
+const BREVAR_ON_POST_OLD = "1770460534063366";
+const BREVAR_ON_POST_NEW = "1775488676893885";
+const BREVAR_COURSE_URL = "https://www.stoicus.com.br/produtos/72/curso-brevar-fundamentos-t04-blumenau-sc/";
+function observedOnPostTracking(post) {
+  return [
+    { "action.type": ["onsite_conversion"], conversion_id: ["35083608944556680"] },
+    { "action.type": ["onsite_conversion"] },
+    { "action.type": ["post_interaction_gross"], page: [BREVAR_PAGE], post: [post] },
+    { "action.type": ["link_click"], post: [post], "post.wall": [BREVAR_PAGE] },
+  ];
+}
+function observedOnPostConversion(post) { return [{ "action.type": ["post_engagement"], page: [BREVAR_PAGE], post: [post] }]; }
+function onPostAttachmentOptions() {
+  return {
+    inputOverride: { link_url: BREVAR_COURSE_URL },
+    adjustState(s) {
+      s.adset.optimization_goal = "POST_ENGAGEMENT"; s.adset.destination_type = "ON_POST";
+      s.ad.tracking_specs = observedOnPostTracking(BREVAR_ON_POST_OLD); s.ad.conversion_specs = observedOnPostConversion(BREVAR_ON_POST_OLD);
+    },
+    respond(call) {
+      if (call.method === "GET" && call.params.fields === "id,account_id,effective_object_story_id") {
+        return { id: call.path, account_id: ACCOUNT, effective_object_story_id: `${BREVAR_PAGE}_${call.path === BREVAR_OLD_CREATIVE ? BREVAR_ON_POST_OLD : BREVAR_ON_POST_NEW}` };
+      }
+    },
+    afterAttach(s) { s.ad.tracking_specs = observedOnPostTracking(BREVAR_ON_POST_NEW); s.ad.conversion_specs = observedOnPostConversion(BREVAR_ON_POST_NEW); },
+  };
+}
+async function seededOnPostAttachment() {
+  const options = onPostAttachmentOptions();
+  const h = await seededCreativeResume(options);
+  h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage = "ATTACH_PENDING";
+  h.runtime.values.get(`brevar-creative-ad:${BREVAR_AD}`).stage = "ATTACH_PENDING";
+  h.state.ad.creative = { id: BREVAR_NEW_CREATIVE }; options.afterAttach(h.state);
+  return h;
+}
+
+test("ON_POST reconciliation exposes compact actual tracking/conversion proof first and completes the same journal without Meta POST", async () => {
+  const h = await seededOnPostAttachment();
+  const before = structuredClone(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`));
+  const posts = postCalls(h).length, writes = h.runtime.storageWrites.length;
+  const read = toolPayload(await h.invoke("meta_get_brevar_creative_operation", { ad_id: BREVAR_AD, expected_name: h.journal.before.ad.name, request_id: REQUEST_ID }));
+  assert.equal(Object.keys(read)[1], "diagnostic");
+  assert.equal(read.diagnostic.content_verified, true); assert.equal(read.diagnostic.eligible, true);
+  assert.deepEqual(read.diagnostic.before.conversion_specs, observedOnPostConversion(BREVAR_ON_POST_OLD));
+  assert.deepEqual(read.diagnostic.current.conversion_specs, observedOnPostConversion(BREVAR_ON_POST_NEW));
+  assert.deepEqual(read.diagnostic.current.tracking_specs, observedOnPostTracking(BREVAR_ON_POST_NEW));
+  assert.equal(read.diagnostic.current.optimization_goal, "POST_ENGAGEMENT"); assert.equal(read.diagnostic.current.destination_type, "ON_POST");
+  assert.equal(read.diagnostic.post_proof.posts_verified, true);
+  assert.equal(read.diagnostic.post_proof.original_story_id, `${BREVAR_PAGE}_${BREVAR_ON_POST_OLD}`);
+  assert.equal(read.diagnostic.post_proof.replacement_story_id, `${BREVAR_PAGE}_${BREVAR_ON_POST_NEW}`);
+  assert.deepEqual(read.diagnostic.post_proof.normalized_fields, ["ad.tracking_specs", "ad.conversion_specs"]);
+  assert.equal(read.diagnostic.required_confirmation, read.required_confirmation);
+  assert.equal(postCalls(h).length, posts); assert.equal(h.runtime.storageWrites.length, writes);
+  const result = toolPayload(await resumeConfirmed(h, { expected_stage: "ATTACH_PENDING" }));
+  assert.equal(result.mode, "reconciled_complete"); assert.equal(result.meta_write_performed, false); assert.equal(postCalls(h).length, posts);
+  const journal = h.runtime.values.get(`brevar-creative:${REQUEST_ID}`);
+  assert.equal(journal.stage, "COMPLETE"); assert.equal(journal.fingerprint, before.fingerprint);
+  assert.deepEqual(journal.before, before.before); assert.deepEqual(journal.proposed, before.proposed); assert.equal(h.state.ad.status, "PAUSED");
+});
+
+test("normal ON_POST replacement creates and attaches once, then verifies derived tracking and conversion without a second attach", async () => {
+  const options = onPostAttachmentOptions();
+  const h = await creativeReplacementHarness(options);
+  const result = toolPayload(await replaceCreative(h, options.inputOverride));
+  assert.equal(result.verified, true); assert.equal(result.tracking_evidence.delivery_profile, "ON_POST");
+  assert.deepEqual(realCreativePosts(h).map(c => c.path), [`act_${ACCOUNT}/adcreatives`, BREVAR_AD]);
+  assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "COMPLETE"); assert.equal(h.state.ad.status, "PAUSED");
+  assert.equal(result.after.creative.object_story_spec.link_data.call_to_action.type, "LEARN_MORE");
+});
+
+for (const [name, modify] of [
+  ["WhatsApp third tracking action", h => { h.state.ad.tracking_specs.push(observedOnPostConversion(BREVAR_ON_POST_NEW)[0]); }],
+  ["missing fixed tracking group", h => { h.state.ad.tracking_specs.splice(1, 1); }],
+  ["custom conversion ID changed", h => { h.state.ad.tracking_specs[0].conversion_id = ["999"]; }],
+  ["extra pixel conversion", h => { h.state.ad.conversion_specs.push({ "action.type": ["offsite_conversion"], fb_pixel: ["999"] }); }],
+  ["different conversion action", h => { h.state.ad.conversion_specs[0]["action.type"] = ["link_click"]; }],
+  ["enriched conversion fields", h => { h.state.ad.conversion_specs[0].conversion_id = ["999"]; }],
+  ["conversion Page changed", h => { h.state.ad.conversion_specs[0].page = ["999"]; }],
+  ["conversion still refers to old post", h => { h.state.ad.conversion_specs = observedOnPostConversion(BREVAR_ON_POST_OLD); }],
+  ["conversion removed", h => { delete h.state.ad.conversion_specs; }],
+  ["changed delivery profile", h => { h.state.adset.destination_type = "WHATSAPP"; h.state.adset.optimization_goal = "CONVERSATIONS"; }],
+]) {
+  test(`ON_POST derived comparison rejects ${name} without completing the journal`, async () => {
+    const h = await seededOnPostAttachment(); modify(h);
+    const posts = postCalls(h).length, writes = h.runtime.storageWrites.length;
+    const read = toolPayload(await h.invoke("meta_get_brevar_creative_operation", { ad_id: BREVAR_AD, expected_name: h.journal.before.ad.name, request_id: REQUEST_ID }));
+    assert.equal(read.diagnostic.eligible, false); assert.equal(read.diagnostic.post_proof.verified, false);
+    assert.ok(read.diagnostic.configuration_differences.length > 0);
+    if (name !== "changed delivery profile") assert.equal(read.diagnostic.post_proof.posts_verified, true, "proof remains visible even if the profile comparison fails");
+    const result = await h.invoke("meta_resume_brevar_ad_creative", resumeInput(h, { expected_stage: "ATTACH_PENDING" }));
+    assert.equal(result.isError, true); assert.equal(postCalls(h).length, posts); assert.equal(h.runtime.storageWrites.length, writes);
+    assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "ATTACH_PENDING");
+  });
+}
+
+test("WhatsApp keeps conversion_specs exact even when a Page/post engagement remap would match ON_POST", async () => {
+  const h = await seededObservedAttachment();
+  h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).before.ad.conversion_specs = observedOnPostConversion(BREVAR_OLD_POST);
+  h.state.ad.conversion_specs = observedOnPostConversion(BREVAR_NEW_POST);
+  const posts = postCalls(h).length, writes = h.runtime.storageWrites.length;
+  const read = toolPayload(await h.invoke("meta_get_brevar_creative_operation", { ad_id: BREVAR_AD, expected_name: h.journal.before.ad.name, request_id: REQUEST_ID }));
+  assert.equal(read.eligible, false); assert.match(read.tracking_evidence.error, /WhatsApp conversion_specs must remain exact/);
+  assert.ok(read.configuration_differences.includes("ad.conversion_specs"));
+  assert.equal(postCalls(h).length, posts); assert.equal(h.runtime.storageWrites.length, writes);
+});
