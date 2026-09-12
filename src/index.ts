@@ -12,13 +12,16 @@ const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const META_ID_PATTERN = /^\d+$/;
 const IDEMPOTENCY_TTL_SECONDS = 86_400;
 const META_GATE_MIN_INTERVAL_MS = 250;
+// Meta can rate-limit consecutive configuration POSTs to one ad set even when
+// globally serialized. Keep validate_only and its real update over 30s apart.
+const BREVAR_SAME_OBJECT_POST_GAP_MS = 31_000;
 const META_GET_RETRY_DELAY_MS = 1_000;
 const META_GET_MAX_INLINE_RETRY_DELAY_MS = 5_000;
 const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.8";
+const CONNECTOR_VERSION = "2.3.9";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -2375,6 +2378,13 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						...params, execution_options: ["validate_only"],
 					}, { write_lease_holder: operationHolder }));
 					if (validation.success !== true) throw new Error("Meta did not confirm successful BREVAR configuration validation; no real write attempted.");
+					if (!validate_only) {
+						// Wait outside the account gateway so unrelated read-only traffic
+						// can continue. The operation lease still excludes connector writes.
+						// Every concurrent-change read is deliberately AFTER this wait.
+						await delay(BREVAR_SAME_OBJECT_POST_GAP_MS);
+						await assertAccountOperationLease(env, operationHolder);
+					}
 					const rechecked = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
 					const campaignRechecked = await getOwnedObject(env, "CAMPAIGN", campaignId, BREVAR_CAMPAIGN_AUDIT_FIELDS);
 					const concurrent = brevarDifferences(before, rechecked);
@@ -3105,6 +3115,10 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const attachParams = { creative: { creative_id: creativeId } };
 					const attachValidation = writeResponseSchema.parse(await callMetaGraph(env, "POST", ad_id, { ...attachParams, execution_options: ["validate_only"] }, { write_lease_holder: holder }));
 					if (attachValidation.success !== true) throw new Error("Meta did not confirm validation of creative attachment; existing ad was not changed.");
+					// Attachment validation and attachment mutate the same ad endpoint.
+					// Respect the same per-object limit, then recheck lease and hierarchy.
+					await delay(BREVAR_SAME_OBJECT_POST_GAP_MS);
+					await assertAccountOperationLease(env, holder);
 					assertBrevarCreativeSnapshotUnchanged(before, await readBrevarCreativeSnapshot(env, ad_id));
 					journal = { ...journal, stage: "ATTACH_PENDING" };
 					await saveJournal("CREATIVE_CREATED"); // durable attach intent precedes dispatch
