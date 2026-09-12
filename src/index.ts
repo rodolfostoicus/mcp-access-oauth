@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.9";
+const CONNECTOR_VERSION = "2.3.10";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -1769,7 +1769,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const { accountId } = getMetaConfig(env);
 					const params: Record<string, string | number | object> = {
 						fields:
-							"id,name,status,effective_status,objective,daily_budget,lifetime_budget,bid_strategy,start_time,stop_time,created_time,updated_time",
+							"id,name,status,effective_status,objective,daily_budget,lifetime_budget,bid_strategy,pacing_type,start_time,stop_time,created_time,updated_time",
 						limit,
 					};
 					if (after) params.after = after;
@@ -2302,7 +2302,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 			{
 				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: false },
 				description:
-					"WRITE/PREVIEW. Apply the explicitly authorized BREVAR profile to one owned, unexpired BREVAR ad set: medical work-position profile PHYSICIANS_10, ages 25-50 with unknown ages disabled, both sexes, all Parana/Rio Grande do Sul/Santa Catarina, audience/geo and lookalike relaxation disabled, daily 06:00-23:00 America/Sao_Paulo (07:00-24:00 America/Noronha). Unlike geo restriction, this replaces city/radius coverage and removes exclusions of the three included states. Requires current detailed/lookalike diagnostics explicitly zero; does not write read-only diagnostics. Preserves other targeting settings, budgets at both levels, objective, optimization, destination, dates and configured status. Sets ad-set day_parting pacing and requires an existing lifetime budget, never converts or transfers budgets. Meta validate_only is the default; real changes require exact current ad-set/campaign names and confirmation. Uses one operation lease, validation, concurrent-change checks and complete read-back. Never activates, creates, changes the campaign, or bypasses Instagram boosted-post restrictions.",
+					"WRITE/PREVIEW. Apply the explicitly authorized BREVAR profile to one owned, unexpired BREVAR ad set: medical work-position profile PHYSICIANS_10, ages 25-50 with unknown ages disabled, both sexes, all Parana/Rio Grande do Sul/Santa Catarina, audience/geo and lookalike relaxation disabled, daily 06:00-23:00 America/Sao_Paulo (07:00-24:00 America/Noronha). Unlike geo restriction, this replaces city/radius coverage and removes exclusions of the three included states. Requires current detailed/lookalike diagnostics explicitly zero; does not write read-only diagnostics. Preserves other targeting settings, budgets at both levels, objective, optimization, destination, dates and configured status. Requires an existing lifetime budget, never converts or transfers budgets. With ABO it sets and verifies ad-set day_parting. With CBO it never writes child pacing; verified reports saved fields while delivery_schedule_verified separately requires parent campaign day_parting before activation. Meta validate_only is the default; real changes require exact current ad-set/campaign names and confirmation. Uses one operation lease, validation, concurrent-change checks and complete read-back. Never activates, creates, changes the campaign, or bypasses Instagram boosted-post restrictions.",
 				inputSchema: {
 					adset_id: z.string().regex(META_ID_PATTERN),
 					expected_name: z.string().min(1).max(500),
@@ -2364,15 +2364,22 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					assertBrevarExpansionDisabled(before);
 					const targeting = buildBrevarTargeting(targetingSchema.parse(before.targeting));
 					const currentPacing = z.array(z.string()).optional().parse(before.pacing_type) ?? [];
-					if (currentPacing.includes("no_pacing")) throw new Error("Accelerated/no_pacing delivery needs separate review before adding day_parting.");
+					if (!campaignLifetime && currentPacing.includes("no_pacing")) throw new Error("Accelerated/no_pacing delivery needs separate review before adding day_parting.");
 					const pacing = [...new Set([...currentPacing, "day_parting"])];
-					const params: Record<string, string | number | boolean | object> = { targeting, adset_schedule: schedule, pacing_type: pacing };
+					const parentPacing = z.array(z.string()).optional().parse(campaign.pacing_type) ?? [];
+					const deliveryScheduleVerified = !campaignLifetime || parentPacing.includes("day_parting");
+					// With CBO, pacing belongs to the parent campaign. Do not write a
+					// shadow ad-set field or pretend its omission proves day_parting.
+					const params: Record<string, string | number | boolean | object> = { targeting, adset_schedule: schedule,
+						...(!campaignLifetime ? { pacing_type: pacing } : {}) };
 					if (name !== undefined) params.name = name;
 					const expected = { ...before, ...params };
 					if (brevarDifferences(expected, before).length === 0) {
 						const warning = await releaseAccountOperationLease(env, operationHolder);
 						return asToolResult({ mode: "no_change", before, after: before, campaign_before: campaign, campaign_after: campaign,
-							timezone_name: timezone, verified: true, required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
+							timezone_name: timezone, verified: true, delivery_schedule_verified: deliveryScheduleVerified,
+							schedule_note: deliveryScheduleVerified ? "Delivery schedule control is present at the budget-owning level." : "Child fields and windows are verified, but parent campaign day_parting is not confirmed. Configure and audit parent pacing before activation.",
+							required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
 					}
 					const validation = writeResponseSchema.parse(await callMetaGraph(env, "POST", adset_id, {
 						...params, execution_options: ["validate_only"],
@@ -2396,7 +2403,8 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					if (validate_only) {
 						const warning = await releaseAccountOperationLease(env, operationHolder);
 						return asToolResult({ mode: "validate_only", before, proposed: expected, campaign_before: campaign, campaign_after: campaignRechecked,
-							timezone_name: timezone, validation, verified_unchanged: true, required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
+							timezone_name: timezone, validation, verified_unchanged: true, delivery_schedule_verified: false,
+							proposed_delivery_schedule_verified: deliveryScheduleVerified, required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
 					}
 					writeAttempted = true;
 					const result = writeResponseSchema.parse(await callMetaGraph(env, "POST", adset_id, params, { write_lease_holder: operationHolder }));
@@ -2413,7 +2421,9 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						regions: SOUTH_BRAZIL_REGION_KEYS, schedule_timezone: timezone, renamed: name !== undefined, verified: true });
 					const warning = await releaseAccountOperationLease(env, operationHolder);
 					return asToolResult({ mode: "updated", before, result, after, campaign_before: campaign, campaign_after: campaignAfter,
-						timezone_name: timezone, verified: true, mismatches, write_lease_release_warning: warning });
+						timezone_name: timezone, verified: true, mismatches, delivery_schedule_verified: deliveryScheduleVerified,
+						schedule_note: deliveryScheduleVerified ? "Delivery schedule control is present at the budget-owning level." : "Child fields and windows are verified, but parent campaign day_parting is not confirmed. Configure and audit parent pacing before activation.",
+						write_lease_release_warning: warning });
 				} catch (error) {
 					if (writeAttempted && !(error instanceof MetaWriteNotDispatchedError)) {
 						auditMutation("configure_brevar_adset_unverified", { adset_id });
@@ -2422,6 +2432,116 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					if (leaseAcquired && operationHolder) {
 						const warning = await releaseAccountOperationLease(env, operationHolder);
 						if (warning) return asToolError(new Error(`${error instanceof Error ? error.message : "BREVAR preflight failed."} No real Meta write was dispatched. ${warning}`));
+					}
+					return asToolError(error);
+				}
+			},
+		);
+
+		this.server.registerTool(
+			"meta_configure_brevar_campaign_pacing",
+			{
+				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: false },
+				description: "WRITE/PREVIEW. Set only pacing_type=['day_parting'] on one owned, unexpired BREVAR lifetime-budget campaign. Every owned child ad set, including paused children, must already have the exact daily 06:00-23:00 Brasilia schedule and no child budget. Requires exact campaign name and expected existing lifetime cap; never changes budget amounts, schedules, names, statuses, targeting or dates. Defaults to Meta validate_only. A real update waits 31s after validation, rechecks its lease and the complete parent/children/timezone snapshots, then verifies all saved fields. No automatic retry, activation or object creation. Uncertain real outcomes retain the operation lease.",
+				inputSchema: {
+					campaign_id: z.string().regex(META_ID_PATTERN), expected_name: z.string().min(1).max(500),
+					expected_lifetime_budget_minor: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+					validate_only: z.boolean().default(true), confirmation_phrase: z.string().max(1_000).optional(),
+				},
+			},
+			async ({ campaign_id, expected_name, expected_lifetime_budget_minor, validate_only, confirmation_phrase }) => {
+				const env = this.env as MetaEnv;
+				const requiredConfirmation = `CONFIGURE BREVAR CAMPAIGN PACING ${campaign_id} DAY_PARTING LIFETIME ${expected_lifetime_budget_minor}`;
+				let holder: string | undefined;
+				let acquired = false;
+				let writeAttempted = false;
+				try {
+					assertWritesEnabled(env);
+					if (!validate_only) assertConfirmation(confirmation_phrase || "", requiredConfirmation);
+					holder = `operation:${crypto.randomUUID()}`;
+					await acquireAccountWriteLease(env, holder, requiredConfirmation);
+					acquired = true;
+					const { accountId, accountNumericId } = getMetaConfig(env);
+					const read = async () => {
+						const account = z.object({ id: z.string(), account_id: z.union([z.string(), z.number()]), timezone_name: z.string() })
+							.parse(await callMetaGraph(env, "GET", accountId, { fields: "id,account_id,timezone_name" }));
+						if (account.id !== accountId || String(account.account_id) !== accountNumericId) throw new Error("Campaign pacing account identity mismatch.");
+						brevarSchedule(account.timezone_name);
+						const campaign = await getOwnedObject(env, "CAMPAIGN", campaign_id, BREVAR_CAMPAIGN_AUDIT_FIELDS);
+						if (campaign.id !== campaign_id) throw new Error("Campaign pacing ID mismatch.");
+						const children = graphListSchema.parse(await callMetaGraph(env, "GET", `${campaign_id}/adsets`, {
+							fields: `id,name,account_id,status,effective_status,campaign_id,daily_budget,lifetime_budget,optimization_goal,billing_event,destination_type,promoted_object,${ADSET_AGE_AUDIT_FIELDS}`, limit: 100,
+						}));
+						if (children.paging?.next || children.data.length === 100) throw new Error("Campaign child snapshot may be incomplete; no pacing change attempted.");
+						if (!children.data.length) throw new Error("Campaign pacing requires at least one fully audited child ad set.");
+						const adsets = children.data.map((raw) => {
+							const child = objectSchema.parse(raw);
+							if (!META_ID_PATTERN.test(child.id) || String(child.account_id).replace(/^act_/, "") !== accountNumericId || child.campaign_id !== campaign_id) throw new Error("Campaign child identity or ownership mismatch.");
+							return child;
+						}).sort((a, b) => a.id.localeCompare(b.id));
+						if (new Set(adsets.map((child) => child.id)).size !== adsets.length) throw new Error("Duplicate campaign child snapshot.");
+						return { campaign, adsets, timezone_name: account.timezone_name };
+					};
+					const before = await read();
+					assertExpectedName(before.campaign, expected_name);
+					if (!/\bBREVAR\b/i.test(before.campaign.name)) throw new Error("Only an explicitly identified BREVAR campaign is supported.");
+					if (!["ACTIVE", "PAUSED"].includes(String(before.campaign.status))) throw new Error("Campaign pacing requires an ACTIVE or PAUSED campaign.");
+					const noBudget = (value: unknown) => value === undefined || value === "0" || value === 0;
+					if (String(before.campaign.lifetime_budget) !== String(expected_lifetime_budget_minor) || !noBudget(before.campaign.daily_budget)) throw new Error("Campaign lifetime cap differs from the expected existing budget, or uses daily budgeting.");
+					const stop = typeof before.campaign.stop_time === "string" ? Date.parse(before.campaign.stop_time) : NaN;
+					if (!Number.isFinite(stop) || stop <= Date.now()) throw new Error("Campaign pacing requires an unexpired stop_time; no date is extended.");
+					const currentPacing = z.array(z.string()).optional().parse(before.campaign.pacing_type) ?? [];
+					if (currentPacing.some((value) => !["standard", "day_parting"].includes(value))) throw new Error("Existing campaign pacing needs separate review before day_parting.");
+					const scheduled = brevarSchedule(before.timezone_name);
+					for (const child of before.adsets) {
+						if (!["ACTIVE", "PAUSED"].includes(String(child.status)) || !noBudget(child.daily_budget) || !noBudget(child.lifetime_budget)) throw new Error(`Child ${child.id} must be active/paused and use only the parent lifetime budget.`);
+						const childEnd = typeof child.end_time === "string" ? Date.parse(child.end_time) : NaN;
+						if (!Number.isFinite(childEnd) || childEnd <= Date.now()) throw new Error(`Child ${child.id} has no valid future end_time.`);
+						if (brevarDifferences({ ...child, adset_schedule: scheduled }, child).length) throw new Error(`Child ${child.id} does not have the exact 06:00-23:00 Brasilia schedule. Configure every child, including paused children, first.`);
+					}
+					const differences = (expected: typeof before, actual: typeof before) => {
+						const diff = adsetAgeDifferences(expected.campaign, actual.campaign).map((key) => `campaign.${key}`);
+						if (expected.timezone_name !== actual.timezone_name) diff.push("account.timezone_name");
+						if (canonicalJson(expected.adsets.map((child) => child.id)) !== canonicalJson(actual.adsets.map((child) => child.id))) diff.push("adsets.ids");
+						for (const child of expected.adsets) {
+							const found = actual.adsets.find((candidate) => candidate.id === child.id);
+							if (found) diff.push(...brevarDifferences(child, found).map((key) => `adset.${child.id}.${key}`));
+						}
+						return diff;
+					};
+					const params = { pacing_type: ["day_parting"] };
+					const expected = { ...before, campaign: { ...before.campaign, ...params } };
+					if (!differences(expected, before).length) {
+						const warning = await releaseAccountOperationLease(env, holder);
+						return asToolResult({ mode: "no_change", before, after: before, verified: true, delivery_schedule_verified: true,
+							required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
+					}
+					const validation = writeResponseSchema.parse(await callMetaGraph(env, "POST", campaign_id, { ...params, execution_options: ["validate_only"] }, { write_lease_holder: holder }));
+					if (validation.success !== true) throw new Error("Meta did not validate parent campaign day_parting; no real write attempted.");
+					if (!validate_only) { await delay(BREVAR_SAME_OBJECT_POST_GAP_MS); await assertAccountOperationLease(env, holder); }
+					const rechecked = await read();
+					const concurrent = differences(before, rechecked);
+					if (concurrent.length) throw new Error(`Campaign or children changed during pacing validation: ${concurrent.join(", ")}. No real write attempted.`);
+					if (stop <= Date.now() || before.adsets.some((child) => Date.parse(String(child.end_time)) <= Date.now())) throw new Error("Campaign or child end_time elapsed during validation; no real write attempted.");
+					if (validate_only) {
+						const warning = await releaseAccountOperationLease(env, holder);
+						return asToolResult({ mode: "validate_only", before, proposed: expected, validation, verified_unchanged: true,
+							delivery_schedule_verified: currentPacing.includes("day_parting"), required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
+					}
+					writeAttempted = true;
+					const result = writeResponseSchema.parse(await callMetaGraph(env, "POST", campaign_id, params, { write_lease_holder: holder }));
+					if (result.success !== true || (result.id !== undefined && result.id !== campaign_id)) throw new Error("Meta did not confirm the parent pacing mutation.");
+					const after = await read();
+					const mismatches = differences(expected, after);
+					if (mismatches.length) throw new Error(`Parent pacing read-back failed: ${mismatches.join(", ")}.`);
+					auditMutation("configure_brevar_campaign_pacing", { campaign_id, lifetime_budget_minor: expected_lifetime_budget_minor, child_count: before.adsets.length, verified: true });
+					const warning = await releaseAccountOperationLease(env, holder);
+					return asToolResult({ mode: "updated", before, result, after, verified: true, delivery_schedule_verified: true, mismatches, write_lease_release_warning: warning });
+				} catch (error) {
+					if (writeAttempted && !(error instanceof MetaWriteNotDispatchedError)) return asToolError(new Error(`WRITE_OUTCOME_UNCERTAIN: parent pacing was attempted; reconcile the campaign and all children before another write. Its operation lease was retained, without retry or rollback. ${error instanceof Error ? error.message : "Unexpected pacing error."}`));
+					if (acquired && holder) {
+						const warning = await releaseAccountOperationLease(env, holder);
+						if (warning) return asToolError(new Error(`${error instanceof Error ? error.message : "Pacing preflight failed."} No real Meta write was dispatched. ${warning}`));
 					}
 					return asToolError(error);
 				}

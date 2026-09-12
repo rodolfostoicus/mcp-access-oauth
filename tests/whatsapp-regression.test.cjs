@@ -803,8 +803,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.9");
-  assert.equal(h.metadata.version, "2.3.9");
+  assert.equal(result.connector_version, "2.3.10");
+  assert.equal(h.metadata.version, "2.3.10");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -830,8 +830,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.9");
-  assert.equal(h.metadata.version, "2.3.9");
+  assert.equal(result.connector_version, "2.3.10");
+  assert.equal(h.metadata.version, "2.3.10");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1529,7 +1529,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.9");
+  assert.equal(result.connector_version, "2.3.10");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1603,7 +1603,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.9");
+  assert.equal(result.connector_version, "2.3.10");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1809,7 +1809,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.9");
+    assert.equal(result.connector_version, "2.3.10");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -2915,7 +2915,8 @@ async function brevarProfilePair(options = {}) {
       if (call.path === `act_${ACCOUNT}` && call.method === "GET") return state.account;
       if (call.method === "POST") {
         assert.equal(call.path, ADSET, "the profile must never write to its campaign or account");
-        const allowed = ["adset_schedule", "pacing_type", "targeting"];
+        const allowed = ["adset_schedule", "targeting"];
+        if (Number(state.value.lifetime_budget) > 0) allowed.push("pacing_type");
         if (call.params.name !== undefined) allowed.push("name");
         if (call.params.execution_options !== undefined) {
           allowed.push("execution_options");
@@ -2978,8 +2979,9 @@ for (const timezone of ["America/Noronha", "America/Sao_Paulo"]) test(`BREVAR pr
   assert.equal(brevarProfileRealPosts(p.runtime).length, 1);
   const post = brevarProfileRealPosts(p.runtime)[0].params;
   assertBrevarSchedule(post.adset_schedule, timezone === "America/Noronha" ? 420 : 360, timezone === "America/Noronha" ? 1440 : 1380);
-  assert.ok(post.pacing_type.includes("day_parting"));
-  assert.ok(post.pacing_type.includes("standard"), "other existing pacing flags survive");
+  assert.equal(Object.hasOwn(post, "pacing_type"), false, "CBO ad sets must not write campaign-owned pacing");
+  assert.deepEqual(p.state.value.pacing_type, p.initial.value.pacing_type);
+  assert.equal(result.delivery_schedule_verified, false, "a saved child schedule does not prove the CBO campaign applies day-parting");
   assert.equal(post.targeting.age_min, 25);
   assert.equal(post.targeting.age_max, 50);
   assert.equal(post.targeting.user_age_unknown, false);
@@ -3023,6 +3025,8 @@ test("BREVAR profile permits existing ABO lifetime budget and an explicitly conf
   assert.equal(p.state.value.name, name);
   assert.equal(p.state.value.lifetime_budget, "40000");
   assert.equal(p.state.value.status, "PAUSED");
+  assert.equal(result.delivery_schedule_verified, true);
+  assert.deepEqual(brevarProfileRealPosts(p.runtime)[0].params.pacing_type, ["standard", "day_parting"]);
   assert.deepEqual(p.state.campaign, campaign);
   assert.equal(p.runtime.calls.some(c => c.method === "POST" && c.path !== ADSET), false);
 });
@@ -3043,7 +3047,7 @@ for (const [label, amend] of [
   ["missing detailed expansion proof", s => { s.value.targeting_optimization_types = [{ key: "lookalike", value: 0 }]; }],
   ["lookalike expansion enabled", s => { s.value.targeting_optimization_types = [{ key: "detailed_targeting", value: 0 }, { key: "lookalike", value: 1 }]; }],
   ["Brazil excluded", s => { s.value.targeting.excluded_geo_locations.countries.push("BR"); }],
-  ["accelerated pacing", s => { s.value.pacing_type = ["no_pacing"]; }],
+  ["accelerated ABO pacing", s => { delete s.campaign.lifetime_budget; s.value.lifetime_budget = "40000"; s.value.pacing_type = ["no_pacing"]; }],
 ]) test("BREVAR profile refuses " + label + " before validation without changing any object", async () => {
   const p = await brevarProfilePair();
   amend(p.state);
@@ -3239,6 +3243,30 @@ test("BREVAR profile rejects an existing enabled individual age expansion before
   assert.equal(p.runtime.values.has("lease"), false);
 });
 
+test("BREVAR profile verifies a CBO schedule only when the parent pacing already enables day-parting", async () => {
+  const p = await brevarProfilePair();
+  p.state.campaign.pacing_type = ["standard", "day_parting"];
+  const result = toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput()));
+  assert.equal(result.verified, true);
+  assert.equal(result.delivery_schedule_verified, true);
+  assert.equal(Object.hasOwn(brevarProfileRealPosts(p.runtime)[0].params, "pacing_type"), false);
+});
+
+test("BREVAR profile recognizes an unchanged CBO child without pacing while reporting unverified parent scheduling", async () => {
+  const p = await brevarProfilePair();
+  delete p.state.value.pacing_type;
+  const first = toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput()));
+  assert.equal(first.verified, true);
+  assert.equal(first.delivery_schedule_verified, false);
+  const posts = brevarProfilePosts(p.runtime).length;
+  const repeated = toolPayload(await p.second.invoke("meta_configure_brevar_adset", brevarProfileRealInput()));
+  assert.equal(repeated.mode, "no_change");
+  assert.equal(repeated.verified, true);
+  assert.equal(repeated.delivery_schedule_verified, false);
+  assert.equal(brevarProfilePosts(p.runtime).length, posts);
+  assert.equal(Object.hasOwn(p.state.value, "pacing_type"), false);
+});
+
 test("BREVAR profile waits at least 31 seconds after completed validation and rereads every authority before the real POST", async () => {
   let validationCompletedAt;
   const p = await brevarProfilePair({ respond(call, _state, _runtime, clock) {
@@ -3329,6 +3357,157 @@ test("BREVAR profile retains the lease and never retries a rate-limited real POS
   assertStatusLeaseRetained(p.runtime, p.clock);
 });
 
+
+function brevarCampaignPacingInput(overrides = {}) {
+  return { campaign_id: CAMPAIGN, expected_name: CAMPAIGN_NAME, expected_lifetime_budget_minor: 70000, ...overrides };
+}
+
+function brevarCampaignPacingRealInput(overrides = {}) {
+  return brevarCampaignPacingInput({ validate_only: false, confirmation_phrase: `CONFIGURE BREVAR CAMPAIGN PACING ${CAMPAIGN} DAY_PARTING LIFETIME 70000`, ...overrides });
+}
+
+async function brevarCampaignPacingHarness(options = {}) {
+  const clock = statusTestClock();
+  const runtime = sharedStatusRuntime();
+  const child = brevarProfileFixture();
+  delete child.pacing_type;
+  child.targeting.age_min = 25;
+  child.targeting.age_max = 50;
+  child.adset_schedule = [{ days: [0, 1, 2, 3, 4, 5, 6], start_minute: 420, end_minute: 1440, timezone_type: "ADVERTISER" }];
+  const state = {
+    campaign: { ...campaignFixture, status: "ACTIVE", effective_status: "ACTIVE", lifetime_budget: "70000", pacing_type: ["standard"], start_time: "2026-09-04T08:00:00-0200", stop_time: "2026-10-02T23:59:00-0200" },
+    adsets: [child, { ...structuredClone(child), id: "900013", name: "BREVAR second paused child", status: "PAUSED", effective_status: "PAUSED" }],
+    account: { id: `act_${ACCOUNT}`, account_id: ACCOUNT, timezone_name: "America/Noronha" },
+  };
+  options.adjustState?.(state);
+  const initial = structuredClone(state);
+  const waits = [];
+  const timeline = [];
+  const advanceTimeout = clock.setTimeout;
+  clock.setTimeout = (callback, ms) => {
+    waits.push({ at: clock.Date.now(), ms });
+    return advanceTimeout(() => { if (ms >= 31000) options.onWait?.(state, runtime, clock); callback(); }, ms);
+  };
+  const h = await harness({ useGate: true, sharedRuntime: runtime, clock, respond: async call => {
+    timeline.push({ at: clock.Date.now(), method: call.method, path: call.path, validation: Boolean(call.params.execution_options) });
+    const override = await options.respond?.(call, state, clock);
+    if (override !== undefined) return override;
+    if (call.method === "GET" && call.path === `act_${ACCOUNT}`) return state.account;
+    if (call.method === "GET" && call.path === CAMPAIGN) return state.campaign;
+    if (call.method === "GET" && call.path === `${CAMPAIGN}/adsets`) {
+      assert.equal(Number(call.params.limit), 100);
+      return { data: state.adsets };
+    }
+    if (call.method === "POST") {
+      assert.equal(call.path, CAMPAIGN, "campaign pacing never mutates children or the account");
+      assert.deepEqual(Object.keys(call.params).sort(), call.params.execution_options ? ["execution_options", "pacing_type"] : ["pacing_type"]);
+      assert.deepEqual(call.params.pacing_type, ["day_parting"]);
+      if (call.params.execution_options) assert.deepEqual(call.params.execution_options, ["validate_only"]);
+      else state.campaign.pacing_type = structuredClone(call.params.pacing_type);
+      return { success: true };
+    }
+  } });
+  return { ...h, state, initial, waits, timeline, runtime, clock };
+}
+
+test("BREVAR campaign pacing previews the exact lifetime cap and audits every child without a real write", async () => {
+  const h = await brevarCampaignPacingHarness();
+  const result = toolPayload(await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingInput()));
+  assert.equal(result.mode, "validate_only");
+  assert.equal(result.verified_unchanged, true);
+  assert.equal(result.required_confirmation, brevarCampaignPacingRealInput().confirmation_phrase);
+  assert.equal(result.proposed.campaign.lifetime_budget, "70000");
+  assert.deepEqual(result.proposed.campaign.pacing_type, ["day_parting"]);
+  assert.deepEqual(h.state, h.initial);
+  assert.equal(postCalls(h).length, 1);
+  assert.ok(postCalls(h)[0].params.execution_options);
+  assert.equal(h.waits.some(w => w.ms >= 31000), false);
+  assert.equal(h.runtime.values.has("lease"), false);
+});
+
+test("BREVAR campaign pacing writes only parent day-parting after the 31-second gap and fresh complete hierarchy reads", async () => {
+  let validationCompletedAt;
+  const h = await brevarCampaignPacingHarness({ respond(call, _state, clock) {
+    if (call.method === "POST" && call.params.execution_options) { clock.advance(5000); validationCompletedAt = clock.Date.now(); return { success: true }; }
+  } });
+  const result = toolPayload(await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingRealInput()));
+  assert.equal(result.verified, true);
+  assert.equal(result.delivery_schedule_verified, true);
+  assert.equal(h.state.campaign.lifetime_budget, "70000");
+  assert.equal(h.state.campaign.status, h.initial.campaign.status);
+  assert.deepEqual(h.state.adsets, h.initial.adsets);
+  const real = h.timeline.find(c => c.method === "POST" && !c.validation);
+  assert.ok(real.at - validationCompletedAt >= 31000);
+  for (const path of [`act_${ACCOUNT}`, CAMPAIGN, `${CAMPAIGN}/adsets`]) {
+    const reads = h.timeline.filter(c => c.method === "GET" && c.path === path && c.at >= validationCompletedAt && c.at < real.at);
+    assert.ok(reads.length > 0);
+    assert.ok(reads.every(c => c.at >= validationCompletedAt + 31000));
+  }
+  assert.equal(postCalls(h).filter(c => !c.params.execution_options).length, 1);
+  assert.equal(h.runtime.values.has("lease"), false);
+  const count = postCalls(h).length;
+  const repeated = toolPayload(await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingRealInput()));
+  assert.equal(repeated.mode, "no_change");
+  assert.equal(repeated.delivery_schedule_verified, true);
+  assert.equal(postCalls(h).length, count);
+});
+
+for (const [label, amend] of [
+  ["incorrect lifetime cap", s => { s.campaign.lifetime_budget = "80000"; }],
+  ["daily parent budget", s => { s.campaign.daily_budget = "2000"; }],
+  ["other course parent", s => { s.campaign.name = "ATLS"; }],
+  ["child with daily budget", s => { s.adsets[1].daily_budget = "1000"; }],
+  ["child with lifetime budget", s => { s.adsets[1].lifetime_budget = "40000"; }],
+  ["foreign child account", s => { s.adsets[1].account_id = "999999"; }],
+  ["foreign child parent", s => { s.adsets[1].campaign_id = "999999"; }],
+  ["paused child missing its schedule", s => { delete s.adsets[1].adset_schedule; }],
+  ["paused child using incorrect local hours", s => { s.adsets[1].adset_schedule[0].start_minute = 480; }],
+  ["expired child", s => { s.adsets[1].end_time = "2026-09-11T20:00:00-0300"; }],
+  ["unsupported parent pacing", s => { s.campaign.pacing_type = ["no_pacing"]; }],
+]) test("BREVAR campaign pacing rejects " + label + " before any POST", async () => {
+  const h = await brevarCampaignPacingHarness({ adjustState: amend });
+  const result = await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingRealInput());
+  assert.equal(result.isError, true);
+  assert.equal(postCalls(h).length, 0);
+  assert.deepEqual(h.state, h.initial);
+  assert.equal(h.runtime.values.has("lease"), false);
+});
+
+test("BREVAR campaign pacing refuses incomplete child pagination instead of silently auditing the first page only", async () => {
+  const h = await brevarCampaignPacingHarness({ respond(call, state) {
+    if (call.path === `${CAMPAIGN}/adsets`) return { data: state.adsets, paging: { next: "https://graph.facebook.com/ignored", cursors: { after: "NEXT" } } };
+  } });
+  const result = await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingRealInput());
+  assert.equal(result.isError, true);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.calls.filter(c => c.path === `${CAMPAIGN}/adsets`).length, 1);
+});
+
+for (const [label, amend] of [
+  ["parent cap", s => { s.campaign.lifetime_budget = "80000"; }],
+  ["paused child schedule", s => { s.adsets[1].adset_schedule[0].end_minute = 1380; }],
+  ["account timezone", s => { s.account.timezone_name = "America/Sao_Paulo"; }],
+]) test("BREVAR campaign pacing stops when " + label + " changes during the validation gap", async () => {
+  const h = await brevarCampaignPacingHarness({ onWait: amend });
+  const result = await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingRealInput());
+  assert.equal(result.isError, true);
+  assert.equal(postCalls(h).length, 1);
+  assert.ok(postCalls(h)[0].params.execution_options);
+  assert.equal(h.runtime.values.has("lease"), false);
+});
+
+test("BREVAR campaign pacing retains its lease if a paused child's targeting drifts after the real parent POST", async () => {
+  let posted = false;
+  const h = await brevarCampaignPacingHarness({ respond(call, state) {
+    if (call.method === "POST" && !call.params.execution_options) posted = true;
+    if (call.method === "GET" && call.path === `${CAMPAIGN}/adsets` && posted) state.adsets[1].targeting.age_max = 65;
+  } });
+  const result = await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingRealInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+  assert.equal(postCalls(h).filter(c => !c.params.execution_options).length, 1);
+  assertStatusLeaseRetained(h.runtime, h.clock);
+});
 
 // BREVAR replacement runs the actual durable lock/journal. No Meta request,
 // production credential, real network, or external object is used by these tests.
