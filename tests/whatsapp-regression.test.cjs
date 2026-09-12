@@ -803,8 +803,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.8");
-  assert.equal(h.metadata.version, "2.3.8");
+  assert.equal(result.connector_version, "2.3.9");
+  assert.equal(h.metadata.version, "2.3.9");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -830,8 +830,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.8");
-  assert.equal(h.metadata.version, "2.3.8");
+  assert.equal(result.connector_version, "2.3.9");
+  assert.equal(h.metadata.version, "2.3.9");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1529,7 +1529,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.8");
+  assert.equal(result.connector_version, "2.3.9");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1603,7 +1603,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.8");
+  assert.equal(result.connector_version, "2.3.9");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1809,7 +1809,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.8");
+    assert.equal(result.connector_version, "2.3.9");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -2894,9 +2894,20 @@ async function brevarProfilePair(options = {}) {
     account: { id: `act_${ACCOUNT}`, account_id: ACCOUNT, account_status: 1, currency: "BRL", timezone_name: options.timezone ?? "America/Noronha" },
   };
   const initial = structuredClone(state);
+  const waits = [];
+  const timeline = [];
+  const advanceTimeout = clock.setTimeout;
+  clock.setTimeout = (callback, ms) => {
+    waits.push({ at: clock.Date.now(), ms });
+    return advanceTimeout(() => {
+      if (ms >= 31000) options.onProfileWait?.(state, runtime, clock);
+      callback();
+    }, ms);
+  };
   const setup = {
     sharedRuntime: runtime, clock, useGate: true,
     async respond(call) {
+      timeline.push({ at: clock.Date.now(), method: call.method, path: call.path, validate_only: Boolean(call.params.execution_options) });
       const override = options.respond && await options.respond(call, state, runtime, clock);
       if (override !== undefined) return override;
       if (call.path === ADSET && call.method === "GET") return state.value;
@@ -2922,7 +2933,7 @@ async function brevarProfilePair(options = {}) {
   };
   const first = await harness({ ...setup, sessionId: "brevar-profile-a" });
   const second = await harness({ ...setup, sessionId: "brevar-profile-b" });
-  return { first, second, state, initial, runtime, clock };
+  return { first, second, state, initial, runtime, clock, waits, timeline };
 }
 
 function brevarProfilePosts(runtime) { return runtime.calls.filter(c => c.method === "POST" && c.path === ADSET); }
@@ -3228,6 +3239,96 @@ test("BREVAR profile rejects an existing enabled individual age expansion before
   assert.equal(p.runtime.values.has("lease"), false);
 });
 
+test("BREVAR profile waits at least 31 seconds after completed validation and rereads every authority before the real POST", async () => {
+  let validationCompletedAt;
+  const p = await brevarProfilePair({ respond(call, _state, _runtime, clock) {
+    if (call.path === ADSET && call.params.execution_options) {
+      clock.advance(5000); // Validation itself is slow; its start must not count toward the gap.
+      validationCompletedAt = clock.Date.now();
+      return { success: true };
+    }
+  } });
+  const result = toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput()));
+  assert.equal(result.verified, true);
+  const real = p.timeline.find(c => c.method === "POST" && c.path === ADSET && !c.validate_only);
+  assert.ok(real.at - validationCompletedAt >= 31000, "the one real POST must follow completion of validation by at least 31 seconds");
+  assert.equal(p.waits.filter(w => w.ms >= 31000).length, 1);
+  const between = p.timeline.filter(c => c.method === "GET" && c.at >= validationCompletedAt && c.at < real.at);
+  for (const path of [ADSET, CAMPAIGN, `act_${ACCOUNT}`]) {
+    const reads = between.filter(c => c.path === path);
+    assert.ok(reads.length > 0, path + " must be reread between the successful validation and mutation");
+    assert.ok(reads.every(c => c.at >= validationCompletedAt + 31000), path + " must be reread after the complete gap");
+  }
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 1);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("BREVAR profile preview performs no 31-second mutation gap", async () => {
+  const p = await brevarProfilePair();
+  const result = toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileInput()));
+  assert.equal(result.verified_unchanged, true);
+  assert.equal(p.waits.some(w => w.ms >= 31000), false);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 0);
+});
+
+for (const [label, amend] of [
+  ["parent budget", s => { s.campaign.lifetime_budget = "80000"; }],
+  ["medical audience", s => { s.value.targeting.age_max = 65; }],
+  ["account timezone", s => { s.account.timezone_name = "America/Sao_Paulo"; }],
+]) test("BREVAR profile stops if " + label + " changes during the 31-second gap", async () => {
+  let waitSeen = false;
+  const p = await brevarProfilePair({ onProfileWait(state) { waitSeen = true; amend(state); } });
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput());
+  assert.equal(waitSeen, true);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /changed during validation/);
+  assert.equal(brevarProfilePosts(p.runtime).length, 1);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("BREVAR profile stops after its lease expires during the mutation gap without dispatching the real POST", async () => {
+  let waitSeen = false;
+  const p = await brevarProfilePair({ onProfileWait(_state, _runtime, clock) { waitSeen = true; clock.advance(600001); } });
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput());
+  assert.equal(waitSeen, true);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_LEASE_EXPIRED/);
+  assert.equal(brevarProfilePosts(p.runtime).length, 1);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("BREVAR profile does not wait or retry after rate-limited validation #613/4841018", async () => {
+  const p = await brevarProfilePair({ respond(call) {
+    if (call.path === ADSET && call.params.execution_options) return {
+      httpStatus: 400, body: { error: { message: "One ad-set edit per 30 seconds", type: "OAuthException", code: 613, error_subcode: 4841018 } },
+    };
+  } });
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /4841018/);
+  assert.equal(p.waits.some(w => w.ms >= 31000), false);
+  assert.equal(brevarProfilePosts(p.runtime).length, 1);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("BREVAR profile retains the lease and never retries a rate-limited real POST after the validated gap", async () => {
+  const p = await brevarProfilePair({ respond(call) {
+    if (call.path === ADSET && call.method === "POST" && !call.params.execution_options) return {
+      httpStatus: 400, body: { error: { message: "One ad-set edit per 30 seconds", type: "OAuthException", code: 613, error_subcode: 4841018 } },
+    };
+  } });
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+  assert.match(result.content[0].text, /4841018/);
+  assert.equal(p.waits.filter(w => w.ms >= 31000).length, 1);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 1);
+  assertStatusLeaseRetained(p.runtime, p.clock);
+});
+
 
 // BREVAR replacement runs the actual durable lock/journal. No Meta request,
 // production credential, real network, or external object is used by these tests.
@@ -3280,6 +3381,78 @@ async function replaceCreative(h, overrides = {}) {
   return h.invoke("meta_update_brevar_ad_creative", { ...input, validate_only: false, confirmation_phrase: preview.required_confirmation });
 }
 function realCreativePosts(h) { return postCalls(h).filter((call) => !call.params.execution_options); }
+
+test("creative replacement waits 31 seconds after attachment validation and rereads the hierarchy before attaching", async () => {
+  const clock = statusTestClock();
+  const waits = [];
+  const timeline = [];
+  const advanceTimeout = clock.setTimeout;
+  clock.setTimeout = (callback, ms) => { waits.push({ at: clock.Date.now(), ms }); return advanceTimeout(callback, ms); };
+  let attachmentValidatedAt;
+  const h = await creativeReplacementHarness({ clock, respond(call) {
+    timeline.push({ at: clock.Date.now(), path: call.path, method: call.method, validation: Boolean(call.params.execution_options) });
+    if (call.method === "POST" && call.path === BREVAR_AD && call.params.execution_options) {
+      clock.advance(5000);
+      attachmentValidatedAt = clock.Date.now();
+      return { success: true };
+    }
+  } });
+  const result = toolPayload(await replaceCreative(h));
+  assert.equal(result.verified, true);
+  const attachment = timeline.find(c => c.method === "POST" && c.path === BREVAR_AD && !c.validation);
+  assert.ok(attachment.at - attachmentValidatedAt >= 31000);
+  const relevantWaits = waits.filter(w => w.ms >= 31000);
+  assert.equal(relevantWaits.length, 1, "different /ads preview and /adcreatives endpoints must not gain unnecessary 31-second gaps");
+  assert.ok(relevantWaits[0].at >= attachmentValidatedAt);
+  const between = timeline.filter(c => c.method === "GET" && c.at >= attachmentValidatedAt && c.at < attachment.at);
+  for (const path of [BREVAR_AD, ADSET, CAMPAIGN, BREVAR_OLD_CREATIVE]) {
+    const reads = between.filter(c => c.path === path);
+    assert.ok(reads.length > 0, path + " must be reread before attaching");
+    assert.ok(reads.every(c => c.at >= attachmentValidatedAt + 31000), path + " must be reread after the complete attachment gap");
+  }
+  assert.deepEqual(realCreativePosts(h).map(c => c.path), [`act_${ACCOUNT}/adcreatives`, BREVAR_AD]);
+  assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "COMPLETE");
+});
+
+test("creative replacement detects an ad change during the attachment gap and retains CREATIVE_CREATED without attaching", async () => {
+  const clock = statusTestClock();
+  const advanceTimeout = clock.setTimeout;
+  let waitSeen = false;
+  let h;
+  clock.setTimeout = (callback, ms) => advanceTimeout(() => {
+    if (ms >= 31000) { waitSeen = true; h.state.ad.name = "Externally changed during gap"; }
+    callback();
+  }, ms);
+  h = await creativeReplacementHarness({ clock });
+  const result = await replaceCreative(h);
+  assert.equal(waitSeen, true);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /RECONCILIATION_REQUIRED.*CREATIVE_CREATED/s);
+  assert.match(result.content[0].text, /ad.name/);
+  assert.deepEqual(realCreativePosts(h).map(c => c.path), [`act_${ACCOUNT}/adcreatives`]);
+  assert.equal(h.state.ad.creative.id, BREVAR_OLD_CREATIVE);
+  assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "CREATIVE_CREATED");
+  assert.equal(h.runtime.values.has("lease"), true);
+});
+
+test("creative replacement stops when its lease expires in the attachment gap and retains its created-creative journal", async () => {
+  const clock = statusTestClock();
+  const advanceTimeout = clock.setTimeout;
+  let waitSeen = false;
+  clock.setTimeout = (callback, ms) => advanceTimeout(() => {
+    if (ms >= 31000) { waitSeen = true; clock.advance(11 * 60 * 1000); }
+    callback();
+  }, ms);
+  const h = await creativeReplacementHarness({ clock });
+  const result = await replaceCreative(h);
+  assert.equal(waitSeen, true);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /RECONCILIATION_REQUIRED.*CREATIVE_CREATED/s);
+  assert.match(result.content[0].text, /WRITE_LEASE_EXPIRED/);
+  assert.deepEqual(realCreativePosts(h).map(c => c.path), [`act_${ACCOUNT}/adcreatives`]);
+  assert.equal(h.state.ad.creative.id, BREVAR_OLD_CREATIVE);
+  assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "CREATIVE_CREATED");
+});
 
 test("creative replacement defaults to inline-only validation and verifies the complete hierarchy without creating anything", async () => {
   const h = await creativeReplacementHarness();
