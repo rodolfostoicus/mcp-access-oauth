@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.13";
+const CONNECTOR_VERSION = "2.3.14";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -57,6 +57,9 @@ const writeLeaseRequestSchema = z.discriminatedUnion("action", [
 	z.object({
 		action: z.literal("assert_owner"),
 		holder: z.string().min(1).max(500),
+	}).strict(),
+	z.object({
+		action: z.literal("creative_journal_inspect"), request_id: z.string().uuid(), ad_id: z.string().regex(/^\d+$/),
 	}).strict(),
 	z.object({
 		action: z.literal("creative_journal_get"), holder: z.string().min(1).max(500), request_id: z.string().uuid(), ad_id: z.string().regex(/^\d+$/),
@@ -109,6 +112,15 @@ export class MetaWriteLock {
 					: { active: false });
 			}
 
+			if (parsed.action === "creative_journal_inspect") {
+				const record = await this.state.storage.get<Record<string, unknown>>(`brevar-creative:${parsed.request_id}`);
+				if (record && record.ad_id !== parsed.ad_id) return jsonResponse({ code: "CREATIVE_JOURNAL_AD_MISMATCH" }, 409);
+				const blocker = await this.state.storage.get<{ request_id: string; stage: string }>(`brevar-creative-ad:${parsed.ad_id}`);
+				// This action performs no put/delete, never acquires or renews a
+				// lease, and does not disclose an operation-holder identifier.
+				return jsonResponse({ record: record ?? null, blocked_by_request_id: blocker && blocker.stage !== "COMPLETE" && blocker.request_id !== parsed.request_id ? blocker.request_id : undefined });
+			}
+
 			if (parsed.action === "creative_journal_get" || parsed.action === "creative_journal_put") {
 				if (!active) return jsonResponse({ code: "WRITE_LEASE_EXPIRED" }, 409);
 				if (current.holder !== parsed.holder) return jsonResponse({ code: "WRITE_LOCKED", expires_at: current.expires_at, operation: current.operation }, 409);
@@ -125,7 +137,7 @@ export class MetaWriteLock {
 				const nextStage: Record<string, string> = { ABSENT: "CREATE_PENDING", CREATE_PENDING: "CREATIVE_CREATED", CREATIVE_CREATED: "ATTACH_PENDING", ATTACH_PENDING: "COMPLETE" };
 				if (oldStage !== parsed.expected_stage || parsed.record.stage !== nextStage[String(oldStage)] ||
 					parsed.record.ad_id !== parsed.ad_id || parsed.record.request_id !== parsed.request_id ||
-					(record && parsed.record.fingerprint !== record.fingerprint) || JSON.stringify(parsed.record).length > 100_000) {
+					(record && (parsed.record.fingerprint !== record.fingerprint || canonicalJson(parsed.record.before) !== canonicalJson(record.before) || canonicalJson(parsed.record.proposed) !== canonicalJson(record.proposed) || (record.creative_id !== undefined && parsed.record.creative_id !== record.creative_id))) || JSON.stringify(parsed.record).length > 100_000) {
 					return jsonResponse({ code: "CREATIVE_JOURNAL_CONFLICT" }, 409);
 				}
 				// Commit journal and per-ad blocker atomically. A new request_id
@@ -1116,7 +1128,10 @@ function assertBrevarCreativeReadback(proposed: Record<string, unknown>, actual:
 	if (link.image_hash) delete link.picture; // Graph may enrich the image rendition
 	const normalizedStory = { ...story, link_data: link };
 	normalized.object_story_spec = normalizedStory;
-	for (const key of ["name", "object_story_spec", "url_tags", "degrees_of_freedom_spec", "contextual_multi_ads"]) {
+	// Creative.name is an administrative label. Meta may rewrite it on create;
+	// the visible headline is object_story_spec.link_data.name and stays strict.
+	if (actual.name !== undefined && typeof actual.name !== "string") throw new Error("Invalid administrative creative name in read-back.");
+	for (const key of ["object_story_spec", "url_tags", "degrees_of_freedom_spec", "contextual_multi_ads"]) {
 		if (canonicalJson(proposed[key]) !== canonicalJson(normalized[key])) throw new Error(`Creative read-back mismatch: ${key}.`);
 	}
 }
@@ -1124,6 +1139,60 @@ function assertBrevarCreativeReadback(proposed: Record<string, unknown>, actual:
 async function brevarCreativeFingerprint(value: unknown) {
 	const bytes = new TextEncoder().encode(canonicalJson(value));
 	return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function brevarCreativeNameEvidence(proposed: Record<string, unknown>, actual: Record<string, unknown>) {
+	return { requested: proposed.name ?? null, actual: actual.name ?? null, matches: proposed.name === actual.name, scope: "administrative_label_only", visible_headline_comparison: "strict_object_story_spec.link_data.name" };
+}
+
+const brevarCreativeJournalSchema = z.object({
+	ad_id: z.string().regex(META_ID_PATTERN), request_id: z.string().uuid(), fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+	stage: z.enum(["CREATE_PENDING", "CREATIVE_CREATED", "ATTACH_PENDING", "COMPLETE"]),
+	creative_id: z.string().regex(META_ID_PATTERN).optional(),
+	before: z.object({ ad: objectSchema, adset: objectSchema, campaign: objectSchema, creative: z.record(z.string(), z.unknown()) }),
+	proposed: z.record(z.string(), z.unknown()),
+}).passthrough();
+
+async function inspectBrevarCreativeOperation(env: MetaEnv, adId: string, requestId: string, expectedName: string, holder?: string) {
+	const current = await readBrevarCreativeSnapshot(env, adId);
+	assertExpectedName(current.ad, expectedName);
+	const response = await callWriteLock(env, holder
+		? { action: "creative_journal_get", holder, request_id: requestId, ad_id: adId }
+		: { action: "creative_journal_inspect", request_id: requestId, ad_id: adId });
+	if (response.blocked_by_request_id) throw new Error(`Another unresolved request owns this ad: ${String(response.blocked_by_request_id)}.`);
+	if (response.record === null) throw new Error("No creative journal exists for this exact ad and request_id.");
+	const journal = brevarCreativeJournalSchema.parse(response.record);
+	const { accountNumericId } = getMetaConfig(env);
+	if (journal.ad_id !== adId || journal.request_id !== requestId || journal.before.ad.id !== adId || journal.before.ad.name !== expectedName ||
+		![/\bBREVAR\b/i.test(String(journal.before.ad.name)), /\bBREVAR\b/i.test(String(journal.before.campaign.name))].some(Boolean) ||
+		[journal.before.ad, journal.before.adset, journal.before.campaign, journal.before.creative].some((value) => String(value.account_id).replace(/^act_/, "") !== accountNumericId)) {
+		throw new Error("Creative journal identity, name, scope or account mismatch.");
+	}
+	let createdCreative: Record<string, unknown> | null = null;
+	let contentError: string | null = null;
+	if (journal.creative_id) {
+		createdCreative = z.record(z.string(), z.unknown()).parse(await callMetaGraph(env, "GET", journal.creative_id, { fields: BREVAR_CREATIVE_FIELDS }));
+		if (createdCreative.id !== journal.creative_id || String(createdCreative.account_id).replace(/^act_/, "") !== accountNumericId) throw new Error("Journal creative identity/account mismatch.");
+		try { assertBrevarCreativeReadback(journal.proposed, createdCreative, journal.creative_id, accountNumericId); }
+		catch (error) { contentError = error instanceof Error ? error.message : "Unverified creative content."; }
+	}
+	const expectedCreativeId = ["ATTACH_PENDING", "COMPLETE"].includes(journal.stage) ? journal.creative_id : undefined;
+	const differences = brevarHierarchyDifferences(journal.before, current, expectedCreativeId);
+	if (journal.stage === "CREATIVE_CREATED" && canonicalJson(journal.before.creative) !== canonicalJson(current.creative)) differences.push("original_creative");
+	const eligible = current.ad.status === "PAUSED" && journal.before.ad.status === "PAUSED" && !!journal.creative_id && !!createdCreative && contentError === null && differences.length === 0 && journal.stage !== "CREATE_PENDING";
+	const nameEvidence = createdCreative ? brevarCreativeNameEvidence(journal.proposed, createdCreative) : null;
+	const nameHash = await brevarCreativeFingerprint(createdCreative?.name ?? null);
+	const requiredConfirmation = journal.creative_id ? `RESUME BREVAR CREATIVE ${adId} REQUEST ${requestId} CREATIVE ${journal.creative_id} SHA256 ${journal.fingerprint} LABEL_SHA256 ${nameHash} STAGE ${journal.stage}` : null;
+	return { journal, current, created_creative: createdCreative, administrative_name: nameEvidence, content_verified: !!createdCreative && contentError === null, content_error: contentError,
+		configuration_differences: differences, eligible, required_confirmation: requiredConfirmation };
+}
+
+function assertBrevarResumeEvidence(value: Awaited<ReturnType<typeof inspectBrevarCreativeOperation>>, input: {
+	creative_id: string; expected_fingerprint: string; expected_stage: string; expected_creative_name: string | null;
+}) {
+	if (value.journal.creative_id !== input.creative_id || value.journal.fingerprint !== input.expected_fingerprint || value.journal.stage !== input.expected_stage ||
+		(value.created_creative?.name ?? null) !== input.expected_creative_name) throw new Error("Resume identity/fingerprint/stage or explicitly reviewed administrative name does not match the journal and live creative.");
+	if (!value.eligible) throw new Error(`Resume preconditions failed: ${value.content_error || value.configuration_differences.join(", ") || "ad must remain PAUSED with an eligible recorded stage"}. No attachment or journal completion performed.`);
 }
 
 function pagingCursors(paging?: MetaPaging) {
@@ -3203,6 +3272,95 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 		);
 
 		this.server.registerTool(
+			"meta_get_brevar_creative_operation",
+			{
+				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: true },
+				description: "Read-only. Inspect one exact BREVAR creative-replacement request, its durable journal, current owned ad/parents and recorded created creative. Requires exact current ad name. Returns the full proposed and actual creative, administrative-name evidence, content verification and configuration differences. Works while another operation holds a lease: never acquires, renews, releases or clears one, never changes the journal and never sends a Meta POST.",
+				inputSchema: { ad_id: z.string().regex(META_ID_PATTERN), expected_name: z.string().min(1).max(500), request_id: z.string().uuid() },
+			},
+			async ({ ad_id, expected_name, request_id }) => {
+				try { return asToolResult({ mode: "read_only", ...(await inspectBrevarCreativeOperation(this.env as MetaEnv, ad_id, request_id, expected_name)) }); }
+				catch (error) { return asToolError(error); }
+			},
+		);
+
+		this.server.registerTool(
+			"meta_resume_brevar_ad_creative",
+			{
+				annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: true, readOnlyHint: false },
+				description: "WRITE/READ-ONLY PREVIEW. Explicitly resume the same BREVAR request and existing creative ID from CREATIVE_CREATED; never creates a creative/ad or changes the UUID/fingerprint/proposal. Defaults to a read-only evidence preview. Real resume requires exact confirmation binding ad, request, creative ID, fingerprint, stage and reviewed administrative creative name; preserves the original PAUSED ad and complete parent settings. Validates attachment, waits 31 seconds, rechecks lease, journal, new creative content and hierarchy, then attaches once and verifies. ATTACH_PENDING sends no Meta POST and can only complete the journal when the exact existing association, content and hierarchy are already proven. COMPLETE is verified read-only replay. No recreation, rollback, lease takeover or bypass of native restrictions.",
+				inputSchema: {
+					ad_id: z.string().regex(META_ID_PATTERN), expected_name: z.string().min(1).max(500), request_id: z.string().uuid(),
+					creative_id: z.string().regex(META_ID_PATTERN), expected_fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+					expected_stage: z.enum(["CREATIVE_CREATED", "ATTACH_PENDING", "COMPLETE"]),
+					expected_creative_name: z.string().max(5_000).nullable(), validate_only: z.boolean().default(true), confirmation_phrase: z.string().max(1_000).optional(),
+				},
+			},
+			async (input) => {
+				const { ad_id, expected_name, request_id, creative_id, expected_fingerprint, expected_stage, expected_creative_name, validate_only, confirmation_phrase } = input;
+				const env = this.env as MetaEnv;
+				let holder: string | undefined;
+				let acquired = false;
+				let attachmentIntent = false;
+				try {
+					const labelHash = await brevarCreativeFingerprint(expected_creative_name);
+					const requiredConfirmation = `RESUME BREVAR CREATIVE ${ad_id} REQUEST ${request_id} CREATIVE ${creative_id} SHA256 ${expected_fingerprint} LABEL_SHA256 ${labelHash} STAGE ${expected_stage}`;
+					if (!validate_only) {
+						assertWritesEnabled(env);
+						assertConfirmation(confirmation_phrase || "", requiredConfirmation);
+						holder = `operation:${crypto.randomUUID()}`;
+						await acquireAccountWriteLease(env, holder, `RESUME BREVAR CREATIVE ${ad_id} REQUEST ${request_id}`);
+						acquired = true;
+					}
+					const evidence = await inspectBrevarCreativeOperation(env, ad_id, request_id, expected_name, holder);
+					assertBrevarResumeEvidence(evidence, input);
+					if (validate_only) return asToolResult({ mode: "resume_preview", ...evidence, meta_write_performed: false, journal_write_performed: false });
+					if (evidence.journal.stage === "COMPLETE") {
+						const warning = await releaseAccountOperationLease(env, holder!);
+						return asToolResult({ mode: "idempotent_replay", ...evidence, verified: true, meta_write_performed: false, journal_write_performed: false, write_lease_release_warning: warning });
+					}
+					const save = async (record: Record<string, unknown>, stage: "CREATIVE_CREATED" | "ATTACH_PENDING") => {
+						const result = await callWriteLock(env, { action: "creative_journal_put", holder: holder!, ad_id, request_id, expected_stage: stage, record });
+						if (result.saved !== true) throw new Error("Resume journal transition was not confirmed.");
+					};
+					if (evidence.journal.stage === "ATTACH_PENDING") {
+						// Already attached is the only recoverable state here. Never
+						// resend an attachment that may have been dispatched earlier.
+						await save({ ...evidence.journal, stage: "COMPLETE", verified_at: new Date().toISOString() }, "ATTACH_PENDING");
+						const warning = await releaseAccountOperationLease(env, holder!);
+						return asToolResult({ mode: "reconciled_complete", ...evidence, verified: true, meta_write_performed: false, journal_write_performed: true, journal_stage_after: "COMPLETE", write_lease_release_warning: warning });
+					}
+					const params = { creative: { creative_id } };
+					const validation = writeResponseSchema.parse(await callMetaGraph(env, "POST", ad_id, { ...params, execution_options: ["validate_only"] }, { write_lease_holder: holder! }));
+					if (validation.success !== true) throw new Error("Meta did not confirm validation of the existing creative attachment; no real attachment attempted.");
+					await delay(BREVAR_SAME_OBJECT_POST_GAP_MS);
+					await assertAccountOperationLease(env, holder!);
+					const rechecked = await inspectBrevarCreativeOperation(env, ad_id, request_id, expected_name, holder);
+					assertBrevarResumeEvidence(rechecked, input);
+					if (canonicalJson(evidence.journal) !== canonicalJson(rechecked.journal)) throw new Error("Creative journal changed during resume validation; no attachment attempted.");
+					const pending = { ...evidence.journal, stage: "ATTACH_PENDING" };
+					await save(pending, "CREATIVE_CREATED");
+					attachmentIntent = true;
+					const result = writeResponseSchema.parse(await callMetaGraph(env, "POST", ad_id, params, { write_lease_holder: holder! }));
+					if (result.success !== true || (result.id !== undefined && result.id !== ad_id)) throw new Error("Meta did not confirm resumed attachment to the exact existing ad.");
+					const after = await inspectBrevarCreativeOperation(env, ad_id, request_id, expected_name, holder);
+					assertBrevarResumeEvidence(after, { ...input, expected_stage: "ATTACH_PENDING" });
+					await save({ ...pending, stage: "COMPLETE", verified_at: new Date().toISOString() }, "ATTACH_PENDING");
+					auditMutation("resume_brevar_ad_creative", { ad_id, request_id, creative_id, verified: true, status: "PAUSED" });
+					const warning = await releaseAccountOperationLease(env, holder!);
+					return asToolResult({ mode: "resumed", ...after, verified: true, result, journal_stage_after: "COMPLETE", write_lease_release_warning: warning });
+				} catch (error) {
+					if (attachmentIntent) return asToolError(new Error(`CREATIVE_RECONCILIATION_REQUIRED: request ${request_id}, creative ${creative_id}. ATTACH_PENDING was persisted; no repeated attachment or recreation is permitted. Its lease was not released. ${error instanceof Error ? error.message : "Unverified resumed attachment."}`));
+					if (acquired && holder) {
+						const warning = await releaseAccountOperationLease(env, holder);
+						if (warning) return asToolError(new Error(`${error instanceof Error ? error.message : "Resume preflight failed."} ${warning}`));
+					}
+					return asToolError(error);
+				}
+			},
+		);
+
+		this.server.registerTool(
 			"meta_update_brevar_ad_creative",
 			{
 				annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: true, readOnlyHint: false },
@@ -3243,7 +3401,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						if (differences.length) throw new Error(`Completed creative operation no longer matches current settings: ${differences.join(", ")}. No replay mutation attempted.`);
 						assertBrevarCreativeReadback(prior.proposed, after.creative, prior.creative_id, accountNumericId);
 						const warning = await releaseAccountOperationLease(env, holder);
-						return asToolResult({ mode: "idempotent_replay", request_id, ad_id, creative_id: prior.creative_id, after, verified: true, no_write_performed: true, write_lease_release_warning: warning });
+						return asToolResult({ mode: "idempotent_replay", request_id, ad_id, creative_id: prior.creative_id, after, administrative_name: brevarCreativeNameEvidence(prior.proposed, after.creative), verified: true, no_write_performed: true, write_lease_release_warning: warning });
 					}
 					const before = await readBrevarCreativeSnapshot(env, ad_id);
 					assertExpectedName(before.ad, expected_name);
@@ -3298,7 +3456,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					await saveJournal("ATTACH_PENDING");
 					auditMutation("update_brevar_ad_creative", { ad_id, request_id, creative_id: creativeId, verified: true, status: "PAUSED" });
 					const warning = await releaseAccountOperationLease(env, holder);
-					return asToolResult({ mode: "updated", request_id, ad_id, creative_id: creativeId, before, proposed, after, verified: true, result, write_lease_release_warning: warning });
+					return asToolResult({ mode: "updated", request_id, ad_id, creative_id: creativeId, before, proposed, after, administrative_name: brevarCreativeNameEvidence(proposed, after.creative), verified: true, result, write_lease_release_warning: warning });
 				} catch (error) {
 					if (realWriteAttempted) {
 						auditMutation("update_brevar_ad_creative_unverified", { ad_id, request_id, creative_id: creativeId, journal_stage: journalStage });
