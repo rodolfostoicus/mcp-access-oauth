@@ -18,7 +18,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.5";
+const CONNECTOR_VERSION = "2.3.6";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -758,6 +758,59 @@ function adsetAgeDifferences(expected: Record<string, unknown>, actual: Record<s
 	// configured status, and return effective_status in the snapshots for review.
 	return [...new Set([...Object.keys(expected), ...Object.keys(actual)])]
 		.filter((key) => key !== "effective_status" && canonicalJson(expected[key]) !== canonicalJson(actual[key]));
+}
+
+const SOUTH_BRAZIL_REGION_KEYS = ["452", "456", "459"] as const;
+
+function buildRestrictedSouthTargeting(targeting: Record<string, unknown>, regionKeys: string[]) {
+	const geo = z.record(z.string(), z.unknown()).parse(targeting.geo_locations);
+	const unexpectedFields = Object.keys(geo).filter((key) => !["countries", "regions", "location_types"].includes(key));
+	if (unexpectedFields.length || (geo.countries !== undefined && geo.regions !== undefined)) {
+		throw new Error("Unsupported or mixed geographic coverage. City/radius and mixed country/region audiences require separate review.");
+	}
+	const hasBrazilCoverage = Array.isArray(geo.countries) && geo.countries.length === 1 && geo.countries[0] === "BR";
+	if (geo.countries !== undefined && !hasBrazilCoverage) {
+		throw new Error("Only the single country BR may be converted to Southern Brazilian states.");
+	}
+	const existingRegions = z.array(z.object({ key: z.string() }).passthrough()).optional().parse(geo.regions);
+	// Never turn an existing city/radius audience into state-wide coverage.
+	// A BR country inclusion covers each requested state; otherwise every state
+	// must already be included explicitly in the current regions list.
+	if (!hasBrazilCoverage && !regionKeys.every((key) => existingRegions?.some((region) => region.key === key))) {
+		throw new Error("Requested states would expand current geography. Only Brazil-wide or already-included state coverage can be restricted by this tool.");
+	}
+	const automation = z.record(z.string(), z.unknown()).parse(targeting.targeting_automation ?? {});
+	const individual = z.record(z.string(), z.unknown()).parse(automation.individual_setting ?? {});
+	return {
+		...targeting,
+		geo_locations: {
+			regions: regionKeys.map((key) => ({ key })),
+			...(geo.location_types !== undefined ? { location_types: geo.location_types } : {}),
+		},
+		targeting_automation: {
+			...automation,
+			individual_setting: { ...individual, geo: 0 },
+		},
+	};
+}
+
+function normalizeGeoAuditSnapshot(snapshot: Record<string, unknown>) {
+	const targeting = targetingSchema.parse(snapshot.targeting);
+	const geo = z.record(z.string(), z.unknown()).parse(targeting.geo_locations);
+	if (!Array.isArray(geo.regions)) return snapshot;
+	const regions = geo.regions.map((raw) => {
+		// Graph enriches region keys with display-only names and country codes.
+		// Reject unexpected fields or a non-BR country instead of hiding a drift.
+		const region = z.object({
+			key: z.string(), name: z.string().optional(), country: z.literal("BR").optional(),
+		}).strict().parse(raw);
+		return { key: region.key };
+	}).sort((a, b) => a.key.localeCompare(b.key));
+	return { ...snapshot, targeting: { ...targeting, geo_locations: { ...geo, regions } } };
+}
+
+function adsetGeoDifferences(expected: Record<string, unknown>, actual: Record<string, unknown>) {
+	return adsetAgeDifferences(normalizeGeoAuditSnapshot(expected), normalizeGeoAuditSnapshot(actual));
 }
 
 function assertExpectedName(snapshot: z.infer<typeof objectSchema>, expectedName: string) {
@@ -1883,6 +1936,95 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					if (writeAttempted) {
 						auditMutation("update_adset_age_unverified", { adset_id, age_min, age_max });
 						return asToolError(new Error(`Real update was attempted; its final state is unverified. Read the ad set before retrying. ${error instanceof Error ? error.message : "Unknown error."}`));
+					}
+					return asToolError(error);
+				}
+			},
+		);
+
+		this.server.registerTool(
+			"meta_update_adset_geo",
+			{
+				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: false },
+				description:
+					"WRITE/PREVIEW. Restrict one owned ad set to selected Southern Brazil states: Parana 452, Rio Grande do Sul 456, Santa Catarina 459. The current geography must cover Brazil or already include every requested state; city/radius audiences are never expanded. Replaces only geographic inclusions and sets individual_setting.geo=0. Preserves exclusions, location presence types, age, professions, other automation settings, budget, schedule, destination, optimization, name and configured status. Defaults to Meta validate_only; exact current name and confirmation are required for a real write. Uses an operation lease, concurrent-change checks and complete read-back verification. Never creates or activates objects.",
+				inputSchema: {
+					adset_id: z.string().regex(META_ID_PATTERN),
+					confirmation_phrase: z.string().max(1_000).optional(),
+					expected_name: z.string().min(1).max(500),
+					region_keys: z.array(z.enum(SOUTH_BRAZIL_REGION_KEYS)).min(1).max(3)
+						.refine((keys) => new Set(keys).size === keys.length, "Region keys must be unique."),
+					validate_only: z.boolean().default(true),
+				},
+			},
+			async ({ adset_id, confirmation_phrase, expected_name, region_keys, validate_only }) => {
+				const env = this.env as MetaEnv;
+				const regionKeys = [...region_keys].sort();
+				const requiredConfirmation = `UPDATE ADSET GEO ${adset_id} REGIONS ${regionKeys.join(",")} GEO_EXPANSION 0`;
+				let operationHolder: string | undefined;
+				let leaseAcquired = false;
+				let writeAttempted = false;
+				try {
+					assertWritesEnabled(env);
+					if (!validate_only) assertConfirmation(confirmation_phrase || "", requiredConfirmation);
+					operationHolder = `operation:${crypto.randomUUID()}`;
+					await acquireAccountWriteLease(env, operationHolder, requiredConfirmation);
+					leaseAcquired = true;
+					const before = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
+					if (before.id !== adset_id) throw new Error("Ad-set ID mismatch before geography update.");
+					assertExpectedName(before, expected_name);
+					if (before.status !== "ACTIVE" && before.status !== "PAUSED") {
+						throw new Error("Geography update requires an ad set currently configured ACTIVE or PAUSED.");
+					}
+					const targeting = targetingSchema.parse(before.targeting);
+					const nextTargeting = buildRestrictedSouthTargeting(targeting, regionKeys);
+					const expected = { ...before, targeting: nextTargeting };
+					const params = { targeting: nextTargeting };
+					if (adsetGeoDifferences(expected, before).length === 0) {
+						const warning = await releaseAccountOperationLease(env, operationHolder);
+						return asToolResult({ mode: "no_change", before, after: before, verified: true,
+							required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
+					}
+					const validation = writeResponseSchema.parse(await callMetaGraph(env, "POST", adset_id, {
+						...params, execution_options: ["validate_only"],
+					}, { write_lease_holder: operationHolder }));
+					if (validation.success !== true) throw new Error("Meta did not confirm successful geography validation; no real write attempted.");
+					const rechecked = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
+					const concurrentChanges = adsetGeoDifferences(before, rechecked);
+					if (concurrentChanges.length) {
+						throw new Error(`Ad set changed during geography validation (${concurrentChanges.join(", ")}); no real write attempted.`);
+					}
+					if (validate_only) {
+						const warning = await releaseAccountOperationLease(env, operationHolder);
+						return asToolResult({ mode: "validate_only", before, proposed: expected, validation,
+							verified_unchanged: true, required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
+					}
+					writeAttempted = true;
+					const result = writeResponseSchema.parse(await callMetaGraph(env, "POST", adset_id, params, {
+						write_lease_holder: operationHolder,
+					}));
+					if (result.success !== true || (result.id !== undefined && result.id !== adset_id)) {
+						throw new Error("Meta did not confirm the requested geography mutation.");
+					}
+					const after = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
+					const mismatches = adsetGeoDifferences(expected, after);
+					if (mismatches.length) throw new Error(`Geography read-back changed or failed to preserve fields: ${mismatches.join(", ")}.`);
+					auditMutation("update_adset_geo", { adset_id, region_keys: regionKeys, geo_expansion: 0, verified: true });
+					const warning = await releaseAccountOperationLease(env, operationHolder);
+					return asToolResult({ mode: "updated", before, result, after, verified: true, mismatches,
+						write_lease_release_warning: warning });
+				} catch (error) {
+					if (writeAttempted && !(error instanceof MetaWriteNotDispatchedError)) {
+						auditMutation("update_adset_geo_unverified", { adset_id, region_keys: regionKeys });
+						return asToolError(new Error(
+							`WRITE_OUTCOME_UNCERTAIN: real geography update was attempted; reconcile the complete ad-set snapshot before another write. Its operation lease was retained; no retry or rollback occurred. ${error instanceof Error ? error.message : "Unexpected geography error."}`,
+						));
+					}
+					if (leaseAcquired && operationHolder) {
+						const warning = await releaseAccountOperationLease(env, operationHolder);
+						if (warning) return asToolError(new Error(
+							`${error instanceof Error ? error.message : "Geography preflight failed."} No real Meta write was dispatched. ${warning}`,
+						));
 					}
 					return asToolError(error);
 				}
