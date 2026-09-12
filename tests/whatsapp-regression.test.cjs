@@ -801,8 +801,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.6");
-  assert.equal(h.metadata.version, "2.3.6");
+  assert.equal(result.connector_version, "2.3.7");
+  assert.equal(h.metadata.version, "2.3.7");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -828,8 +828,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.6");
-  assert.equal(h.metadata.version, "2.3.6");
+  assert.equal(result.connector_version, "2.3.7");
+  assert.equal(h.metadata.version, "2.3.7");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1527,7 +1527,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.6");
+  assert.equal(result.connector_version, "2.3.7");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1601,7 +1601,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.6");
+  assert.equal(result.connector_version, "2.3.7");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1807,7 +1807,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.6");
+    assert.equal(result.connector_version, "2.3.7");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -2569,6 +2569,64 @@ async function geoPair(options = {}) {
 function realGeoPosts(runtime) {
   return runtime.calls.filter(c => c.method === "POST" && !c.params.execution_options);
 }
+
+
+for (const retainLegacy of [false, true]) test("geo legacy compatibility omits the removed write field and verifies readback (retained=" + retainLegacy + ")", async () => {
+  const initial = geoFixture();
+  initial.targeting.targeting_optimization = "none";
+  initial.targeting_optimization_types = [{ detailed_targeting: 0, lookalike: 0 }];
+  let realWrite = false;
+  const p = await geoPair({ initial, respond(call, state) {
+    if (call.path === ADSET && call.method === "POST") {
+      assert.equal(Object.hasOwn(call.params.targeting, "targeting_optimization"), false,
+        "the removed field must not be sent in validation or real update");
+      if (!call.params.execution_options) realWrite = true;
+    }
+    if (call.path === ADSET && call.method === "GET" && realWrite && retainLegacy) {
+      state.value.targeting.targeting_optimization = "none";
+      return state.value;
+    }
+  } });
+  const result = toolPayload(await p.first.invoke("meta_update_adset_geo", geoRealInput()));
+  assert.equal(result.verified, true);
+  assert.equal(result.before.targeting.targeting_optimization, "none");
+  assert.equal(result.after.targeting.targeting_optimization, retainLegacy ? "none" : undefined);
+  assert.deepEqual(result.after.targeting_optimization_types, initial.targeting_optimization_types);
+  assert.equal(result.after.targeting.targeting_automation.individual_setting.geo, 0);
+  assert.equal(realGeoPosts(p.runtime).length, 1);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("geo legacy compatibility still fails if Meta changes effective detailed expansion", async () => {
+  const initial = geoFixture();
+  initial.targeting.targeting_optimization = "none";
+  initial.targeting_optimization_types = [{ detailed_targeting: 0, lookalike: 0 }];
+  let realWrite = false;
+  const p = await geoPair({ initial, respond(call, state) {
+    if (call.path === ADSET && call.method === "POST" && !call.params.execution_options) realWrite = true;
+    if (call.path === ADSET && call.method === "GET" && realWrite) {
+      state.value.targeting_optimization_types = [{ detailed_targeting: 1, lookalike: 0 }];
+      return state.value;
+    }
+  } });
+  const result = await p.first.invoke("meta_update_adset_geo", geoRealInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN.*targeting_optimization_types/);
+  assert.equal(realGeoPosts(p.runtime).length, 1);
+  assertStatusLeaseRetained(p.runtime, p.clock);
+});
+
+test("geo legacy compatibility rejects other legacy values before any POST", async () => {
+  const initial = geoFixture();
+  initial.targeting.targeting_optimization = "expansion_all";
+  const p = await geoPair({ initial });
+  const result = await p.first.invoke("meta_update_adset_geo", geoRealInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Unsupported legacy targeting_optimization/);
+  assert.equal(p.runtime.calls.filter(c => c.method === "POST").length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
 
 test("geo restriction previews the exact change and leaves the complete ad set unchanged", async () => {
   const p = await geoPair();

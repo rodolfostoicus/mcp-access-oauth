@@ -18,7 +18,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.6";
+const CONNECTOR_VERSION = "2.3.7";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -781,8 +781,17 @@ function buildRestrictedSouthTargeting(targeting: Record<string, unknown>, regio
 	}
 	const automation = z.record(z.string(), z.unknown()).parse(targeting.targeting_automation ?? {});
 	const individual = z.record(z.string(), z.unknown()).parse(automation.individual_setting ?? {});
+	const writableTargeting = { ...targeting };
+	// Graph can still return this legacy value while rejecting it in writes
+	// (100/1870197). Effective expansion controls remain part of the audit.
+	if (Object.prototype.hasOwnProperty.call(writableTargeting, "targeting_optimization")) {
+		if (writableTargeting.targeting_optimization !== "none") {
+			throw new Error("Unsupported legacy targeting_optimization value; no geography update attempted.");
+		}
+		delete writableTargeting.targeting_optimization;
+	}
 	return {
-		...targeting,
+		...writableTargeting,
 		geo_locations: {
 			regions: regionKeys.map((key) => ({ key })),
 			...(geo.location_types !== undefined ? { location_types: geo.location_types } : {}),
@@ -795,9 +804,12 @@ function buildRestrictedSouthTargeting(targeting: Record<string, unknown>, regio
 }
 
 function normalizeGeoAuditSnapshot(snapshot: Record<string, unknown>) {
-	const targeting = targetingSchema.parse(snapshot.targeting);
+	const targeting = { ...targetingSchema.parse(snapshot.targeting) };
+	// Only the obsolete 'none' value and its omission are equivalent. Do not
+	// normalize targeting_optimization_types or any active expansion setting.
+	if (targeting.targeting_optimization === "none") delete targeting.targeting_optimization;
 	const geo = z.record(z.string(), z.unknown()).parse(targeting.geo_locations);
-	if (!Array.isArray(geo.regions)) return snapshot;
+	if (!Array.isArray(geo.regions)) return { ...snapshot, targeting };
 	const regions = geo.regions.map((raw) => {
 		// Graph enriches region keys with display-only names and country codes.
 		// Reject unexpected fields or a non-BR country instead of hiding a drift.
