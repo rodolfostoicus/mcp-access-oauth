@@ -15,8 +15,10 @@ import asset10 from "./creative-data/brevar-oeste-preparo-feed";
 import asset11 from "./creative-data/brevar-oeste-preparo-stories";
 import asset12 from "./creative-data/brevar-oeste-regional-feed";
 import asset13 from "./creative-data/brevar-oeste-regional-stories";
+import brevarSulConvite from "./creative-data/brevar-sul-convite-feed";
 
 export const CREATIVE_ASSETS: Record<string, { mimeType: "image/jpeg" | "image/png"; base64: string }> = {
+  "/creative-assets/brevar-sul-convite-feed-efb12cc4d8d25aef.jpg": { mimeType: "image/jpeg", base64: brevarSulConvite },
   "/creative-assets/brevar-preparo-feed-e0ab576a73501a45.jpg": { mimeType: "image/jpeg", base64: asset0 },
   "/creative-assets/brevar-fundamentos-feed-e25c570dca600000.jpg": { mimeType: "image/jpeg", base64: asset1 },
   "/creative-assets/brevar-preparo-stories-a1c8eb967bd9f5f0.jpg": { mimeType: "image/jpeg", base64: asset2 },

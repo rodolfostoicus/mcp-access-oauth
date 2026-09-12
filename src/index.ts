@@ -18,7 +18,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.7";
+const CONNECTOR_VERSION = "2.3.8";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -54,6 +54,14 @@ const writeLeaseRequestSchema = z.discriminatedUnion("action", [
 	z.object({
 		action: z.literal("assert_owner"),
 		holder: z.string().min(1).max(500),
+	}).strict(),
+	z.object({
+		action: z.literal("creative_journal_get"), holder: z.string().min(1).max(500), request_id: z.string().uuid(), ad_id: z.string().regex(/^\d+$/),
+	}).strict(),
+	z.object({
+		action: z.literal("creative_journal_put"), holder: z.string().min(1).max(500), request_id: z.string().uuid(), ad_id: z.string().regex(/^\d+$/),
+		expected_stage: z.enum(["ABSENT", "CREATE_PENDING", "CREATIVE_CREATED", "ATTACH_PENDING"]),
+		record: z.record(z.string(), z.unknown()),
 	}).strict(),
 	z.object({ action: z.literal("status") }).strict(),
 ]);
@@ -96,6 +104,31 @@ export class MetaWriteLock {
 				return jsonResponse(active
 					? { active: true, expires_at: current.expires_at, operation: current.operation }
 					: { active: false });
+			}
+
+			if (parsed.action === "creative_journal_get" || parsed.action === "creative_journal_put") {
+				if (!active) return jsonResponse({ code: "WRITE_LEASE_EXPIRED" }, 409);
+				if (current.holder !== parsed.holder) return jsonResponse({ code: "WRITE_LOCKED", expires_at: current.expires_at, operation: current.operation }, 409);
+				const key = `brevar-creative:${parsed.request_id}`;
+				const record = await this.state.storage.get<Record<string, unknown>>(key);
+				const adKey = `brevar-creative-ad:${parsed.ad_id}`;
+				const adJournal = await this.state.storage.get<{ request_id: string; stage: string }>(adKey);
+				if (adJournal && adJournal.stage !== "COMPLETE" && adJournal.request_id !== parsed.request_id) {
+					return jsonResponse({ record: null, blocked_by_request_id: adJournal.request_id });
+				}
+				if (record && record.ad_id !== parsed.ad_id) return jsonResponse({ code: "CREATIVE_JOURNAL_AD_MISMATCH" }, 409);
+				if (parsed.action === "creative_journal_get") return jsonResponse({ record: record ?? null });
+				const oldStage = record?.stage ?? "ABSENT";
+				const nextStage: Record<string, string> = { ABSENT: "CREATE_PENDING", CREATE_PENDING: "CREATIVE_CREATED", CREATIVE_CREATED: "ATTACH_PENDING", ATTACH_PENDING: "COMPLETE" };
+				if (oldStage !== parsed.expected_stage || parsed.record.stage !== nextStage[String(oldStage)] ||
+					parsed.record.ad_id !== parsed.ad_id || parsed.record.request_id !== parsed.request_id ||
+					(record && parsed.record.fingerprint !== record.fingerprint) || JSON.stringify(parsed.record).length > 100_000) {
+					return jsonResponse({ code: "CREATIVE_JOURNAL_CONFLICT" }, 409);
+				}
+				// Commit journal and per-ad blocker atomically. A new request_id
+				// cannot bypass an unresolved operation after its lease expires.
+				await this.state.storage.put({ [key]: parsed.record, [adKey]: { request_id: parsed.request_id, stage: String(parsed.record.stage) } });
+				return jsonResponse({ saved: true });
 			}
 
 			if (parsed.action === "assert_owner") {
@@ -825,6 +858,114 @@ function adsetGeoDifferences(expected: Record<string, unknown>, actual: Record<s
 	return adsetAgeDifferences(normalizeGeoAuditSnapshot(expected), normalizeGeoAuditSnapshot(actual));
 }
 
+// Deliberately separate from geography restriction: this explicit BREVAR profile
+// may replace a city/radius audience with all three Southern Brazilian states.
+const BREVAR_MEDICAL_POSITION_IDS = [
+	"125395097503911", "138787906146791", "1423257317968087", "1597521383816555",
+	"359815664202923", "588508654618832", "649354901854686", "761820927245398",
+	"896416657056805", "941373515875427",
+] as const;
+const BREVAR_CAMPAIGN_AUDIT_FIELDS = "start_time,stop_time,pacing_type";
+
+function assertBrevarExpansionDisabled(snapshot: Record<string, unknown>) {
+	const rows = z.array(z.record(z.string(), z.unknown())).parse(snapshot.targeting_optimization_types);
+	const values: Record<string, unknown> = {};
+	for (const row of rows) {
+		if (typeof row.key === "string") {
+			if (Object.prototype.hasOwnProperty.call(values, row.key)) throw new Error("Duplicate targeting expansion diagnostic.");
+			values[row.key] = row.value;
+		} else {
+			for (const [key, value] of Object.entries(row)) {
+				if (Object.prototype.hasOwnProperty.call(values, key)) throw new Error("Duplicate targeting expansion diagnostic.");
+				values[key] = value;
+			}
+		}
+	}
+	if (values.detailed_targeting !== 0 || values.lookalike !== 0) {
+		throw new Error("BREVAR requires explicit detailed_targeting=0 and lookalike=0 diagnostics. This tool does not write read-only expansion diagnostics.");
+	}
+}
+
+function buildBrevarTargeting(targeting: Record<string, unknown>) {
+	const next = { ...targeting };
+	const geo = z.record(z.string(), z.unknown()).parse(targeting.geo_locations);
+	const presence = z.array(z.enum(["home", "recent", "frequently_in"])).min(1).parse(geo.location_types);
+	if (next.targeting_optimization !== undefined && next.targeting_optimization !== "none") {
+		throw new Error("Unsupported legacy targeting_optimization; no BREVAR change attempted.");
+	}
+	// Replace detailed inclusion filters, never combine medical jobs with broad
+	// interests or student/education alternatives. Placement and exclusion fields
+	// outside this replacement remain unchanged and are included in read-back.
+	for (const key of ["targeting_optimization", "age_range", "flexible_spec", "interests", "behaviors", "work_positions",
+		"work_employers", "education_majors", "education_schools", "education_statuses", "industries", "life_events"]) {
+		delete next[key];
+	}
+	next.age_min = 25;
+	next.age_max = 50;
+	next.user_age_unknown = false;
+	next.genders = [1, 2];
+	next.flexible_spec = [{ work_positions: BREVAR_MEDICAL_POSITION_IDS.map((id) => ({ id })) }];
+	next.geo_locations = { regions: SOUTH_BRAZIL_REGION_KEYS.map((key) => ({ key })), location_types: presence };
+	if (next.excluded_geo_locations !== undefined) {
+		const excluded = { ...z.record(z.string(), z.unknown()).parse(next.excluded_geo_locations) };
+		if (Array.isArray(excluded.countries) && excluded.countries.includes("BR")) {
+			throw new Error("Brazil is excluded; this conflicting country exclusion needs separate review.");
+		}
+		if (excluded.regions !== undefined) {
+			const regions = z.array(z.object({ key: z.string() }).passthrough()).parse(excluded.regions);
+			const remaining = regions.filter((region) => !(SOUTH_BRAZIL_REGION_KEYS as readonly string[]).includes(region.key));
+			if (remaining.length) excluded.regions = remaining;
+			else delete excluded.regions;
+		}
+		if (Object.keys(excluded).some((key) => key !== "location_types")) next.excluded_geo_locations = excluded;
+		else delete next.excluded_geo_locations;
+	}
+	const automation = z.record(z.string(), z.unknown()).parse(next.targeting_automation ?? {});
+	const individual = z.record(z.string(), z.unknown()).parse(automation.individual_setting ?? {});
+	if (individual.age !== undefined && individual.age !== 0) throw new Error("An existing individual age-expansion setting requires separate review; no unverified age subfield is written.");
+	next.targeting_automation = { ...automation, advantage_audience: 0, individual_setting: { ...individual, geo: 0 } };
+	const relaxation = z.record(z.string(), z.unknown()).parse(next.targeting_relaxation_types ?? {});
+	next.targeting_relaxation_types = { ...relaxation, lookalike: 0, custom_audience: 0 };
+	return next;
+}
+
+function brevarSchedule(timezone: unknown) {
+	if (timezone !== "America/Noronha" && timezone !== "America/Sao_Paulo") {
+		throw new Error("BREVAR schedule supports verified America/Noronha or America/Sao_Paulo account timezones only.");
+	}
+	return [{ days: [0, 1, 2, 3, 4, 5, 6], start_minute: timezone === "America/Noronha" ? 420 : 360,
+		end_minute: timezone === "America/Noronha" ? 1440 : 1380, timezone_type: "ADVERTISER" as const }];
+}
+
+function normalizeBrevarSnapshot(snapshot: Record<string, unknown>) {
+	const normalized = normalizeGeoAuditSnapshot(snapshot);
+	const targeting = { ...targetingSchema.parse(normalized.targeting) };
+	if (targeting.genders === undefined || canonicalJson(targeting.genders) === "[0]"
+		|| canonicalJson(targeting.genders) === "[2,1]") targeting.genders = [1, 2];
+	if (Array.isArray(targeting.flexible_spec)) {
+		targeting.flexible_spec = targeting.flexible_spec.map((raw) => {
+			const clause = z.record(z.string(), z.unknown()).parse(raw);
+			if (!Array.isArray(clause.work_positions)) return clause;
+			const positions = clause.work_positions.map((position) => {
+				const parsed = z.object({ id: z.string(), name: z.string().optional() }).strict().parse(position);
+				return { id: parsed.id };
+			}).sort((a, b) => a.id.localeCompare(b.id));
+			return { ...clause, work_positions: positions };
+		});
+	}
+	// Meta may split the same weekly window into separate day rows. Compare the
+	// exact per-day intervals, retaining timezone semantics and overlap checks.
+	const schedule = snapshot.adset_schedule === undefined ? undefined : adsetScheduleSchema.parse(snapshot.adset_schedule)
+		.flatMap((window) => window.days.map((day) => ({ day, start_minute: window.start_minute,
+			end_minute: window.end_minute, timezone_type: window.timezone_type })))
+		.sort((a, b) => a.day - b.day || a.start_minute - b.start_minute);
+	return { ...normalized, targeting, ...(schedule !== undefined ? { adset_schedule: schedule } : {}) };
+}
+
+function brevarDifferences(expected: Record<string, unknown>, actual: Record<string, unknown>) {
+	return adsetAgeDifferences(normalizeBrevarSnapshot(expected), normalizeBrevarSnapshot(actual));
+}
+
 function assertExpectedName(snapshot: z.infer<typeof objectSchema>, expectedName: string) {
 	if (snapshot.name !== expectedName) {
 		throw new Error(
@@ -853,6 +994,116 @@ function getPromotedPageId(snapshot: z.infer<typeof objectSchema>) {
 
 function buildWhatsAppLink(phoneNumber: string, prefilledMessage: string) {
 	return `https://wa.me/${phoneNumber}?text=${encodeURIComponent(prefilledMessage)}`;
+}
+
+// BREVAR creative replacement deliberately changes one paused ad's creative ID
+// only. The durable operation journal survives request/lease expiry; incomplete
+// operations are reconciled manually instead of replaying a create or attach.
+const BREVAR_CREATIVE_PAGE = "102139681237405";
+const BREVAR_CREATIVE_PHONE = "554791822809";
+const BREVAR_CREATIVE_COURSE_PATH = "/produtos/72/curso-brevar-fundamentos-t04-blumenau-sc/";
+const BREVAR_CREATIVE_FIELDS = "id,name,account_id,object_story_spec,object_story_id,source_instagram_media_id,asset_feed_spec,url_tags,degrees_of_freedom_spec,contextual_multi_ads";
+const BREVAR_AD_AUDIT_FIELDS = "tracking_specs,conversion_specs";
+const BREVAR_CREATIVE_CAMPAIGN_AUDIT_FIELDS = "spend_cap,start_time,stop_time,special_ad_categories,is_adset_budget_sharing_enabled";
+
+type BrevarCreativeSnapshot = {
+	ad: z.infer<typeof objectSchema>;
+	adset: z.infer<typeof objectSchema>;
+	campaign: z.infer<typeof objectSchema>;
+	creative: Record<string, unknown>;
+};
+
+async function readBrevarCreativeSnapshot(env: MetaEnv, adId: string): Promise<BrevarCreativeSnapshot> {
+	const ad = await getOwnedObject(env, "AD", adId, BREVAR_AD_AUDIT_FIELDS);
+	if (ad.id !== adId) throw new Error("Ad identity mismatch.");
+	const adsetId = z.string().regex(META_ID_PATTERN).parse(ad.adset_id);
+	const campaignId = z.string().regex(META_ID_PATTERN).parse(ad.campaign_id);
+	const adset = await getOwnedObject(env, "ADSET", adsetId, ADSET_AGE_AUDIT_FIELDS);
+	const campaign = await getOwnedObject(env, "CAMPAIGN", campaignId, BREVAR_CREATIVE_CAMPAIGN_AUDIT_FIELDS);
+	if (adset.id !== adsetId || campaign.id !== campaignId || adset.campaign_id !== campaignId) throw new Error("Ad hierarchy mismatch.");
+	const creativeId = z.object({ id: z.string().regex(META_ID_PATTERN) }).parse(ad.creative).id;
+	const creative = z.record(z.string(), z.unknown()).parse(await callMetaGraph(env, "GET", creativeId, { fields: BREVAR_CREATIVE_FIELDS }));
+	if (creative.id !== creativeId || String(creative.account_id).replace(/^act_/, "") !== getMetaConfig(env).accountNumericId) throw new Error("Creative identity or account mismatch.");
+	return { ad, adset, campaign, creative };
+}
+
+function brevarHierarchyDifferences(expected: BrevarCreativeSnapshot, actual: BrevarCreativeSnapshot, creativeId?: string) {
+	const expectedAd = creativeId ? { ...expected.ad, creative: { id: creativeId } } : expected.ad;
+	// Graph's creative expansion may include a display name. Only that relation's
+	// ID is configurable; actual creative contents are checked independently.
+	const normalizedAd = (value: Record<string, unknown>) => ({ ...value, creative: { id: z.object({ id: z.string() }).parse(value.creative).id } });
+	return [
+		...adsetAgeDifferences(normalizedAd(expectedAd), normalizedAd(actual.ad)).map((key) => `ad.${key}`),
+		...adsetAgeDifferences(expected.adset, actual.adset).map((key) => `adset.${key}`),
+		...adsetAgeDifferences(expected.campaign, actual.campaign).map((key) => `campaign.${key}`),
+	];
+}
+
+function assertBrevarCreativeSnapshotUnchanged(before: BrevarCreativeSnapshot, after: BrevarCreativeSnapshot) {
+	const differences = brevarHierarchyDifferences(before, after);
+	if (canonicalJson(before.creative) !== canonicalJson(after.creative)) differences.push("creative");
+	if (differences.length) throw new Error(`BREVAR structure changed (${differences.join(", ")}); no subsequent mutation dispatched.`);
+}
+
+function buildBrevarCreativeProposal(before: BrevarCreativeSnapshot, input: {
+	description: string; headline: string; image_hash: string; link_url: string; message: string;
+}) {
+	if (before.ad.status !== "PAUSED") throw new Error("Creative replacement requires the existing ad to be configured PAUSED; this operation never pauses or activates ads.");
+	if (!/\bBREVAR\b/i.test(`${before.ad.name} ${before.campaign.name}`)) throw new Error("Creative replacement is limited to explicitly named BREVAR ads or campaigns.");
+	if (before.creative.source_instagram_media_id || before.creative.object_story_id || before.creative.asset_feed_spec) {
+		throw new Error("Existing-post/Instagram-boost and dynamic creatives require their native workflow; this operation does not bypass those restrictions.");
+	}
+	const story = z.record(z.string(), z.unknown()).parse(before.creative.object_story_spec);
+	if (story.page_id !== BREVAR_CREATIVE_PAGE || story.video_data || story.photo_data || story.template_data || story.text_data) throw new Error("Only existing Stoicus Page link-image creatives can be replaced.");
+	const previousLink = z.record(z.string(), z.unknown()).parse(story.link_data);
+	if (previousLink.child_attachments || previousLink.video_id) throw new Error("Carousel and video link creatives require a separate reviewed operation.");
+	const url = new URL(input.link_url);
+	if (url.protocol !== "https:" || url.username || url.password || url.port || url.hash) throw new Error("Approved destination requires a plain HTTPS URL without credentials, port or fragment.");
+	const whatsApp = before.adset.destination_type === "WHATSAPP" && before.adset.optimization_goal === "CONVERSATIONS";
+	const onPost = before.adset.destination_type === "ON_POST" && before.adset.optimization_goal === "POST_ENGAGEMENT";
+	if (!whatsApp && !onPost) throw new Error("Only CONVERSATIONS/WHATSAPP and POST_ENGAGEMENT/ON_POST BREVAR ad sets are supported.");
+	if (getPromotedPageId(before.adset) !== BREVAR_CREATIVE_PAGE) throw new Error("Parent ad set must promote the approved Stoicus Page.");
+	if (whatsApp) {
+		if (url.hostname !== "wa.me" || url.pathname !== `/${BREVAR_CREATIVE_PHONE}` || [...url.searchParams.keys()].some((key) => key !== "text")) throw new Error("WhatsApp link must use the approved BREVAR phone and optional text only.");
+		const promoted = z.record(z.string(), z.unknown()).parse(before.adset.promoted_object);
+		if (promoted.whatsapp_phone_number !== undefined && String(promoted.whatsapp_phone_number).replace(/\D/g, "") !== BREVAR_CREATIVE_PHONE) throw new Error("Parent WhatsApp phone differs from the approved destination.");
+	} else if (!["www.stoicus.com.br", "stoicus.com.br"].includes(url.hostname) || url.pathname !== BREVAR_CREATIVE_COURSE_PATH || [...url.searchParams.keys()].some((key) => !/^utm_(source|medium|campaign|term|content)$/.test(key))) {
+		throw new Error("Regional/on-post destination must be the approved BREVAR course URL with optional UTM parameters only.");
+	}
+	const linkData: Record<string, unknown> = {
+		...previousLink, image_hash: input.image_hash, message: input.message, name: input.headline, description: input.description,
+		link: input.link_url, call_to_action: { type: whatsApp ? "WHATSAPP_MESSAGE" : "LEARN_MORE", value: whatsApp ? { app_destination: "WHATSAPP", link: input.link_url } : { link: input.link_url } },
+	};
+	delete linkData.picture; // generated rendition URL; image_hash is authoritative
+	delete linkData.page_welcome_message; // replaced by the approved wa.me prefill
+	delete linkData.caption; // stale display text is not copied into revised ads
+	const proposal: Record<string, string | number | boolean | object> = {
+		name: `${before.ad.name} | BREVAR corrigido`,
+		object_story_spec: { ...story, page_id: BREVAR_CREATIVE_PAGE, link_data: linkData },
+	};
+	for (const key of ["url_tags", "degrees_of_freedom_spec", "contextual_multi_ads"]) {
+		if (before.creative[key] !== undefined) proposal[key] = z.union([z.string(), z.number(), z.boolean(), z.record(z.string(), z.unknown()), z.array(z.unknown())]).parse(before.creative[key]);
+	}
+	return proposal;
+}
+
+function assertBrevarCreativeReadback(proposed: Record<string, unknown>, actual: Record<string, unknown>, id: string, accountNumericId: string) {
+	if (actual.id !== id || String(actual.account_id).replace(/^act_/, "") !== accountNumericId) throw new Error("Replacement creative identity/account read-back mismatch.");
+	if (actual.source_instagram_media_id || actual.object_story_id || actual.asset_feed_spec) throw new Error("Unexpected existing-post or dynamic format after creative replacement.");
+	const normalized = { ...actual };
+	const story = z.record(z.string(), z.unknown()).parse(actual.object_story_spec);
+	const link = { ...z.record(z.string(), z.unknown()).parse(story.link_data) };
+	if (link.image_hash) delete link.picture; // Graph may enrich the image rendition
+	const normalizedStory = { ...story, link_data: link };
+	normalized.object_story_spec = normalizedStory;
+	for (const key of ["name", "object_story_spec", "url_tags", "degrees_of_freedom_spec", "contextual_multi_ads"]) {
+		if (canonicalJson(proposed[key]) !== canonicalJson(normalized[key])) throw new Error(`Creative read-back mismatch: ${key}.`);
+	}
+}
+
+async function brevarCreativeFingerprint(value: unknown) {
+	const bytes = new TextEncoder().encode(canonicalJson(value));
+	return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function pagingCursors(paging?: MetaPaging) {
@@ -2044,6 +2295,130 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 		);
 
 		this.server.registerTool(
+			"meta_configure_brevar_adset",
+			{
+				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: false },
+				description:
+					"WRITE/PREVIEW. Apply the explicitly authorized BREVAR profile to one owned, unexpired BREVAR ad set: medical work-position profile PHYSICIANS_10, ages 25-50 with unknown ages disabled, both sexes, all Parana/Rio Grande do Sul/Santa Catarina, audience/geo and lookalike relaxation disabled, daily 06:00-23:00 America/Sao_Paulo (07:00-24:00 America/Noronha). Unlike geo restriction, this replaces city/radius coverage and removes exclusions of the three included states. Requires current detailed/lookalike diagnostics explicitly zero; does not write read-only diagnostics. Preserves other targeting settings, budgets at both levels, objective, optimization, destination, dates and configured status. Sets ad-set day_parting pacing and requires an existing lifetime budget, never converts or transfers budgets. Meta validate_only is the default; real changes require exact current ad-set/campaign names and confirmation. Uses one operation lease, validation, concurrent-change checks and complete read-back. Never activates, creates, changes the campaign, or bypasses Instagram boosted-post restrictions.",
+				inputSchema: {
+					adset_id: z.string().regex(META_ID_PATTERN),
+					expected_name: z.string().min(1).max(500),
+					expected_campaign_name: z.string().min(1).max(500),
+					name: z.string().trim().min(1).max(500).optional(),
+					confirmation_phrase: z.string().max(1_000).optional(),
+					validate_only: z.boolean().default(true),
+				},
+			},
+			async ({ adset_id, expected_name, expected_campaign_name, name, confirmation_phrase, validate_only }) => {
+				const env = this.env as MetaEnv;
+				const requiredConfirmation = `CONFIGURE BREVAR ADSET ${adset_id} SOUTH_BR PHYSICIANS_10 AGE 25 50 HOURS 06-23 AMERICA_SAO_PAULO${name !== undefined ? ` NAME ${name}` : ""}`;
+				let operationHolder: string | undefined;
+				let leaseAcquired = false;
+				let writeAttempted = false;
+				try {
+					assertWritesEnabled(env);
+					if (!validate_only) assertConfirmation(confirmation_phrase || "", requiredConfirmation);
+					operationHolder = `operation:${crypto.randomUUID()}`;
+					await acquireAccountWriteLease(env, operationHolder, requiredConfirmation);
+					leaseAcquired = true;
+					const { accountId, accountNumericId } = getMetaConfig(env);
+					const readTimezone = async () => {
+						const account = z.object({ id: z.string(), account_id: z.union([z.string(), z.number()]), timezone_name: z.string() })
+							.parse(await callMetaGraph(env, "GET", accountId, { fields: "id,account_id,timezone_name" }));
+						if (account.id !== accountId || String(account.account_id) !== accountNumericId) throw new Error("Account timezone belongs to a different account.");
+						return account.timezone_name;
+					};
+					const timezone = await readTimezone();
+					const schedule = brevarSchedule(timezone);
+					const before = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
+					if (before.id !== adset_id) throw new Error("Ad-set ID mismatch before BREVAR configuration.");
+					assertExpectedName(before, expected_name);
+					if (before.status !== "ACTIVE" && before.status !== "PAUSED") throw new Error("BREVAR configuration requires an ACTIVE or PAUSED ad set.");
+					const campaignId = z.string().regex(META_ID_PATTERN).parse(before.campaign_id);
+					const campaign = await getOwnedObject(env, "CAMPAIGN", campaignId, BREVAR_CAMPAIGN_AUDIT_FIELDS);
+					if (campaign.id !== campaignId) throw new Error("Parent campaign ID mismatch.");
+					assertExpectedName(campaign, expected_campaign_name);
+					if (!/\bBREVAR\b/i.test(campaign.name)) throw new Error("The owned parent campaign must identify BREVAR; other courses and unclassified boosts are not supported.");
+					if (campaign.status !== "ACTIVE" && campaign.status !== "PAUSED") throw new Error("BREVAR configuration requires an ACTIVE or PAUSED parent campaign.");
+					const start = typeof before.start_time === "string" ? Date.parse(before.start_time) : NaN;
+					const end = typeof before.end_time === "string" ? Date.parse(before.end_time) : NaN;
+					if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || end <= Date.now()) {
+						throw new Error("BREVAR configuration requires complete ordered dates and an unexpired end_time; no dates are extended by this tool.");
+					}
+					if (campaign.stop_time !== undefined && (!Number.isFinite(Date.parse(String(campaign.stop_time))) || Date.parse(String(campaign.stop_time)) <= Date.now())) {
+						throw new Error("BREVAR parent campaign has an invalid or expired stop_time; no dates are extended.");
+					}
+					const budget = (value: unknown) => {
+						if (value === undefined) return 0;
+						if (!/^[0-9]+$/.test(String(value)) || !Number.isSafeInteger(Number(value))) throw new Error("Incomplete or invalid budget snapshot.");
+						return Number(value);
+					};
+					const campaignLifetime = budget(campaign.lifetime_budget);
+					const adsetLifetime = budget(before.lifetime_budget);
+					if (budget(campaign.daily_budget) || budget(before.daily_budget) || (!campaignLifetime && !adsetLifetime) || (campaignLifetime && adsetLifetime)) {
+						throw new Error("BREVAR daily schedule requires exactly one existing lifetime budget source and no daily budget. No budget conversion or transfer is supported.");
+					}
+					assertBrevarExpansionDisabled(before);
+					const targeting = buildBrevarTargeting(targetingSchema.parse(before.targeting));
+					const currentPacing = z.array(z.string()).optional().parse(before.pacing_type) ?? [];
+					if (currentPacing.includes("no_pacing")) throw new Error("Accelerated/no_pacing delivery needs separate review before adding day_parting.");
+					const pacing = [...new Set([...currentPacing, "day_parting"])];
+					const params: Record<string, string | number | boolean | object> = { targeting, adset_schedule: schedule, pacing_type: pacing };
+					if (name !== undefined) params.name = name;
+					const expected = { ...before, ...params };
+					if (brevarDifferences(expected, before).length === 0) {
+						const warning = await releaseAccountOperationLease(env, operationHolder);
+						return asToolResult({ mode: "no_change", before, after: before, campaign_before: campaign, campaign_after: campaign,
+							timezone_name: timezone, verified: true, required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
+					}
+					const validation = writeResponseSchema.parse(await callMetaGraph(env, "POST", adset_id, {
+						...params, execution_options: ["validate_only"],
+					}, { write_lease_holder: operationHolder }));
+					if (validation.success !== true) throw new Error("Meta did not confirm successful BREVAR configuration validation; no real write attempted.");
+					const rechecked = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
+					const campaignRechecked = await getOwnedObject(env, "CAMPAIGN", campaignId, BREVAR_CAMPAIGN_AUDIT_FIELDS);
+					const concurrent = brevarDifferences(before, rechecked);
+					const campaignConcurrent = adsetAgeDifferences(campaign, campaignRechecked);
+					if (concurrent.length || campaignConcurrent.length || await readTimezone() !== timezone) {
+						throw new Error(`BREVAR settings changed during validation (adset: ${concurrent.join(", ")}; campaign: ${campaignConcurrent.join(", ")}; account timezone also rechecked). No real write attempted.`);
+					}
+					if (end <= Date.now()) throw new Error("BREVAR end_time elapsed during validation; no real write attempted.");
+					if (validate_only) {
+						const warning = await releaseAccountOperationLease(env, operationHolder);
+						return asToolResult({ mode: "validate_only", before, proposed: expected, campaign_before: campaign, campaign_after: campaignRechecked,
+							timezone_name: timezone, validation, verified_unchanged: true, required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
+					}
+					writeAttempted = true;
+					const result = writeResponseSchema.parse(await callMetaGraph(env, "POST", adset_id, params, { write_lease_holder: operationHolder }));
+					if (result.success !== true || (result.id !== undefined && result.id !== adset_id)) throw new Error("Meta did not confirm the requested BREVAR configuration mutation.");
+					const after = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
+					const campaignAfter = await getOwnedObject(env, "CAMPAIGN", campaignId, BREVAR_CAMPAIGN_AUDIT_FIELDS);
+					assertBrevarExpansionDisabled(after);
+					const mismatches = brevarDifferences(expected, after);
+					const campaignMismatches = adsetAgeDifferences(campaign, campaignAfter);
+					if (mismatches.length || campaignMismatches.length || await readTimezone() !== timezone) {
+						throw new Error(`BREVAR read-back failed (adset: ${mismatches.join(", ")}; campaign: ${campaignMismatches.join(", ")}; account timezone also rechecked).`);
+					}
+					auditMutation("configure_brevar_adset", { adset_id, campaign_id: campaignId, profile: "PHYSICIANS_10", age_min: 25, age_max: 50,
+						regions: SOUTH_BRAZIL_REGION_KEYS, schedule_timezone: timezone, renamed: name !== undefined, verified: true });
+					const warning = await releaseAccountOperationLease(env, operationHolder);
+					return asToolResult({ mode: "updated", before, result, after, campaign_before: campaign, campaign_after: campaignAfter,
+						timezone_name: timezone, verified: true, mismatches, write_lease_release_warning: warning });
+				} catch (error) {
+					if (writeAttempted && !(error instanceof MetaWriteNotDispatchedError)) {
+						auditMutation("configure_brevar_adset_unverified", { adset_id });
+						return asToolError(new Error(`WRITE_OUTCOME_UNCERTAIN: BREVAR configuration was attempted; reconcile the ad set and campaign before another write. Its operation lease was retained; no retry or rollback occurred. ${error instanceof Error ? error.message : "Unexpected configuration error."}`));
+					}
+					if (leaseAcquired && operationHolder) {
+						const warning = await releaseAccountOperationLease(env, operationHolder);
+						if (warning) return asToolError(new Error(`${error instanceof Error ? error.message : "BREVAR preflight failed."} No real Meta write was dispatched. ${warning}`));
+					}
+					return asToolError(error);
+				}
+			},
+		);
+
+		this.server.registerTool(
 			"meta_update_budget",
 			{
 				annotations: {
@@ -2424,6 +2799,91 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 		);
 
 		this.server.registerTool(
+			"meta_upload_creative_asset",
+			{
+				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: false },
+				description:
+					"WRITE/LOCAL PREVIEW. Upload one deliberately public raster asset already present in this Worker's immutable creative manifest to the configured ad account's image library. Accepts only a manifest path, never caller bytes or external URLs. validate_only defaults to a local preview with MIME, size and SHA-256; it does not contact or validate with Meta. Real upload requires exact confirmation, enabled writes, confirmed account identity and an operation lease. Verifies the returned hash and account identity by read-back, and reports Meta's image name (bytes uploads may receive a generated name). Never creates ads, activates delivery or changes budgets. A possibly dispatched upload is never retried automatically.",
+				inputSchema: {
+					asset_path: z.string().max(300).regex(/^\/creative-assets\/[A-Za-z0-9][A-Za-z0-9._-]*\.(?:jpg|jpeg|png)$/),
+					confirmation_phrase: z.string().max(500).optional(),
+					validate_only: z.boolean().default(true),
+				},
+			},
+			async ({ asset_path, confirmation_phrase, validate_only }) => {
+				const env = this.env as MetaEnv;
+				let operationHolder: string | undefined;
+				let leaseAcquired = false;
+				let writeAttempted = false;
+				try {
+					assertWritesEnabled(env);
+					const { accountId, accountNumericId } = getMetaConfig(env);
+					const requiredConfirmation = `UPLOAD CREATIVE ASSET ${accountId} ${asset_path}`;
+					if (!validate_only) assertConfirmation(confirmation_phrase || "", requiredConfirmation);
+					// This serves bytes directly from CREATIVE_ASSETS. No URL fetch or
+					// filesystem lookup occurs, and the handler verifies raster signatures.
+					const asset = getCreativeAssetResponse(new Request(`https://creative-assets.internal${asset_path}`));
+					if (!asset || !asset.ok) throw new Error("Creative asset path is absent from the public manifest or its raster bytes are invalid.");
+					const mimeType = asset.headers.get("Content-Type");
+					if (mimeType !== "image/jpeg" && mimeType !== "image/png") throw new Error("Creative asset must be a public JPEG or PNG.");
+					const buffer = await asset.arrayBuffer();
+					if (!buffer.byteLength || buffer.byteLength > 10 * 1024 * 1024) throw new Error("Creative asset must contain 1 through 10 MiB of raster bytes.");
+					const bytes = new Uint8Array(buffer);
+					const sha256 = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", buffer)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+					const imageName = asset_path.slice("/creative-assets/".length);
+					const proposed = { account_id: accountId, asset_path, image_name: imageName, mime_type: mimeType, size_bytes: bytes.byteLength, sha256 };
+					if (validate_only) return asToolResult({
+						mode: "local_preview", meta_validation_performed: false, meta_write_performed: false,
+						proposed, required_confirmation: requiredConfirmation,
+					});
+					operationHolder = `operation:${crypto.randomUUID()}`;
+					await acquireAccountWriteLease(env, operationHolder, requiredConfirmation);
+					leaseAcquired = true;
+					const account = z.object({ id: z.string(), account_id: z.union([z.string(), z.number()]) }).parse(
+						await callMetaGraph(env, "GET", accountId, { fields: "id,account_id" }),
+					);
+					if (account.id !== accountId || String(account.account_id) !== accountNumericId) throw new Error("Configured account identity was not confirmed; no image upload was attempted.");
+					const chunks: string[] = [];
+					for (let offset = 0; offset < bytes.length; offset += 8192) {
+						chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 8192)));
+					}
+					writeAttempted = true;
+					const uploaded = z.object({ images: z.record(z.string(), z.object({ hash: z.string().regex(/^[a-fA-F0-9]{32}$/), name: z.string().min(1).optional() })) }).parse(
+						await callMetaGraph(env, "POST", `${accountId}/adimages`, { bytes: btoa(chunks.join("")) }, { write_lease_holder: operationHolder }),
+					);
+					const images = Object.values(uploaded.images);
+					if (images.length !== 1) throw new Error("Meta upload response did not identify exactly one image hash.");
+					const imageHash = images[0].hash;
+					const imageList = z.object({ data: z.array(z.object({ hash: z.string(), name: z.string().min(1), account_id: z.union([z.string(), z.number()]) })) }).parse(
+						await callMetaGraph(env, "GET", `${accountId}/adimages`, { fields: "hash,name,account_id", hashes: [imageHash], limit: 2 }),
+					);
+					if (imageList.data.length !== 1 || imageList.data[0].hash !== imageHash
+						|| String(imageList.data[0].account_id).replace(/^act_/, "") !== accountNumericId
+						|| (images[0].name !== undefined && imageList.data[0].name !== images[0].name)) {
+						throw new Error("Account-bound image read-back did not confirm the uploaded hash, account and returned Meta name.");
+					}
+					auditMutation("upload_creative_asset", { account_id: accountId, asset_path, sha256, image_hash: imageHash, verified: true });
+					const warning = await releaseAccountOperationLease(env, operationHolder);
+					return asToolResult({ mode: "uploaded", ...proposed, image_hash: imageHash,
+						meta_image_name: imageList.data[0].name,
+						name_verification: images[0].name === undefined ? "read_from_account_library" : "matches_upload_response",
+						verified: true, write_lease_release_warning: warning });
+				} catch (error) {
+					if (writeAttempted && !(error instanceof MetaWriteNotDispatchedError)) {
+						auditMutation("upload_creative_asset_unverified", { asset_path });
+						return asToolError(new Error(`WRITE_OUTCOME_UNCERTAIN: image upload may have been dispatched; reconcile the account image library before another upload. Its operation lease was retained; no retry occurred. ${error instanceof Error ? error.message : "Unexpected image upload error."}`));
+					}
+					if (leaseAcquired && operationHolder) {
+						const warning = await releaseAccountOperationLease(env, operationHolder);
+						if (warning) return asToolError(new Error(`${error instanceof Error ? error.message : "Creative asset preflight failed."} No image upload was dispatched. ${warning}`));
+					}
+					return asToolError(error);
+				}
+			},
+		);
+
+
+		this.server.registerTool(
 			"meta_create_ad_draft",
 			{
 				annotations: {
@@ -2561,6 +3021,113 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					});
 					return asToolResult(created);
 				} catch (error) {
+					return asToolError(error);
+				}
+			},
+		);
+
+		this.server.registerTool(
+			"meta_update_brevar_ad_creative",
+			{
+				annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: true, readOnlyHint: false },
+				description: "WRITE/PREVIEW. Correct a PAUSED existing BREVAR link-image ad while preserving its ad ID, ad set, campaign, names, configured status, audience, schedule and budgets. Validates account-owned image and approved Stoicus Page/WhatsApp or BREVAR course URL. Defaults to a no-create Meta validate_only preview. A real operation requires exact name, request_id and confirmation; it creates one replacement creative and attaches it to the same ad without activating anything. Uses a durable lease-protected journal: uncertain partial operations are never automatically repeated. Native Instagram boosts and existing-post/dynamic/video formats are not supported or bypassed.",
+				inputSchema: {
+					ad_id: z.string().regex(META_ID_PATTERN), expected_name: z.string().min(1).max(500),
+					message: z.string().min(1).max(5_000), headline: z.string().min(1).max(500), description: z.string().max(1_000).default(""),
+					image_hash: z.string().regex(/^[a-fA-F0-9]{32}$/), link_url: z.string().url().max(2_000),
+					request_id: z.string().uuid(), validate_only: z.boolean().default(true), confirmation_phrase: z.string().max(1_000).optional(),
+				},
+			},
+			async ({ ad_id, expected_name, message, headline, description, image_hash, link_url, request_id, validate_only, confirmation_phrase }) => {
+				const env = this.env as MetaEnv;
+				let holder: string | undefined;
+				let acquired = false;
+				let realWriteAttempted = false;
+				let creativeId: string | undefined;
+				let journalStage = "ABSENT";
+				try {
+					assertWritesEnabled(env);
+					const { accountId, accountNumericId } = getMetaConfig(env);
+					const input = { ad_id, expected_name, message, headline, description, image_hash, link_url };
+					const fingerprint = await brevarCreativeFingerprint({ accountId, ...input });
+					const requiredConfirmation = `REPLACE BREVAR CREATIVE ${ad_id} REQUEST ${request_id} SHA256 ${fingerprint}`;
+					if (!validate_only) assertConfirmation(confirmation_phrase || "", requiredConfirmation);
+					holder = `operation:${crypto.randomUUID()}`;
+					await acquireAccountWriteLease(env, holder, `REPLACE BREVAR CREATIVE ${ad_id} REQUEST ${request_id}`);
+					acquired = true;
+					const journalResult = await callWriteLock(env, { action: "creative_journal_get", holder, request_id, ad_id });
+					if (journalResult.blocked_by_request_id) throw new Error(`CREATIVE_RECONCILIATION_REQUIRED: ad ${ad_id} has unresolved request ${String(journalResult.blocked_by_request_id)}; a different request_id cannot bypass it.`);
+					if (!Object.prototype.hasOwnProperty.call(journalResult, "record")) throw new Error("Creative journal read was not confirmed; no mutation dispatched.");
+					if (journalResult.record !== null) {
+						const prior = z.object({ fingerprint: z.string(), stage: z.string(), before: z.object({ ad: objectSchema, adset: objectSchema, campaign: objectSchema, creative: z.record(z.string(), z.unknown()) }), proposed: z.record(z.string(), z.unknown()), creative_id: z.string().regex(META_ID_PATTERN).optional() }).passthrough().parse(journalResult.record);
+						if (prior.fingerprint !== fingerprint) throw new Error("request_id is already bound to different creative inputs; no mutation dispatched.");
+						if (prior.stage !== "COMPLETE" || !prior.creative_id) throw new Error(`CREATIVE_RECONCILIATION_REQUIRED: request ${request_id} remains ${prior.stage}${prior.creative_id ? ` (creative ${prior.creative_id})` : ""}. Read and reconcile before any new request; automatic recreation or reattachment is prohibited.`);
+						const after = await readBrevarCreativeSnapshot(env, ad_id);
+						const differences = brevarHierarchyDifferences(prior.before, after, prior.creative_id);
+						if (differences.length) throw new Error(`Completed creative operation no longer matches current settings: ${differences.join(", ")}. No replay mutation attempted.`);
+						assertBrevarCreativeReadback(prior.proposed, after.creative, prior.creative_id, accountNumericId);
+						const warning = await releaseAccountOperationLease(env, holder);
+						return asToolResult({ mode: "idempotent_replay", request_id, ad_id, creative_id: prior.creative_id, after, verified: true, no_write_performed: true, write_lease_release_warning: warning });
+					}
+					const before = await readBrevarCreativeSnapshot(env, ad_id);
+					assertExpectedName(before.ad, expected_name);
+					const proposed = buildBrevarCreativeProposal(before, input);
+					const images = graphListSchema.parse(await callMetaGraph(env, "GET", `${accountId}/adimages`, { hashes: [image_hash], fields: "hash", limit: 2 }));
+					if (images.data.length !== 1 || images.data[0].hash !== image_hash) throw new Error("Replacement image hash was not uniquely confirmed in the configured ad account.");
+					// This existing creation endpoint supports inline creatives and is
+					// used only with validate_only. No ad or creative is created here.
+					const validation = writeResponseSchema.parse(await callMetaGraph(env, "POST", `${accountId}/ads`, {
+						adset_id: String(before.ad.adset_id), name: String(before.ad.name), status: "PAUSED", creative: proposed,
+						execution_options: ["validate_only"],
+					}, { write_lease_holder: holder }));
+					if (validation.success !== true) throw new Error("Meta did not confirm the inline creative preview; no real write attempted.");
+					const rechecked = await readBrevarCreativeSnapshot(env, ad_id);
+					assertBrevarCreativeSnapshotUnchanged(before, rechecked);
+					if (validate_only) {
+						const warning = await releaseAccountOperationLease(env, holder);
+						return asToolResult({ mode: "validate_only", before, proposed, validation, request_id, required_confirmation: requiredConfirmation, verified_unchanged: true, write_lease_release_warning: warning });
+					}
+					let journal: Record<string, unknown> = { fingerprint, stage: "CREATE_PENDING", before, proposed, ad_id, request_id };
+					const saveJournal = async (expected_stage: "ABSENT" | "CREATE_PENDING" | "CREATIVE_CREATED" | "ATTACH_PENDING") => {
+						const saved = await callWriteLock(env, { action: "creative_journal_put", holder: holder!, request_id, ad_id, expected_stage, record: journal });
+						if (saved.saved !== true) throw new Error("Creative journal transition was not confirmed; no next mutation dispatched.");
+						journalStage = String(journal.stage);
+					};
+					await saveJournal("ABSENT"); // durable create intent precedes dispatch
+					realWriteAttempted = true;
+					const created = z.object({ id: z.string().regex(META_ID_PATTERN) }).passthrough().parse(await callMetaGraph(env, "POST", `${accountId}/adcreatives`, proposed, { write_lease_holder: holder }));
+					creativeId = created.id;
+					journal = { ...journal, stage: "CREATIVE_CREATED", creative_id: creativeId };
+					await saveJournal("CREATE_PENDING");
+					const newCreative = z.record(z.string(), z.unknown()).parse(await callMetaGraph(env, "GET", creativeId, { fields: BREVAR_CREATIVE_FIELDS }));
+					assertBrevarCreativeReadback(proposed, newCreative, creativeId, accountNumericId);
+					assertBrevarCreativeSnapshotUnchanged(before, await readBrevarCreativeSnapshot(env, ad_id));
+					const attachParams = { creative: { creative_id: creativeId } };
+					const attachValidation = writeResponseSchema.parse(await callMetaGraph(env, "POST", ad_id, { ...attachParams, execution_options: ["validate_only"] }, { write_lease_holder: holder }));
+					if (attachValidation.success !== true) throw new Error("Meta did not confirm validation of creative attachment; existing ad was not changed.");
+					assertBrevarCreativeSnapshotUnchanged(before, await readBrevarCreativeSnapshot(env, ad_id));
+					journal = { ...journal, stage: "ATTACH_PENDING" };
+					await saveJournal("CREATIVE_CREATED"); // durable attach intent precedes dispatch
+					const result = writeResponseSchema.parse(await callMetaGraph(env, "POST", ad_id, attachParams, { write_lease_holder: holder }));
+					if (result.success !== true || (result.id !== undefined && result.id !== ad_id)) throw new Error("Meta did not confirm attachment to the existing ad ID.");
+					const after = await readBrevarCreativeSnapshot(env, ad_id);
+					const differences = brevarHierarchyDifferences(before, after, creativeId);
+					if (differences.length) throw new Error(`Creative replacement failed to preserve configuration: ${differences.join(", ")}.`);
+					assertBrevarCreativeReadback(proposed, after.creative, creativeId, accountNumericId);
+					journal = { ...journal, stage: "COMPLETE", verified_at: new Date().toISOString() };
+					await saveJournal("ATTACH_PENDING");
+					auditMutation("update_brevar_ad_creative", { ad_id, request_id, creative_id: creativeId, verified: true, status: "PAUSED" });
+					const warning = await releaseAccountOperationLease(env, holder);
+					return asToolResult({ mode: "updated", request_id, ad_id, creative_id: creativeId, before, proposed, after, verified: true, result, write_lease_release_warning: warning });
+				} catch (error) {
+					if (realWriteAttempted) {
+						auditMutation("update_brevar_ad_creative_unverified", { ad_id, request_id, creative_id: creativeId, journal_stage: journalStage });
+						return asToolError(new Error(`CREATIVE_RECONCILIATION_REQUIRED: request ${request_id}, stage ${journalStage}${creativeId ? `, creative ${creativeId}` : ""}. ${error instanceof MetaWriteNotDispatchedError && journalStage === "CREATE_PENDING" ? "The API gate confirmed no creative-create POST was dispatched, but durable create intent still requires reconciliation." : "A real creative write was attempted and may have succeeded."} Its operation journal was retained and its lease was not released. Do not create a replacement request or repeat attachment before reconciling. ${error instanceof Error ? error.message : "Unexpected creative failure."}`));
+					}
+					if (acquired && holder) {
+						const warning = await releaseAccountOperationLease(env, holder);
+						if (warning) return asToolError(new Error(`${error instanceof Error ? error.message : "Creative preflight failed."} ${warning}`));
+					}
 					return asToolError(error);
 				}
 			},
