@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.14";
+const CONNECTOR_VERSION = "2.3.15";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -1071,6 +1071,93 @@ function brevarHierarchyDifferences(expected: BrevarCreativeSnapshot, actual: Br
 	];
 }
 
+const BREVAR_DERIVED_POST_ACTIONS = ["post_engagement", "post_interaction_gross", "link_click"] as const;
+
+function derivedBrevarPostTrackingMatches(expected: unknown, actual: unknown, oldPost: string, newPost: string) {
+	const split = (value: unknown, post: string) => {
+		const rows = z.array(z.record(z.string(), z.unknown())).parse(value);
+		const fixed: Record<string, unknown>[] = [];
+		const derived: Record<string, unknown>[] = [];
+		const seen = new Set<string>();
+		for (const row of rows) {
+			const actions = row["action.type"];
+			const action = Array.isArray(actions) && actions.length === 1 ? String(actions[0]) : "";
+			if (!(BREVAR_DERIVED_POST_ACTIONS as readonly string[]).includes(action)) { fixed.push(row); continue; }
+			if (seen.has(action)) throw new Error("Duplicated derived post-tracking action.");
+			seen.add(action);
+			const shape = action === "link_click"
+				? { "action.type": [action], post: [post], "post.wall": [BREVAR_CREATIVE_PAGE] }
+				: { "action.type": [action], page: [BREVAR_CREATIVE_PAGE], post: [post] };
+			if (canonicalJson(row) !== canonicalJson(shape)) throw new Error("Unrecognized derived post-tracking shape, Page or post ID.");
+			derived.push({ ...row, post: ["verified_creative_post"] });
+		}
+		if (seen.size !== BREVAR_DERIVED_POST_ACTIONS.length) throw new Error("Missing derived post-tracking action.");
+		return { fixed, derived: derived.sort((a, b) => canonicalJson(a).localeCompare(canonicalJson(b))) };
+	};
+	return canonicalJson(split(expected, oldPost)) === canonicalJson(split(actual, newPost));
+}
+
+async function brevarAfterAttachmentDifferences(env: MetaEnv, expected: BrevarCreativeSnapshot, actual: BrevarCreativeSnapshot, creativeId: string) {
+	const differences = brevarHierarchyDifferences(expected, actual, creativeId);
+	let trackingEvidence: Record<string, unknown> | null = null;
+	if (!differences.includes("ad.tracking_specs") || z.object({ id: z.string() }).parse(actual.ad.creative).id !== creativeId) return { differences, tracking_evidence: trackingEvidence };
+	try {
+		const oldCreativeId = z.object({ id: z.string().regex(META_ID_PATTERN) }).parse(expected.ad.creative).id;
+		if (oldCreativeId === creativeId) throw new Error("Tracking normalization requires distinct original and replacement creatives.");
+		const { accountNumericId } = getMetaConfig(env);
+		const readPost = async (id: string) => {
+			const object = z.object({ id: z.string(), account_id: z.union([z.string(), z.number()]), effective_object_story_id: z.string() }).parse(
+				await callMetaGraph(env, "GET", id, { fields: "id,account_id,effective_object_story_id" }),
+			);
+			if (object.id !== id || String(object.account_id).replace(/^act_/, "") !== accountNumericId) throw new Error("Post proof creative is not the expected account-owned object.");
+			const match = /^(\d+)_(\d+)$/.exec(object.effective_object_story_id);
+			if (!match || match[1] !== BREVAR_CREATIVE_PAGE) throw new Error("Derived post does not belong to the approved Stoicus Page.");
+			return { story_id: object.effective_object_story_id, post_id: match[2] };
+		};
+		// Legacy journals did not capture effective_object_story_id. Read the
+		// original creative itself; never fabricate or rewrite the before snapshot.
+		const oldPost = await readPost(oldCreativeId);
+		const newPost = await readPost(creativeId);
+		if (!derivedBrevarPostTrackingMatches(expected.ad.tracking_specs, actual.ad.tracking_specs, oldPost.post_id, newPost.post_id)) throw new Error("Non-derived tracking groups or values changed.");
+		trackingEvidence = { verified: true, original_creative_id: oldCreativeId, replacement_creative_id: creativeId, original_story_id: oldPost.story_id, replacement_story_id: newPost.story_id,
+			normalized_actions: BREVAR_DERIVED_POST_ACTIONS, all_other_tracking_preserved_exactly: true };
+		return { differences: differences.filter((key) => key !== "ad.tracking_specs"), tracking_evidence: trackingEvidence };
+	} catch (error) {
+		return { differences, tracking_evidence: { verified: false, error: error instanceof Error ? error.message : "Unverified derived post tracking." } };
+	}
+}
+
+function brevarStaticVideoOmissions(proposed: Record<string, unknown>, actual: Record<string, unknown>) {
+	const original = { proposed: proposed.degrees_of_freedom_spec, actual: actual.degrees_of_freedom_spec, omitted: [] as string[] };
+	const staticImage = (creative: Record<string, unknown>) => {
+		if (creative.asset_feed_spec || creative.source_instagram_media_id || creative.object_story_id || creative.video_id) return false;
+		const story = creative.object_story_spec;
+		if (!story || typeof story !== "object") return false;
+		const record = story as Record<string, unknown>;
+		if (record.video_data || record.photo_data || record.template_data || record.text_data) return false;
+		const link = record.link_data as Record<string, unknown> | undefined;
+		return !!link && typeof link.image_hash === "string" && /^[a-fA-F0-9]{32}$/.test(link.image_hash) && !link.video_id && !link.child_attachments;
+	};
+	if (!staticImage(proposed) || !staticImage(actual)) return original;
+	const expectedSpec = z.record(z.string(), z.unknown()).safeParse(proposed.degrees_of_freedom_spec);
+	const actualSpec = z.record(z.string(), z.unknown()).safeParse(actual.degrees_of_freedom_spec);
+	if (!expectedSpec.success || !actualSpec.success) return original;
+	const expectedFeatures = z.record(z.string(), z.unknown()).safeParse(expectedSpec.data.creative_features_spec);
+	const actualFeatures = z.record(z.string(), z.unknown()).safeParse(actualSpec.data.creative_features_spec);
+	if (!expectedFeatures.success || !actualFeatures.success) return original;
+	for (const key of ["image_animation", "media_type_automation", "multi_photo_to_video"]) {
+		if (canonicalJson(expectedFeatures.data[key]) !== canonicalJson({ enroll_status: "OPT_OUT" }) || canonicalJson(actualFeatures.data[key]) !== canonicalJson({ enroll_status: "OPT_OUT" })) return original;
+	}
+	const normalized = { ...expectedFeatures.data };
+	const omitted: string[] = [];
+	for (const key of ["video_auto_crop", "video_filtering", "video_uncrop"]) {
+		if (canonicalJson(normalized[key]) === canonicalJson({ enroll_status: "OPT_IN" }) && !Object.prototype.hasOwnProperty.call(actualFeatures.data, key)) { delete normalized[key]; omitted.push(key); }
+	}
+	// This only reconciles the three observed, inapplicable video entries for
+	// a proven static image. Omission is never represented as OPT_OUT.
+	return { proposed: { ...expectedSpec.data, creative_features_spec: normalized }, actual: actualSpec.data, omitted };
+}
+
 function assertBrevarCreativeSnapshotUnchanged(before: BrevarCreativeSnapshot, after: BrevarCreativeSnapshot) {
 	const differences = brevarHierarchyDifferences(before, after);
 	if (canonicalJson(before.creative) !== canonicalJson(after.creative)) differences.push("creative");
@@ -1131,8 +1218,11 @@ function assertBrevarCreativeReadback(proposed: Record<string, unknown>, actual:
 	// Creative.name is an administrative label. Meta may rewrite it on create;
 	// the visible headline is object_story_spec.link_data.name and stays strict.
 	if (actual.name !== undefined && typeof actual.name !== "string") throw new Error("Invalid administrative creative name in read-back.");
+	const staticVideoEvidence = brevarStaticVideoOmissions(proposed, actual);
 	for (const key of ["object_story_spec", "url_tags", "degrees_of_freedom_spec", "contextual_multi_ads"]) {
-		if (canonicalJson(proposed[key]) !== canonicalJson(normalized[key])) throw new Error(`Creative read-back mismatch: ${key}.`);
+		const expectedValue = key === "degrees_of_freedom_spec" ? staticVideoEvidence.proposed : proposed[key];
+		const actualValue = key === "degrees_of_freedom_spec" ? staticVideoEvidence.actual : normalized[key];
+		if (canonicalJson(expectedValue) !== canonicalJson(actualValue)) throw new Error(`Creative read-back mismatch: ${key}.`);
 	}
 }
 
@@ -1177,14 +1267,16 @@ async function inspectBrevarCreativeOperation(env: MetaEnv, adId: string, reques
 		catch (error) { contentError = error instanceof Error ? error.message : "Unverified creative content."; }
 	}
 	const expectedCreativeId = ["ATTACH_PENDING", "COMPLETE"].includes(journal.stage) ? journal.creative_id : undefined;
-	const differences = brevarHierarchyDifferences(journal.before, current, expectedCreativeId);
+	const attachmentAudit = expectedCreativeId ? await brevarAfterAttachmentDifferences(env, journal.before, current, expectedCreativeId) : { differences: brevarHierarchyDifferences(journal.before, current), tracking_evidence: null };
+	const differences = attachmentAudit.differences;
 	if (journal.stage === "CREATIVE_CREATED" && canonicalJson(journal.before.creative) !== canonicalJson(current.creative)) differences.push("original_creative");
 	const eligible = current.ad.status === "PAUSED" && journal.before.ad.status === "PAUSED" && !!journal.creative_id && !!createdCreative && contentError === null && differences.length === 0 && journal.stage !== "CREATE_PENDING";
 	const nameEvidence = createdCreative ? brevarCreativeNameEvidence(journal.proposed, createdCreative) : null;
 	const nameHash = await brevarCreativeFingerprint(createdCreative?.name ?? null);
 	const requiredConfirmation = journal.creative_id ? `RESUME BREVAR CREATIVE ${adId} REQUEST ${requestId} CREATIVE ${journal.creative_id} SHA256 ${journal.fingerprint} LABEL_SHA256 ${nameHash} STAGE ${journal.stage}` : null;
 	return { journal, current, created_creative: createdCreative, administrative_name: nameEvidence, content_verified: !!createdCreative && contentError === null, content_error: contentError,
-		configuration_differences: differences, eligible, required_confirmation: requiredConfirmation };
+		configuration_differences: differences, tracking_evidence: attachmentAudit.tracking_evidence,
+		observed_static_video_omissions: createdCreative ? brevarStaticVideoOmissions(journal.proposed, createdCreative).omitted : [], eligible, required_confirmation: requiredConfirmation };
 }
 
 function assertBrevarResumeEvidence(value: Awaited<ReturnType<typeof inspectBrevarCreativeOperation>>, input: {
@@ -3397,11 +3489,12 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						if (prior.fingerprint !== fingerprint) throw new Error("request_id is already bound to different creative inputs; no mutation dispatched.");
 						if (prior.stage !== "COMPLETE" || !prior.creative_id) throw new Error(`CREATIVE_RECONCILIATION_REQUIRED: request ${request_id} remains ${prior.stage}${prior.creative_id ? ` (creative ${prior.creative_id})` : ""}. Read and reconcile before any new request; automatic recreation or reattachment is prohibited.`);
 						const after = await readBrevarCreativeSnapshot(env, ad_id);
-						const differences = brevarHierarchyDifferences(prior.before, after, prior.creative_id);
+						const attachmentAudit = await brevarAfterAttachmentDifferences(env, prior.before, after, prior.creative_id);
+						const differences = attachmentAudit.differences;
 						if (differences.length) throw new Error(`Completed creative operation no longer matches current settings: ${differences.join(", ")}. No replay mutation attempted.`);
 						assertBrevarCreativeReadback(prior.proposed, after.creative, prior.creative_id, accountNumericId);
 						const warning = await releaseAccountOperationLease(env, holder);
-						return asToolResult({ mode: "idempotent_replay", request_id, ad_id, creative_id: prior.creative_id, after, administrative_name: brevarCreativeNameEvidence(prior.proposed, after.creative), verified: true, no_write_performed: true, write_lease_release_warning: warning });
+						return asToolResult({ mode: "idempotent_replay", request_id, ad_id, creative_id: prior.creative_id, after, tracking_evidence: attachmentAudit.tracking_evidence, observed_static_video_omissions: brevarStaticVideoOmissions(prior.proposed, after.creative).omitted, administrative_name: brevarCreativeNameEvidence(prior.proposed, after.creative), verified: true, no_write_performed: true, write_lease_release_warning: warning });
 					}
 					const before = await readBrevarCreativeSnapshot(env, ad_id);
 					assertExpectedName(before.ad, expected_name);
@@ -3449,14 +3542,15 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const result = writeResponseSchema.parse(await callMetaGraph(env, "POST", ad_id, attachParams, { write_lease_holder: holder }));
 					if (result.success !== true || (result.id !== undefined && result.id !== ad_id)) throw new Error("Meta did not confirm attachment to the existing ad ID.");
 					const after = await readBrevarCreativeSnapshot(env, ad_id);
-					const differences = brevarHierarchyDifferences(before, after, creativeId);
+					const attachmentAudit = await brevarAfterAttachmentDifferences(env, before, after, creativeId);
+					const differences = attachmentAudit.differences;
 					if (differences.length) throw new Error(`Creative replacement failed to preserve configuration: ${differences.join(", ")}.`);
 					assertBrevarCreativeReadback(proposed, after.creative, creativeId, accountNumericId);
 					journal = { ...journal, stage: "COMPLETE", verified_at: new Date().toISOString() };
 					await saveJournal("ATTACH_PENDING");
 					auditMutation("update_brevar_ad_creative", { ad_id, request_id, creative_id: creativeId, verified: true, status: "PAUSED" });
 					const warning = await releaseAccountOperationLease(env, holder);
-					return asToolResult({ mode: "updated", request_id, ad_id, creative_id: creativeId, before, proposed, after, administrative_name: brevarCreativeNameEvidence(proposed, after.creative), verified: true, result, write_lease_release_warning: warning });
+					return asToolResult({ mode: "updated", request_id, ad_id, creative_id: creativeId, before, proposed, after, tracking_evidence: attachmentAudit.tracking_evidence, observed_static_video_omissions: brevarStaticVideoOmissions(proposed, after.creative).omitted, administrative_name: brevarCreativeNameEvidence(proposed, after.creative), verified: true, result, write_lease_release_warning: warning });
 				} catch (error) {
 					if (realWriteAttempted) {
 						auditMutation("update_brevar_ad_creative_unverified", { ad_id, request_id, creative_id: creativeId, journal_stage: journalStage });

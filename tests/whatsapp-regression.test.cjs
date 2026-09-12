@@ -803,8 +803,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.14");
-  assert.equal(h.metadata.version, "2.3.14");
+  assert.equal(result.connector_version, "2.3.15");
+  assert.equal(h.metadata.version, "2.3.15");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -830,8 +830,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.14");
-  assert.equal(h.metadata.version, "2.3.14");
+  assert.equal(result.connector_version, "2.3.15");
+  assert.equal(h.metadata.version, "2.3.15");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1529,7 +1529,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.14");
+  assert.equal(result.connector_version, "2.3.15");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1603,7 +1603,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.14");
+  assert.equal(result.connector_version, "2.3.15");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1809,7 +1809,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.14");
+    assert.equal(result.connector_version, "2.3.15");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -4446,3 +4446,116 @@ test("normal creative replacement allows only administrative label rewriting whi
   assert.equal(result.verified, true); assert.equal(result.administrative_name.matches, false);
   assert.equal(result.after.creative.object_story_spec.link_data.name, creativeReplaceInput().headline);
 });
+
+
+// v2.3.15: exact observed post-attachment derivations, with independent creative
+// ownership/post proof. The legacy journal deliberately has no effective post ID.
+const BREVAR_OLD_POST = "1769466657496087";
+const BREVAR_NEW_POST = "1775462563563163";
+const BREVAR_VIDEO_OMISSIONS = ["video_auto_crop", "video_filtering", "video_uncrop"];
+function observedBrevarFeatures() {
+  return { creative_features_spec: {
+    image_animation: { enroll_status: "OPT_OUT" }, media_type_automation: { enroll_status: "OPT_OUT" }, multi_photo_to_video: { enroll_status: "OPT_OUT" },
+    image_enhancement: { enroll_status: "OPT_OUT" }, text_optimizations: { enroll_status: "OPT_OUT" },
+    video_auto_crop: { enroll_status: "OPT_IN" }, video_filtering: { enroll_status: "OPT_IN" }, video_uncrop: { enroll_status: "OPT_IN" },
+  } };
+}
+function observedBrevarTracking(post, reordered = false) {
+  const fixed = [
+    { "action.type": ["offsite_conversion"], fb_pixel: ["400001"] },
+    { "action.type": ["onsite_conversion"], conversion_id: ["400002"] },
+    { "action.type": ["onsite_conversion"], conversion_id: ["400003"] },
+    { "action.type": ["onsite_conversion.messaging_conversation_started_7d"], page: [BREVAR_PAGE] },
+    { "action.type": ["onsite_conversion.whatsapp_conversation_started_7d"], page: [BREVAR_PAGE] },
+  ];
+  const derived = [
+    { "action.type": ["post_engagement"], page: [BREVAR_PAGE], post: [post] },
+    { "action.type": ["post_interaction_gross"], page: [BREVAR_PAGE], post: [post] },
+    { "action.type": ["link_click"], post: [post], "post.wall": [BREVAR_PAGE] },
+  ];
+  return [...fixed, ...(reordered ? [derived[1], derived[0], derived[2]] : derived)];
+}
+async function seededObservedAttachment() {
+  const proofs = {
+    [BREVAR_OLD_CREATIVE]: { id: BREVAR_OLD_CREATIVE, account_id: ACCOUNT, effective_object_story_id: `${BREVAR_PAGE}_${BREVAR_OLD_POST}` },
+    [BREVAR_NEW_CREATIVE]: { id: BREVAR_NEW_CREATIVE, account_id: ACCOUNT, effective_object_story_id: `${BREVAR_PAGE}_${BREVAR_NEW_POST}` },
+  };
+  const h = await seededCreativeResume({
+    adjustState(s) { s.oldCreative.degrees_of_freedom_spec = observedBrevarFeatures(); s.ad.tracking_specs = observedBrevarTracking(BREVAR_OLD_POST); },
+    respond(call) { if (call.method === "GET" && call.params.fields === "id,account_id,effective_object_story_id") return structuredClone(proofs[call.path]); },
+  });
+  h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage = "ATTACH_PENDING";
+  h.runtime.values.get(`brevar-creative-ad:${BREVAR_AD}`).stage = "ATTACH_PENDING";
+  h.state.ad.creative = { id: BREVAR_NEW_CREATIVE };
+  h.state.ad.tracking_specs = observedBrevarTracking(BREVAR_NEW_POST, true);
+  for (const key of BREVAR_VIDEO_OMISSIONS) delete h.state.newCreative.degrees_of_freedom_spec.creative_features_spec[key];
+  return { ...h, proofs };
+}
+
+test("observed static-image attachment reconciles derived post tracking and only three video omissions without any Meta POST", async () => {
+  const h = await seededObservedAttachment();
+  const savedBefore = structuredClone(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`));
+  const posts = postCalls(h).length, writes = h.runtime.storageWrites.length;
+  const read = toolPayload(await h.invoke("meta_get_brevar_creative_operation", { ad_id: BREVAR_AD, expected_name: h.journal.before.ad.name, request_id: REQUEST_ID }));
+  assert.equal(read.content_verified, true); assert.equal(read.eligible, true);
+  assert.deepEqual(read.configuration_differences, []); assert.equal(read.tracking_evidence.verified, true);
+  assert.equal(read.tracking_evidence.original_story_id, `${BREVAR_PAGE}_${BREVAR_OLD_POST}`);
+  assert.equal(read.tracking_evidence.replacement_story_id, `${BREVAR_PAGE}_${BREVAR_NEW_POST}`);
+  assert.deepEqual(read.observed_static_video_omissions, BREVAR_VIDEO_OMISSIONS);
+  assert.equal(read.created_creative.degrees_of_freedom_spec.creative_features_spec.video_auto_crop, undefined);
+  assert.equal(read.journal.before.creative.effective_object_story_id, undefined);
+  assert.equal(h.runtime.storageWrites.length, writes); assert.equal(postCalls(h).length, posts);
+  const result = toolPayload(await resumeConfirmed(h, { expected_stage: "ATTACH_PENDING" }));
+  assert.equal(result.mode, "reconciled_complete"); assert.equal(result.meta_write_performed, false);
+  assert.equal(postCalls(h).length, posts); assert.equal(h.state.ad.status, "PAUSED");
+  const saved = h.runtime.values.get(`brevar-creative:${REQUEST_ID}`);
+  assert.equal(saved.stage, "COMPLETE"); assert.equal(saved.fingerprint, savedBefore.fingerprint);
+  assert.deepEqual(saved.before, savedBefore.before); assert.deepEqual(saved.proposed, savedBefore.proposed);
+  assert.equal(saved.creative_id, savedBefore.creative_id); assert.equal(saved.request_id, savedBefore.request_id);
+  assert.equal(h.runtime.values.has("lease"), false);
+});
+
+for (const [name, modify] of [
+  ["pixel change", h => { h.state.ad.tracking_specs[0].fb_pixel = ["999"]; }],
+  ["conversion change", h => { h.state.ad.tracking_specs[1].conversion_id = ["999"]; }],
+  ["fixed tracking reorder", h => { [h.state.ad.tracking_specs[0], h.state.ad.tracking_specs[1]] = [h.state.ad.tracking_specs[1], h.state.ad.tracking_specs[0]]; }],
+  ["additional fixed tracking", h => { h.state.ad.tracking_specs.push({ "action.type": ["offsite_conversion"], fb_pixel: ["999"] }); }],
+  ["duplicated derived action", h => { h.state.ad.tracking_specs.push(structuredClone(h.state.ad.tracking_specs[5])); }],
+  ["missing derived action", h => { h.state.ad.tracking_specs.pop(); }],
+  ["derived field enrichment", h => { h.state.ad.tracking_specs[5].extra = ["unapproved"]; }],
+  ["wrong derived post", h => { h.state.ad.tracking_specs[5].post = [BREVAR_OLD_POST]; }],
+  ["wrong proof Page", h => { h.proofs[BREVAR_NEW_CREATIVE].effective_object_story_id = `999_${BREVAR_NEW_POST}`; }],
+  ["foreign original creative proof", h => { h.proofs[BREVAR_OLD_CREATIVE].account_id = "999"; }],
+  ["missing original post proof", h => { delete h.proofs[BREVAR_OLD_CREATIVE].effective_object_story_id; }],
+  ["missing replacement post proof", h => { delete h.proofs[BREVAR_NEW_CREATIVE].effective_object_story_id; }],
+]) {
+  test(`derived tracking rejects ${name} and cannot complete ATTACH_PENDING`, async () => {
+    const h = await seededObservedAttachment(); modify(h);
+    const posts = postCalls(h).length, writes = h.runtime.storageWrites.length;
+    const result = await h.invoke("meta_resume_brevar_ad_creative", resumeInput(h, { expected_stage: "ATTACH_PENDING" }));
+    assert.equal(result.isError, true); assert.match(result.content[0].text, /ad.tracking_specs/);
+    assert.equal(postCalls(h).length, posts); assert.equal(h.runtime.storageWrites.length, writes);
+    assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "ATTACH_PENDING");
+  });
+}
+
+for (const [name, modify] of [
+  ["image transformation changed", (p, a) => { a.degrees_of_freedom_spec.creative_features_spec.image_enhancement.enroll_status = "OPT_IN"; }],
+  ["text transformation changed", (p, a) => { a.degrees_of_freedom_spec.creative_features_spec.text_optimizations.enroll_status = "OPT_IN"; }],
+  ["fourth video feature omitted", (p) => { p.degrees_of_freedom_spec.creative_features_spec.video_brightness = { enroll_status: "OPT_IN" }; }],
+  ["video status changed instead of omitted", (p, a) => { a.degrees_of_freedom_spec.creative_features_spec.video_auto_crop = { enroll_status: "OPT_OUT" }; }],
+  ["image conversion not explicitly disabled", (p, a) => { delete p.degrees_of_freedom_spec.creative_features_spec.image_animation; delete a.degrees_of_freedom_spec.creative_features_spec.image_animation; }],
+  ["image conversion enabled on both sides", (p, a) => { p.degrees_of_freedom_spec.creative_features_spec.multi_photo_to_video.enroll_status = "OPT_IN"; a.degrees_of_freedom_spec.creative_features_spec.multi_photo_to_video.enroll_status = "OPT_IN"; }],
+  ["video representation", (p, a) => { p.video_id = "123"; a.video_id = "123"; }],
+  ["carousel representation", (p, a) => { p.object_story_spec.link_data.child_attachments = [{ link: "https://example.test" }]; a.object_story_spec.link_data.child_attachments = [{ link: "https://example.test" }]; }],
+]) {
+  test(`static-video omission exception rejects ${name}`, async () => {
+    const h = await seededObservedAttachment();
+    modify(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).proposed, h.state.newCreative);
+    const posts = postCalls(h).length, writes = h.runtime.storageWrites.length;
+    const read = toolPayload(await h.invoke("meta_get_brevar_creative_operation", { ad_id: BREVAR_AD, expected_name: h.journal.before.ad.name, request_id: REQUEST_ID }));
+    assert.equal(read.content_verified, false); assert.equal(read.eligible, false);
+    assert.match(read.content_error, /degrees_of_freedom_spec/);
+    assert.equal(postCalls(h).length, posts); assert.equal(h.runtime.storageWrites.length, writes);
+  });
+}
