@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.10";
+const CONNECTOR_VERSION = "2.3.11";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -2442,16 +2442,17 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 			"meta_configure_brevar_campaign_pacing",
 			{
 				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: false },
-				description: "WRITE/PREVIEW. Set only pacing_type=['day_parting'] on one owned, unexpired BREVAR lifetime-budget campaign. Every owned child ad set, including paused children, must already have the exact daily 06:00-23:00 Brasilia schedule and no child budget. Requires exact campaign name and expected existing lifetime cap; never changes budget amounts, schedules, names, statuses, targeting or dates. Defaults to Meta validate_only. A real update waits 31s after validation, rechecks its lease and the complete parent/children/timezone snapshots, then verifies all saved fields. No automatic retry, activation or object creation. Uncertain real outcomes retain the operation lease.",
+				description: "WRITE/PREVIEW. Set only pacing_type=['day_parting'] on one owned, unexpired BREVAR lifetime-budget campaign. Normally every owned child, including paused children, must already have the exact daily 06:00-23:00 Brasilia schedule and no child budget. The explicit allow_unscheduled_children preparation option permits only absent child schedules while the parent remains PAUSED; present divergent schedules still fail. It requires its own confirmation suffix and reports pending child IDs with delivery_schedule_verified=false until all calendars match. Requires exact campaign name and expected existing lifetime cap; never changes budget amounts, child schedules, names, statuses, targeting or dates. Defaults to Meta validate_only. A real update waits 31s after validation, rechecks its lease and the complete parent/children/timezone snapshots, then verifies all saved fields. No automatic retry, activation or object creation. Uncertain real outcomes retain the operation lease.",
 				inputSchema: {
 					campaign_id: z.string().regex(META_ID_PATTERN), expected_name: z.string().min(1).max(500),
 					expected_lifetime_budget_minor: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+					allow_unscheduled_children: z.boolean().default(false),
 					validate_only: z.boolean().default(true), confirmation_phrase: z.string().max(1_000).optional(),
 				},
 			},
-			async ({ campaign_id, expected_name, expected_lifetime_budget_minor, validate_only, confirmation_phrase }) => {
+			async ({ campaign_id, expected_name, expected_lifetime_budget_minor, allow_unscheduled_children, validate_only, confirmation_phrase }) => {
 				const env = this.env as MetaEnv;
-				const requiredConfirmation = `CONFIGURE BREVAR CAMPAIGN PACING ${campaign_id} DAY_PARTING LIFETIME ${expected_lifetime_budget_minor}`;
+				const requiredConfirmation = `CONFIGURE BREVAR CAMPAIGN PACING ${campaign_id} DAY_PARTING LIFETIME ${expected_lifetime_budget_minor}${allow_unscheduled_children ? " ALLOW_UNSCHEDULED_CHILDREN_WHILE_PAUSED" : ""}`;
 				let holder: string | undefined;
 				let acquired = false;
 				let writeAttempted = false;
@@ -2486,6 +2487,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					assertExpectedName(before.campaign, expected_name);
 					if (!/\bBREVAR\b/i.test(before.campaign.name)) throw new Error("Only an explicitly identified BREVAR campaign is supported.");
 					if (!["ACTIVE", "PAUSED"].includes(String(before.campaign.status))) throw new Error("Campaign pacing requires an ACTIVE or PAUSED campaign.");
+					if (allow_unscheduled_children && before.campaign.status !== "PAUSED") throw new Error("Preparing missing child schedules requires the parent campaign to remain PAUSED.");
 					const noBudget = (value: unknown) => value === undefined || value === "0" || value === 0;
 					if (String(before.campaign.lifetime_budget) !== String(expected_lifetime_budget_minor) || !noBudget(before.campaign.daily_budget)) throw new Error("Campaign lifetime cap differs from the expected existing budget, or uses daily budgeting.");
 					const stop = typeof before.campaign.stop_time === "string" ? Date.parse(before.campaign.stop_time) : NaN;
@@ -2493,11 +2495,16 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const currentPacing = z.array(z.string()).optional().parse(before.campaign.pacing_type) ?? [];
 					if (currentPacing.some((value) => !["standard", "day_parting"].includes(value))) throw new Error("Existing campaign pacing needs separate review before day_parting.");
 					const scheduled = brevarSchedule(before.timezone_name);
+					const pendingAdsetIds: string[] = [];
 					for (const child of before.adsets) {
 						if (!["ACTIVE", "PAUSED"].includes(String(child.status)) || !noBudget(child.daily_budget) || !noBudget(child.lifetime_budget)) throw new Error(`Child ${child.id} must be active/paused and use only the parent lifetime budget.`);
 						const childEnd = typeof child.end_time === "string" ? Date.parse(child.end_time) : NaN;
 						if (!Number.isFinite(childEnd) || childEnd <= Date.now()) throw new Error(`Child ${child.id} has no valid future end_time.`);
-						if (brevarDifferences({ ...child, adset_schedule: scheduled }, child).length) throw new Error(`Child ${child.id} does not have the exact 06:00-23:00 Brasilia schedule. Configure every child, including paused children, first.`);
+						if (allow_unscheduled_children && child.adset_schedule === undefined) {
+							pendingAdsetIds.push(child.id);
+						} else if (brevarDifferences({ ...child, adset_schedule: scheduled }, child).length) {
+							throw new Error(`Child ${child.id} does not have the exact 06:00-23:00 Brasilia schedule. Only absent schedules may be prepared while the parent remains PAUSED; present divergent calendars must be corrected first.`);
+						}
 					}
 					const differences = (expected: typeof before, actual: typeof before) => {
 						const diff = adsetAgeDifferences(expected.campaign, actual.campaign).map((key) => `campaign.${key}`);
@@ -2513,30 +2520,38 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const expected = { ...before, campaign: { ...before.campaign, ...params } };
 					if (!differences(expected, before).length) {
 						const warning = await releaseAccountOperationLease(env, holder);
-						return asToolResult({ mode: "no_change", before, after: before, verified: true, delivery_schedule_verified: true,
+						return asToolResult({ mode: "no_change", before, after: before, verified: true, delivery_schedule_verified: pendingAdsetIds.length === 0,
+							pending_adset_ids: pendingAdsetIds, preparation_only: allow_unscheduled_children && pendingAdsetIds.length > 0,
 							required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
 					}
 					const validation = writeResponseSchema.parse(await callMetaGraph(env, "POST", campaign_id, { ...params, execution_options: ["validate_only"] }, { write_lease_holder: holder }));
 					if (validation.success !== true) throw new Error("Meta did not validate parent campaign day_parting; no real write attempted.");
 					if (!validate_only) { await delay(BREVAR_SAME_OBJECT_POST_GAP_MS); await assertAccountOperationLease(env, holder); }
 					const rechecked = await read();
+					if (allow_unscheduled_children && rechecked.campaign.status !== "PAUSED") throw new Error("Parent campaign stopped being PAUSED during preparation; no real write attempted.");
 					const concurrent = differences(before, rechecked);
 					if (concurrent.length) throw new Error(`Campaign or children changed during pacing validation: ${concurrent.join(", ")}. No real write attempted.`);
 					if (stop <= Date.now() || before.adsets.some((child) => Date.parse(String(child.end_time)) <= Date.now())) throw new Error("Campaign or child end_time elapsed during validation; no real write attempted.");
 					if (validate_only) {
 						const warning = await releaseAccountOperationLease(env, holder);
 						return asToolResult({ mode: "validate_only", before, proposed: expected, validation, verified_unchanged: true,
-							delivery_schedule_verified: currentPacing.includes("day_parting"), required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
+							delivery_schedule_verified: currentPacing.includes("day_parting") && pendingAdsetIds.length === 0,
+							pending_adset_ids: pendingAdsetIds, preparation_only: allow_unscheduled_children && pendingAdsetIds.length > 0,
+							required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
 					}
 					writeAttempted = true;
 					const result = writeResponseSchema.parse(await callMetaGraph(env, "POST", campaign_id, params, { write_lease_holder: holder }));
 					if (result.success !== true || (result.id !== undefined && result.id !== campaign_id)) throw new Error("Meta did not confirm the parent pacing mutation.");
 					const after = await read();
+					if (allow_unscheduled_children && after.campaign.status !== "PAUSED") throw new Error("Parent campaign is not PAUSED after preparation read-back.");
 					const mismatches = differences(expected, after);
 					if (mismatches.length) throw new Error(`Parent pacing read-back failed: ${mismatches.join(", ")}.`);
-					auditMutation("configure_brevar_campaign_pacing", { campaign_id, lifetime_budget_minor: expected_lifetime_budget_minor, child_count: before.adsets.length, verified: true });
+					auditMutation("configure_brevar_campaign_pacing", { campaign_id, lifetime_budget_minor: expected_lifetime_budget_minor, child_count: before.adsets.length,
+						allow_unscheduled_children, pending_adset_ids: pendingAdsetIds, verified: true, delivery_schedule_verified: pendingAdsetIds.length === 0 });
 					const warning = await releaseAccountOperationLease(env, holder);
-					return asToolResult({ mode: "updated", before, result, after, verified: true, delivery_schedule_verified: true, mismatches, write_lease_release_warning: warning });
+					return asToolResult({ mode: "updated", before, result, after, verified: true, delivery_schedule_verified: pendingAdsetIds.length === 0,
+						pending_adset_ids: pendingAdsetIds, preparation_only: allow_unscheduled_children && pendingAdsetIds.length > 0,
+						mismatches, write_lease_release_warning: warning });
 				} catch (error) {
 					if (writeAttempted && !(error instanceof MetaWriteNotDispatchedError)) return asToolError(new Error(`WRITE_OUTCOME_UNCERTAIN: parent pacing was attempted; reconcile the campaign and all children before another write. Its operation lease was retained, without retry or rollback. ${error instanceof Error ? error.message : "Unexpected pacing error."}`));
 					if (acquired && holder) {
