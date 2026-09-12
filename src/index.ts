@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.15";
+const CONNECTOR_VERSION = "2.3.16";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -1072,8 +1072,9 @@ function brevarHierarchyDifferences(expected: BrevarCreativeSnapshot, actual: Br
 }
 
 const BREVAR_DERIVED_POST_ACTIONS = ["post_engagement", "post_interaction_gross", "link_click"] as const;
+const BREVAR_ON_POST_TRACKING_ACTIONS = ["post_interaction_gross", "link_click"] as const;
 
-function derivedBrevarPostTrackingMatches(expected: unknown, actual: unknown, oldPost: string, newPost: string) {
+function derivedBrevarPostTrackingMatches(expected: unknown, actual: unknown, oldPost: string, newPost: string, requiredActions: readonly string[] = BREVAR_DERIVED_POST_ACTIONS) {
 	const split = (value: unknown, post: string) => {
 		const rows = z.array(z.record(z.string(), z.unknown())).parse(value);
 		const fixed: Record<string, unknown>[] = [];
@@ -1083,6 +1084,7 @@ function derivedBrevarPostTrackingMatches(expected: unknown, actual: unknown, ol
 			const actions = row["action.type"];
 			const action = Array.isArray(actions) && actions.length === 1 ? String(actions[0]) : "";
 			if (!(BREVAR_DERIVED_POST_ACTIONS as readonly string[]).includes(action)) { fixed.push(row); continue; }
+			if (!requiredActions.includes(action)) throw new Error("Unexpected derived tracking action for this delivery profile.");
 			if (seen.has(action)) throw new Error("Duplicated derived post-tracking action.");
 			seen.add(action);
 			const shape = action === "link_click"
@@ -1091,7 +1093,7 @@ function derivedBrevarPostTrackingMatches(expected: unknown, actual: unknown, ol
 			if (canonicalJson(row) !== canonicalJson(shape)) throw new Error("Unrecognized derived post-tracking shape, Page or post ID.");
 			derived.push({ ...row, post: ["verified_creative_post"] });
 		}
-		if (seen.size !== BREVAR_DERIVED_POST_ACTIONS.length) throw new Error("Missing derived post-tracking action.");
+		if (seen.size !== requiredActions.length) throw new Error("Missing derived post-tracking action.");
 		return { fixed, derived: derived.sort((a, b) => canonicalJson(a).localeCompare(canonicalJson(b))) };
 	};
 	return canonicalJson(split(expected, oldPost)) === canonicalJson(split(actual, newPost));
@@ -1099,9 +1101,16 @@ function derivedBrevarPostTrackingMatches(expected: unknown, actual: unknown, ol
 
 async function brevarAfterAttachmentDifferences(env: MetaEnv, expected: BrevarCreativeSnapshot, actual: BrevarCreativeSnapshot, creativeId: string) {
 	const differences = brevarHierarchyDifferences(expected, actual, creativeId);
-	let trackingEvidence: Record<string, unknown> | null = null;
-	if (!differences.includes("ad.tracking_specs") || z.object({ id: z.string() }).parse(actual.ad.creative).id !== creativeId) return { differences, tracking_evidence: trackingEvidence };
+	let postProof: Record<string, unknown> | null = null;
+	const changedTracking = differences.includes("ad.tracking_specs");
+	const changedConversion = differences.includes("ad.conversion_specs");
+	if ((!changedTracking && !changedConversion) || z.object({ id: z.string() }).parse(actual.ad.creative).id !== creativeId) return { differences, tracking_evidence: null };
 	try {
+		const profile = (snapshot: BrevarCreativeSnapshot) => snapshot.adset.optimization_goal === "CONVERSATIONS" && snapshot.adset.destination_type === "WHATSAPP" ? "WHATSAPP"
+			: snapshot.adset.optimization_goal === "POST_ENGAGEMENT" && snapshot.adset.destination_type === "ON_POST" ? "ON_POST" : null;
+		const deliveryProfile = profile(expected);
+		if (!deliveryProfile || profile(actual) !== deliveryProfile) throw new Error("Unchanged supported delivery profile is required for derived post references.");
+		if (deliveryProfile === "WHATSAPP" && !changedTracking) throw new Error("WhatsApp conversion_specs must remain exact.");
 		const oldCreativeId = z.object({ id: z.string().regex(META_ID_PATTERN) }).parse(expected.ad.creative).id;
 		if (oldCreativeId === creativeId) throw new Error("Tracking normalization requires distinct original and replacement creatives.");
 		const { accountNumericId } = getMetaConfig(env);
@@ -1114,16 +1123,29 @@ async function brevarAfterAttachmentDifferences(env: MetaEnv, expected: BrevarCr
 			if (!match || match[1] !== BREVAR_CREATIVE_PAGE) throw new Error("Derived post does not belong to the approved Stoicus Page.");
 			return { story_id: object.effective_object_story_id, post_id: match[2] };
 		};
-		// Legacy journals did not capture effective_object_story_id. Read the
-		// original creative itself; never fabricate or rewrite the before snapshot.
+		// Legacy journals did not capture effective_object_story_id. Read both
+		// account-owned creatives independently; never rewrite frozen snapshots.
 		const oldPost = await readPost(oldCreativeId);
 		const newPost = await readPost(creativeId);
-		if (!derivedBrevarPostTrackingMatches(expected.ad.tracking_specs, actual.ad.tracking_specs, oldPost.post_id, newPost.post_id)) throw new Error("Non-derived tracking groups or values changed.");
-		trackingEvidence = { verified: true, original_creative_id: oldCreativeId, replacement_creative_id: creativeId, original_story_id: oldPost.story_id, replacement_story_id: newPost.story_id,
-			normalized_actions: BREVAR_DERIVED_POST_ACTIONS, all_other_tracking_preserved_exactly: true };
-		return { differences: differences.filter((key) => key !== "ad.tracking_specs"), tracking_evidence: trackingEvidence };
+		postProof = { posts_verified: true, delivery_profile: deliveryProfile, original_creative_id: oldCreativeId, replacement_creative_id: creativeId,
+			original_story_id: oldPost.story_id, replacement_story_id: newPost.story_id };
+		const requiredActions = deliveryProfile === "ON_POST" ? BREVAR_ON_POST_TRACKING_ACTIONS : BREVAR_DERIVED_POST_ACTIONS;
+		if (!derivedBrevarPostTrackingMatches(expected.ad.tracking_specs, actual.ad.tracking_specs, oldPost.post_id, newPost.post_id, requiredActions)) throw new Error("Non-derived tracking groups or values changed.");
+		const normalizedFields = changedTracking ? ["ad.tracking_specs"] : [];
+		if (deliveryProfile === "ON_POST") {
+			// This observed optimization uses exactly one Page/post engagement
+			// conversion. Pixels, extra actions or extra fields are never remapped.
+			const shape = (post: string) => [{ "action.type": ["post_engagement"], page: [BREVAR_CREATIVE_PAGE], post: [post] }];
+			if (canonicalJson(expected.ad.conversion_specs) !== canonicalJson(shape(oldPost.post_id)) || canonicalJson(actual.ad.conversion_specs) !== canonicalJson(shape(newPost.post_id))) throw new Error("ON_POST conversion_specs must be exactly the single verified Page/post engagement conversion.");
+			if (changedConversion) normalizedFields.push("ad.conversion_specs");
+		} else if (changedConversion) {
+			throw new Error("WhatsApp conversion_specs must remain exact.");
+		}
+		return { differences: differences.filter((key) => !normalizedFields.includes(key)), tracking_evidence: { ...postProof, verified: true,
+			normalized_actions: requiredActions, normalized_fields: normalizedFields, all_other_tracking_preserved_exactly: true,
+			conversion_policy: deliveryProfile === "ON_POST" ? "single_post_engagement_with_verified_post_only" : "unchanged_exactly" } };
 	} catch (error) {
-		return { differences, tracking_evidence: { verified: false, error: error instanceof Error ? error.message : "Unverified derived post tracking." } };
+		return { differences, tracking_evidence: { ...postProof, verified: false, error: error instanceof Error ? error.message : "Unverified derived post tracking." } };
 	}
 }
 
@@ -1274,7 +1296,16 @@ async function inspectBrevarCreativeOperation(env: MetaEnv, adId: string, reques
 	const nameEvidence = createdCreative ? brevarCreativeNameEvidence(journal.proposed, createdCreative) : null;
 	const nameHash = await brevarCreativeFingerprint(createdCreative?.name ?? null);
 	const requiredConfirmation = journal.creative_id ? `RESUME BREVAR CREATIVE ${adId} REQUEST ${requestId} CREATIVE ${journal.creative_id} SHA256 ${journal.fingerprint} LABEL_SHA256 ${nameHash} STAGE ${journal.stage}` : null;
-	return { journal, current, created_creative: createdCreative, administrative_name: nameEvidence, content_verified: !!createdCreative && contentError === null, content_error: contentError,
+	// Put bounded diagnostics before full creative/snapshot payloads so clients
+	// can inspect the actual comparison even if a large tool result is truncated.
+	const compactSnapshot = (value: BrevarCreativeSnapshot) => ({ creative_id: z.object({ id: z.string() }).parse(value.ad.creative).id,
+		status: value.ad.status, effective_status: value.ad.effective_status, optimization_goal: value.adset.optimization_goal, destination_type: value.adset.destination_type,
+		tracking_specs: value.ad.tracking_specs ?? null, conversion_specs: value.ad.conversion_specs ?? null });
+	const diagnostic = { ad_id: adId, request_id: requestId, stage: journal.stage, fingerprint: journal.fingerprint, created_creative_id: journal.creative_id ?? null,
+		content_verified: !!createdCreative && contentError === null, content_error: contentError, configuration_differences: differences, eligible,
+		before: compactSnapshot(journal.before), current: compactSnapshot(current), post_proof: attachmentAudit.tracking_evidence,
+		administrative_name: nameEvidence, required_confirmation: requiredConfirmation };
+	return { diagnostic, journal, current, created_creative: createdCreative, administrative_name: nameEvidence, content_verified: !!createdCreative && contentError === null, content_error: contentError,
 		configuration_differences: differences, tracking_evidence: attachmentAudit.tracking_evidence,
 		observed_static_video_omissions: createdCreative ? brevarStaticVideoOmissions(journal.proposed, createdCreative).omitted : [], eligible, required_confirmation: requiredConfirmation };
 }
