@@ -803,8 +803,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.10");
-  assert.equal(h.metadata.version, "2.3.10");
+  assert.equal(result.connector_version, "2.3.11");
+  assert.equal(h.metadata.version, "2.3.11");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -830,8 +830,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.10");
-  assert.equal(h.metadata.version, "2.3.10");
+  assert.equal(result.connector_version, "2.3.11");
+  assert.equal(h.metadata.version, "2.3.11");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1529,7 +1529,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.10");
+  assert.equal(result.connector_version, "2.3.11");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1603,7 +1603,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.10");
+  assert.equal(result.connector_version, "2.3.11");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1809,7 +1809,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.10");
+    assert.equal(result.connector_version, "2.3.11");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -3363,7 +3363,7 @@ function brevarCampaignPacingInput(overrides = {}) {
 }
 
 function brevarCampaignPacingRealInput(overrides = {}) {
-  return brevarCampaignPacingInput({ validate_only: false, confirmation_phrase: `CONFIGURE BREVAR CAMPAIGN PACING ${CAMPAIGN} DAY_PARTING LIFETIME 70000`, ...overrides });
+  return brevarCampaignPacingInput({ validate_only: false, confirmation_phrase: `CONFIGURE BREVAR CAMPAIGN PACING ${CAMPAIGN} DAY_PARTING LIFETIME 70000${overrides.allow_unscheduled_children ? " ALLOW_UNSCHEDULED_CHILDREN_WHILE_PAUSED" : ""}`, ...overrides });
 }
 
 async function brevarCampaignPacingHarness(options = {}) {
@@ -3507,6 +3507,111 @@ test("BREVAR campaign pacing retains its lease if a paused child's targeting dri
   assert.match(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
   assert.equal(postCalls(h).filter(c => !c.params.execution_options).length, 1);
   assertStatusLeaseRetained(h.runtime, h.clock);
+});
+
+function pausedCampaignWithPendingChild(state) {
+  state.campaign.status = "PAUSED";
+  state.campaign.effective_status = "PAUSED";
+  delete state.adsets[1].adset_schedule;
+}
+
+test("BREVAR campaign pacing refuses the unscheduled-child exception for an active campaign", async () => {
+  const h = await brevarCampaignPacingHarness({ adjustState(state) { delete state.adsets[1].adset_schedule; } });
+  const result = await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingRealInput({ allow_unscheduled_children: true }));
+  assert.equal(result.isError, true);
+  assert.equal(postCalls(h).length, 0);
+  assert.deepEqual(h.state, h.initial);
+  assert.equal(h.runtime.values.has("lease"), false);
+});
+
+for (const preview of [true, false]) test(`BREVAR campaign pacing ${preview ? "previews" : "updates"} only the paused parent while reporting its unscheduled child as pending`, async () => {
+  const h = await brevarCampaignPacingHarness({ adjustState: pausedCampaignWithPendingChild });
+  const input = preview ? brevarCampaignPacingInput({ allow_unscheduled_children: true }) : brevarCampaignPacingRealInput({ allow_unscheduled_children: true });
+  const result = toolPayload(await h.invoke("meta_configure_brevar_campaign_pacing", input));
+  assert.equal(preview ? result.verified_unchanged : result.verified, true);
+  assert.equal(result.delivery_schedule_verified, false);
+  assert.deepEqual(result.pending_adset_ids, ["900013"]);
+  if (preview) {
+    assert.equal(result.required_confirmation, brevarCampaignPacingRealInput({ allow_unscheduled_children: true }).confirmation_phrase);
+    assert.deepEqual(h.state, h.initial);
+  } else {
+    assert.deepEqual(h.state.campaign.pacing_type, ["day_parting"]);
+    assert.equal(h.state.campaign.status, "PAUSED");
+    assert.equal(h.state.campaign.lifetime_budget, "70000");
+  }
+  assert.deepEqual(h.state.adsets, h.initial.adsets);
+  assert.equal(postCalls(h).filter(c => !c.params.execution_options).length, preview ? 0 : 1);
+  assert.equal(h.runtime.values.has("lease"), false);
+});
+
+test("BREVAR campaign pacing requires explicit authorization even if the campaign with an unscheduled child is paused", async () => {
+  const h = await brevarCampaignPacingHarness({ adjustState: pausedCampaignWithPendingChild });
+  const result = await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingRealInput());
+  assert.equal(result.isError, true);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.runtime.values.has("lease"), false);
+});
+
+for (const [label, schedule] of [
+  ["empty calendar", []],
+  ["different hours", [{ days: [0, 1, 2, 3, 4, 5, 6], start_minute: 480, end_minute: 1440, timezone_type: "ADVERTISER" }]],
+]) test("BREVAR campaign pacing still rejects an existing " + label + " when the unscheduled-child exception is authorized", async () => {
+  const h = await brevarCampaignPacingHarness({ adjustState(state) { pausedCampaignWithPendingChild(state); state.adsets[1].adset_schedule = schedule; } });
+  const result = await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingRealInput({ allow_unscheduled_children: true }));
+  assert.equal(result.isError, true);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.runtime.values.has("lease"), false);
+});
+
+test("BREVAR campaign pacing checks the exception-specific confirmation before reads and locking", async () => {
+  const h = await brevarCampaignPacingHarness({ adjustState: pausedCampaignWithPendingChild });
+  const result = await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingRealInput({ allow_unscheduled_children: true, confirmation_phrase: brevarCampaignPacingRealInput().confirmation_phrase }));
+  assert.equal(result.isError, true);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.lockCalls.length, 0);
+});
+
+test("BREVAR campaign pacing aborts when the paused campaign is activated during the unscheduled-child validation gap", async () => {
+  const h = await brevarCampaignPacingHarness({ adjustState: pausedCampaignWithPendingChild, onWait(state) { state.campaign.status = "ACTIVE"; } });
+  const result = await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingRealInput({ allow_unscheduled_children: true }));
+  assert.equal(result.isError, true);
+  assert.equal(postCalls(h).length, 1);
+  assert.equal(postCalls(h).filter(c => !c.params.execution_options).length, 0);
+  assert.equal(h.runtime.values.has("lease"), false);
+});
+
+test("BREVAR campaign pacing retains its lease when the paused campaign is activated after the real write with a pending child", async () => {
+  let posted = false;
+  const h = await brevarCampaignPacingHarness({ adjustState: pausedCampaignWithPendingChild, respond(call, state) {
+    if (call.method === "POST" && !call.params.execution_options) posted = true;
+    if (call.method === "GET" && call.path === CAMPAIGN && posted) state.campaign.status = "ACTIVE";
+  } });
+  const result = await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingRealInput({ allow_unscheduled_children: true }));
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+  assert.equal(postCalls(h).filter(c => !c.params.execution_options).length, 1);
+  assertStatusLeaseRetained(h.runtime, h.clock);
+});
+
+test("BREVAR campaign pacing no-op keeps a missing child pending even when parent day-parting is already set", async () => {
+  const h = await brevarCampaignPacingHarness({ adjustState(state) { pausedCampaignWithPendingChild(state); state.campaign.pacing_type = ["day_parting"]; } });
+  const result = toolPayload(await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingRealInput({ allow_unscheduled_children: true })));
+  assert.equal(result.mode, "no_change");
+  assert.equal(result.verified, true);
+  assert.equal(result.delivery_schedule_verified, false);
+  assert.deepEqual(result.pending_adset_ids, ["900013"]);
+  assert.equal(postCalls(h).length, 0);
+  assert.equal(h.runtime.values.has("lease"), false);
+});
+
+test("BREVAR campaign pacing verifies delivery with the exception enabled when every paused campaign child has the correct calendar", async () => {
+  const h = await brevarCampaignPacingHarness({ adjustState(state) { state.campaign.status = "PAUSED"; state.campaign.effective_status = "PAUSED"; } });
+  const result = toolPayload(await h.invoke("meta_configure_brevar_campaign_pacing", brevarCampaignPacingRealInput({ allow_unscheduled_children: true })));
+  assert.equal(result.verified, true);
+  assert.equal(result.delivery_schedule_verified, true);
+  assert.deepEqual(result.pending_adset_ids, []);
+  assert.equal(h.state.campaign.status, "PAUSED");
+  assert.equal(h.runtime.values.has("lease"), false);
 });
 
 // BREVAR replacement runs the actual durable lock/journal. No Meta request,
