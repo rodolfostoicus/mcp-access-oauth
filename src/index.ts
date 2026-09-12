@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.12";
+const CONNECTOR_VERSION = "2.3.13";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -965,8 +965,25 @@ function normalizeBrevarSnapshot(snapshot: Record<string, unknown>) {
 	return { ...normalized, targeting, ...(schedule !== undefined ? { adset_schedule: schedule } : {}) };
 }
 
-function brevarDifferences(expected: Record<string, unknown>, actual: Record<string, unknown>) {
-	return adsetAgeDifferences(normalizeBrevarSnapshot(expected), normalizeBrevarSnapshot(actual));
+function brevarDifferences(expected: Record<string, unknown>, actual: Record<string, unknown>, facebookInstagramOnly = false) {
+	const normalizedExpected = normalizeBrevarSnapshot(expected);
+	const normalizedActual = normalizeBrevarSnapshot(actual);
+	if (facebookInstagramOnly) {
+		const snapshots = [normalizedExpected, normalizedActual];
+		const exactPlatforms = (value: unknown) => Array.isArray(value) && value.length === 2
+			&& value.includes("facebook") && value.includes("instagram");
+		if (snapshots.every((snapshot) => exactPlatforms(snapshot.targeting.publisher_platforms))) {
+			for (const snapshot of snapshots) snapshot.targeting.publisher_platforms = ["facebook", "instagram"];
+			// Meta Basic Targeting defines this field only for WhatsApp Status.
+			// Compare false with omission ONLY under the explicit placement option
+			// and proof in BOTH snapshots that WhatsApp is excluded. Never equate
+			// missing platforms, true, null or other unknown-age values with false.
+			if (snapshots.every((snapshot) => snapshot.targeting.user_age_unknown === undefined || snapshot.targeting.user_age_unknown === false)) {
+				for (const snapshot of snapshots) delete snapshot.targeting.user_age_unknown;
+			}
+		}
+	}
+	return adsetAgeDifferences(normalizedExpected, normalizedActual);
 }
 
 function assertExpectedName(snapshot: z.infer<typeof objectSchema>, expectedName: string) {
@@ -2302,19 +2319,23 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 			{
 				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: false },
 				description:
-					"WRITE/PREVIEW. Apply the explicitly authorized BREVAR profile to one owned, unexpired BREVAR ad set: medical work-position profile PHYSICIANS_10, ages 25-50 with unknown ages disabled, both sexes, all Parana/Rio Grande do Sul/Santa Catarina, audience/geo and lookalike relaxation disabled, daily 06:00-23:00 America/Sao_Paulo (07:00-24:00 America/Noronha). Unlike geo restriction, this replaces city/radius coverage and removes exclusions of the three included states. Requires current detailed/lookalike diagnostics explicitly zero; does not write read-only diagnostics. Preserves other targeting settings, budgets at both levels, objective, optimization, destination, dates and configured status. Requires an existing lifetime budget, never converts or transfers budgets. With ABO it sets and verifies ad-set day_parting. CBO changes require parent campaign day_parting before any POST and send child pacing_type=['day_parting'] as the calendar write parameter, while auditing pacing at its parent budget owner and preserving the actually returned child pacing field. Actual child calendar read-back remains mandatory. An unchanged child returns a separate delivery_schedule_verified diagnostic without a POST. Meta validate_only is the default; real changes require exact current ad-set/campaign names and confirmation. Uses one operation lease, validation, concurrent-change checks and complete read-back. Never activates, creates, changes the campaign, or bypasses Instagram boosted-post restrictions.",
+					"WRITE/PREVIEW. Apply the explicitly authorized BREVAR profile to one owned, unexpired BREVAR ad set: medical work-position profile PHYSICIANS_10, ages 25-50 with unknown ages disabled, both sexes, all Parana/Rio Grande do Sul/Santa Catarina, audience/geo and lookalike relaxation disabled, daily 06:00-23:00 America/Sao_Paulo (07:00-24:00 America/Noronha). Unlike geo restriction, this replaces city/radius coverage and removes exclusions of the three included states. Requires current detailed/lookalike diagnostics explicitly zero; does not write read-only diagnostics. Preserves other targeting settings, budgets at both levels, objective, optimization, destination, dates and configured status. Optional facebook_instagram_only requires its own confirmation suffix and writes exactly those two publisher platforms. Only under that explicit option and matching exact platform read-backs may the WhatsApp-Status-only user_age_unknown field be absent instead of false; raw saved fields remain visible. No general missing=false normalization. Requires an existing lifetime budget, never converts or transfers budgets. With ABO it sets and verifies ad-set day_parting. CBO changes require parent campaign day_parting before any POST and send child pacing_type=['day_parting'] as the calendar write parameter, while auditing pacing at its parent budget owner and preserving the actually returned child pacing field. Actual child calendar read-back remains mandatory. An unchanged child returns a separate delivery_schedule_verified diagnostic without a POST. Meta validate_only is the default; real changes require exact current ad-set/campaign names and confirmation. Uses one operation lease, validation, concurrent-change checks and complete read-back. Never activates, creates, changes the campaign, or bypasses Instagram boosted-post restrictions.",
 				inputSchema: {
 					adset_id: z.string().regex(META_ID_PATTERN),
 					expected_name: z.string().min(1).max(500),
 					expected_campaign_name: z.string().min(1).max(500),
 					name: z.string().trim().min(1).max(500).optional(),
+					facebook_instagram_only: z.boolean().default(false),
 					confirmation_phrase: z.string().max(1_000).optional(),
 					validate_only: z.boolean().default(true),
 				},
 			},
-			async ({ adset_id, expected_name, expected_campaign_name, name, confirmation_phrase, validate_only }) => {
+			async ({ adset_id, expected_name, expected_campaign_name, name, facebook_instagram_only, confirmation_phrase, validate_only }) => {
 				const env = this.env as MetaEnv;
-				const requiredConfirmation = `CONFIGURE BREVAR ADSET ${adset_id} SOUTH_BR PHYSICIANS_10 AGE 25 50 HOURS 06-23 AMERICA_SAO_PAULO${name !== undefined ? ` NAME ${name}` : ""}`;
+				const requiredConfirmation = `CONFIGURE BREVAR ADSET ${adset_id} SOUTH_BR PHYSICIANS_10 AGE 25 50 HOURS 06-23 AMERICA_SAO_PAULO${name !== undefined ? ` NAME ${name}` : ""}${facebook_instagram_only ? " PLACEMENTS FACEBOOK_INSTAGRAM_ONLY" : ""}`;
+				const unknownAgeNote = facebook_instagram_only
+					? "user_age_unknown applies only to WhatsApp Status. With this explicit option, omission is comparable to false only when both audited snapshots explicitly contain exactly Facebook and Instagram; raw returned fields remain unchanged."
+					: "user_age_unknown=false requires explicit read-back; no omission equivalence is applied.";
 				let operationHolder: string | undefined;
 				let leaseAcquired = false;
 				let writeAttempted = false;
@@ -2363,6 +2384,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					}
 					assertBrevarExpansionDisabled(before);
 					const targeting = buildBrevarTargeting(targetingSchema.parse(before.targeting));
+					if (facebook_instagram_only) targeting.publisher_platforms = ["facebook", "instagram"];
 					const currentPacing = z.array(z.string()).optional().parse(before.pacing_type) ?? [];
 					if (!campaignLifetime && currentPacing.includes("no_pacing")) throw new Error("Accelerated/no_pacing delivery needs separate review before adding day_parting.");
 					const pacing = [...new Set([...currentPacing, "day_parting"])];
@@ -2377,10 +2399,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					if (name !== undefined) storedParams.name = name;
 					const params = { ...storedParams, pacing_type: campaignLifetime ? ["day_parting"] : pacing };
 					const expected = { ...before, ...storedParams };
-					if (brevarDifferences(expected, before).length === 0) {
+					if (brevarDifferences(expected, before, facebook_instagram_only).length === 0) {
 						const warning = await releaseAccountOperationLease(env, operationHolder);
 						return asToolResult({ mode: "no_change", before, after: before, campaign_before: campaign, campaign_after: campaign,
 							timezone_name: timezone, verified: true, delivery_schedule_verified: deliveryScheduleVerified,
+							facebook_instagram_only, unknown_age_note: unknownAgeNote,
 							schedule_note: deliveryScheduleVerified ? "Delivery schedule control is present at the budget-owning level." : "Child fields and windows are verified, but parent campaign day_parting is not confirmed. Configure and audit parent pacing before activation.",
 							required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
 					}
@@ -2400,7 +2423,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					}
 					const rechecked = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
 					const campaignRechecked = await getOwnedObject(env, "CAMPAIGN", campaignId, BREVAR_CAMPAIGN_AUDIT_FIELDS);
-					const concurrent = brevarDifferences(before, rechecked);
+					const concurrent = brevarDifferences(before, rechecked, facebook_instagram_only);
 					const campaignConcurrent = adsetAgeDifferences(campaign, campaignRechecked);
 					if (concurrent.length || campaignConcurrent.length || await readTimezone() !== timezone) {
 						throw new Error(`BREVAR settings changed during validation (adset: ${concurrent.join(", ")}; campaign: ${campaignConcurrent.join(", ")}; account timezone also rechecked). No real write attempted.`);
@@ -2410,6 +2433,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						const warning = await releaseAccountOperationLease(env, operationHolder);
 						return asToolResult({ mode: "validate_only", before, proposed: expected, campaign_before: campaign, campaign_after: campaignRechecked,
 							timezone_name: timezone, validation, verified_unchanged: true, delivery_schedule_verified: false,
+							facebook_instagram_only, unknown_age_note: unknownAgeNote,
 							proposed_delivery_schedule_verified: deliveryScheduleVerified, required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
 					}
 					writeAttempted = true;
@@ -2418,16 +2442,17 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const after = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
 					const campaignAfter = await getOwnedObject(env, "CAMPAIGN", campaignId, BREVAR_CAMPAIGN_AUDIT_FIELDS);
 					assertBrevarExpansionDisabled(after);
-					const mismatches = brevarDifferences(expected, after);
+					const mismatches = brevarDifferences(expected, after, facebook_instagram_only);
 					const campaignMismatches = adsetAgeDifferences(campaign, campaignAfter);
 					if (mismatches.length || campaignMismatches.length || await readTimezone() !== timezone) {
 						throw new Error(`BREVAR read-back failed (adset: ${mismatches.join(", ")}; campaign: ${campaignMismatches.join(", ")}; account timezone also rechecked).`);
 					}
 					auditMutation("configure_brevar_adset", { adset_id, campaign_id: campaignId, profile: "PHYSICIANS_10", age_min: 25, age_max: 50,
-						regions: SOUTH_BRAZIL_REGION_KEYS, schedule_timezone: timezone, renamed: name !== undefined, verified: true });
+						regions: SOUTH_BRAZIL_REGION_KEYS, schedule_timezone: timezone, renamed: name !== undefined, facebook_instagram_only, verified: true });
 					const warning = await releaseAccountOperationLease(env, operationHolder);
 					return asToolResult({ mode: "updated", before, result, after, campaign_before: campaign, campaign_after: campaignAfter,
 						timezone_name: timezone, verified: true, mismatches, delivery_schedule_verified: deliveryScheduleVerified,
+						facebook_instagram_only, unknown_age_note: unknownAgeNote,
 						schedule_note: deliveryScheduleVerified ? "Delivery schedule control is present at the budget-owning level." : "Child fields and windows are verified, but parent campaign day_parting is not confirmed. Configure and audit parent pacing before activation.",
 						write_lease_release_warning: warning });
 				} catch (error) {

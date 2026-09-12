@@ -803,8 +803,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.12");
-  assert.equal(h.metadata.version, "2.3.12");
+  assert.equal(result.connector_version, "2.3.13");
+  assert.equal(h.metadata.version, "2.3.13");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -830,8 +830,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.12");
-  assert.equal(h.metadata.version, "2.3.12");
+  assert.equal(result.connector_version, "2.3.13");
+  assert.equal(h.metadata.version, "2.3.13");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1529,7 +1529,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.12");
+  assert.equal(result.connector_version, "2.3.13");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1603,7 +1603,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.12");
+  assert.equal(result.connector_version, "2.3.13");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1809,7 +1809,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.12");
+    assert.equal(result.connector_version, "2.3.13");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -2880,7 +2880,7 @@ function brevarProfileRealInput(overrides = {}) {
   const input = brevarProfileInput({ validate_only: false, ...overrides });
   return {
     ...input,
-    confirmation_phrase: `CONFIGURE BREVAR ADSET ${ADSET} SOUTH_BR PHYSICIANS_10 AGE 25 50 HOURS 06-23 AMERICA_SAO_PAULO${input.name ? " NAME " + input.name : ""}`,
+    confirmation_phrase: `CONFIGURE BREVAR ADSET ${ADSET} SOUTH_BR PHYSICIANS_10 AGE 25 50 HOURS 06-23 AMERICA_SAO_PAULO${input.name ? " NAME " + input.name : ""}${input.facebook_instagram_only ? " PLACEMENTS FACEBOOK_INSTAGRAM_ONLY" : ""}`,
     ...overrides,
   };
 }
@@ -3311,6 +3311,148 @@ test("BREVAR profile rejects a successful CBO response that still omits the actu
   assert.match(result.content[0].text, /adset_schedule/);
   assert.equal(brevarProfileRealPosts(p.runtime).length, 1);
   assertStatusLeaseRetained(p.runtime, p.clock);
+});
+
+test("BREVAR profile FB/IG-only preview includes placement authorization after the optional name", async () => {
+  const p = await brevarProfilePair();
+  delete p.state.value.targeting.publisher_platforms;
+  const name = "BREVAR | SUL | FB E IG";
+  const result = toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileInput({ facebook_instagram_only: true, name })));
+  assert.equal(result.verified_unchanged, true);
+  assert.equal(result.facebook_instagram_only, true);
+  assert.equal(result.required_confirmation, brevarProfileRealInput({ facebook_instagram_only: true, name }).confirmation_phrase);
+  assert.ok(result.required_confirmation.endsWith(` NAME ${name} PLACEMENTS FACEBOOK_INSTAGRAM_ONLY`));
+  assert.deepEqual(result.proposed.targeting.publisher_platforms, ["facebook", "instagram"]);
+  assert.equal(Object.hasOwn(p.state.value.targeting, "publisher_platforms"), false);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 0);
+});
+
+test("BREVAR profile FB/IG-only rejects real confirmation that omits the placement suffix before reads or locks", async () => {
+  const p = await brevarProfilePair();
+  const name = "BREVAR renamed";
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput({ facebook_instagram_only: true, name, confirmation_phrase: brevarProfileRealInput({ name }).confirmation_phrase }));
+  assert.equal(result.isError, true);
+  assert.equal(p.runtime.calls.length, 0);
+  assert.equal(p.runtime.lockCalls.length, 0);
+});
+
+test("BREVAR profile FB/IG-only narrows implicit placements and verifies an omitted unknown-age field without inventing persisted false", async () => {
+  const initial = brevarProfileFixture();
+  delete initial.targeting.publisher_platforms;
+  let posted = false;
+  const p = await brevarProfilePair({ initial, respond(call, state) {
+    if (call.path === ADSET && call.method === "POST" && !call.params.execution_options) posted = true;
+    if (call.path === ADSET && call.method === "GET" && posted) delete state.value.targeting.user_age_unknown;
+  } });
+  const result = toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput({ facebook_instagram_only: true })));
+  assert.equal(result.verified, true);
+  assert.equal(result.delivery_schedule_verified, true);
+  assert.equal(result.facebook_instagram_only, true);
+  assert.match(result.unknown_age_note, /WhatsApp.*Status/i);
+  assert.equal(Object.hasOwn(result.before.targeting, "publisher_platforms"), false);
+  assert.deepEqual(result.after.targeting.publisher_platforms, ["facebook", "instagram"]);
+  assert.equal(Object.hasOwn(result.after.targeting, "user_age_unknown"), false);
+  for (const post of brevarProfilePosts(p.runtime)) {
+    assert.deepEqual(post.params.targeting.publisher_platforms, ["facebook", "instagram"]);
+    assert.equal(post.params.targeting.user_age_unknown, false);
+  }
+  assert.deepEqual(result.after.promoted_object, initial.promoted_object);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("BREVAR profile default remains strict when Meta omits unknown-age false, even with exactly Facebook and Instagram", async () => {
+  let posted = false;
+  const p = await brevarProfilePair({ respond(call, state) {
+    if (call.path === ADSET && call.method === "POST" && !call.params.execution_options) posted = true;
+    if (call.path === ADSET && call.method === "GET" && posted) delete state.value.targeting.user_age_unknown;
+  } });
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 1);
+  assertStatusLeaseRetained(p.runtime, p.clock);
+});
+
+for (const [label, mutate] of [
+  ["absent platforms", t => { delete t.publisher_platforms; delete t.user_age_unknown; }],
+  ["WhatsApp added", t => { t.publisher_platforms.push("whatsapp"); delete t.user_age_unknown; }],
+  ["duplicate Facebook", t => { t.publisher_platforms.push("facebook"); delete t.user_age_unknown; }],
+  ["one platform only", t => { t.publisher_platforms = ["facebook"]; delete t.user_age_unknown; }],
+  ["malformed platforms", t => { t.publisher_platforms = null; delete t.user_age_unknown; }],
+  ["unknown age enabled", t => { t.user_age_unknown = true; }],
+  ["null unknown age", t => { t.user_age_unknown = null; }],
+]) test("BREVAR profile FB/IG-only rejects " + label + " at final verification", async () => {
+  let posted = false;
+  const p = await brevarProfilePair({ respond(call, state) {
+    if (call.path === ADSET && call.method === "POST" && !call.params.execution_options) posted = true;
+    if (call.path === ADSET && call.method === "GET" && posted) { posted = false; mutate(state.value.targeting); }
+  } });
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput({ facebook_instagram_only: true }));
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 1);
+  assertStatusLeaseRetained(p.runtime, p.clock);
+});
+
+test("BREVAR profile FB/IG-only no-op accepts omitted unknown-age only after the actual correct placements and calendar exist", async () => {
+  const p = await brevarProfilePair();
+  toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput({ facebook_instagram_only: true })));
+  delete p.state.value.targeting.user_age_unknown;
+  const count = brevarProfilePosts(p.runtime).length;
+  const result = toolPayload(await p.second.invoke("meta_configure_brevar_adset", brevarProfileRealInput({ facebook_instagram_only: true })));
+  assert.equal(result.mode, "no_change");
+  assert.equal(result.verified, true);
+  assert.equal(result.delivery_schedule_verified, true);
+  assert.equal(result.facebook_instagram_only, true);
+  assert.equal(Object.hasOwn(result.after.targeting, "user_age_unknown"), false);
+  assert.match(result.unknown_age_note, /WhatsApp.*Status/i);
+  assert.equal(brevarProfilePosts(p.runtime).length, count);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("BREVAR profile FB/IG-only permits harmless unknown-age omission during validation while retaining exact placements", async () => {
+  const initial = brevarProfileFixture();
+  initial.targeting.user_age_unknown = false;
+  let validated = false;
+  const p = await brevarProfilePair({ initial, respond(call, state) {
+    if (call.path === ADSET && call.params.execution_options) validated = true;
+    if (call.path === ADSET && call.method === "GET" && validated) { validated = false; delete state.value.targeting.user_age_unknown; }
+  } });
+  const result = toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput({ facebook_instagram_only: true })));
+  assert.equal(result.verified, true);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 1);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("BREVAR profile FB/IG-only recognizes the exact platform pair in reversed order without rewriting the returned snapshot", async () => {
+  let posted = false;
+  const p = await brevarProfilePair({ respond(call, state) {
+    if (call.path === ADSET && call.method === "POST" && !call.params.execution_options) posted = true;
+    if (call.path === ADSET && call.method === "GET" && posted) {
+      posted = false;
+      state.value.targeting.publisher_platforms = ["instagram", "facebook"];
+      delete state.value.targeting.user_age_unknown;
+    }
+  } });
+  const result = toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput({ facebook_instagram_only: true })));
+  assert.equal(result.verified, true);
+  assert.deepEqual(result.after.targeting.publisher_platforms, ["instagram", "facebook"]);
+  assert.equal(Object.hasOwn(result.after.targeting, "user_age_unknown"), false);
+  assert.deepEqual(brevarProfileRealPosts(p.runtime)[0].params.targeting.publisher_platforms, ["facebook", "instagram"]);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("BREVAR profile FB/IG-only still rejects concurrent placement changes during validation", async () => {
+  let validated = false;
+  const p = await brevarProfilePair({ respond(call, state) {
+    if (call.path === ADSET && call.params.execution_options) validated = true;
+    if (call.path === ADSET && call.method === "GET" && validated) { validated = false; state.value.targeting.publisher_platforms.push("whatsapp"); delete state.value.targeting.user_age_unknown; }
+  } });
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput({ facebook_instagram_only: true }));
+  assert.equal(result.isError, true);
+  assert.equal(brevarProfilePosts(p.runtime).length, 1);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
 });
 
 test("BREVAR profile waits at least 31 seconds after completed validation and rereads every authority before the real POST", async () => {
