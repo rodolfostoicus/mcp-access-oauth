@@ -13,22 +13,23 @@ Use this sequence when `meta_get_token_permissions` still reports `ads_read` and
 
 1. Run `meta_get_token_permissions` with `business_access_diagnostic_id` set to the historically recorded Stoicus Business ID `644876512865789`. This opt-in diagnostic is read-only. It checks bounded lists of system users and owned/shared ad accounts, returns only the token subject and configured account, and skips unrelated Page/WhatsApp calls. An incomplete or denied list does not prove absence. An observed `ADMIN` role is not a successful authorization test for asset assignment.
 2. In Meta Business Settings, inspect the exact ad account `3422857277981490` and the identity backing the production token. Confirm the owner business, current asset assignment, and tasks to view performance and manage campaigns. Do not identify a user solely by the display name `Integra IA`. Historical system-user IDs and the ID returned by `/me` require mapping; a difference alone does not prove that the token is wrong.
-3. If the assignment is absent, an authorized administrator may use the temporary `meta_recovery_assign_self_to_configured_account` tool. It accepts no IDs or task overrides. It resolves `/me` to exactly one app-scoped row returned by `/<META_BUSINESS_ID>/system_users`, requires that row to be `ADMIN`, requires the configured account to appear on `/<META_BUSINESS_ID>/client_ad_accounts`, and uses that row's `id` rather than a canonical Business Manager ID or the auxiliary `system_user_id` field.
-4. Run the tool in its default preflight mode first. A real write requires its exact confirmation and a positively confirmed active account write lease, then sends only `user=<resolved app-scoped row.id>` and `tasks=["ADVERTISE","ANALYZE"]` to `POST /act_3422857277981490/assigned_users`. `MANAGE` is never requested, ownership is never changed, and `business` is not a POST parameter. The tool reads `GET /act_3422857277981490/assigned_users` before and after with the configured Business ID and accepts success only when the same app-scoped `SYSTEM_USER` row has exactly those two tasks and direct account access succeeds. Pagination is capped at three pages of 25 rows; incomplete or ambiguous identity, Business, client-account, or assignment evidence fails closed. If that row already has a task outside this fixed set, the tool stops rather than possibly revoking it. If both fixed tasks are already listed but direct access is not yet confirmed, it also stops without repeating the POST. An ambiguous POST is never retried and can be reconciled only by that exact read-back.
-5. Retry one minimal account read after any authorized recovery. If the assignment is already correct but access remains denied, inspect business/app restrictions, security review, and any Meta-requested authorization renewal. In Business Integrations, the application is distinct from the user/system-user name. The historical app is `STOICUS MKT IA` (`1633140634900008`); verify the actual token's application before renewing or replacing anything.
-6. Generate or renew the production token through Meta's supported flow only when the evidence calls for it. A browser login or MCP OAuth refresh does not replace `META_ACCESS_TOKEN`. If replacement is necessary, use the existing Worker secret, without committing or sharing its value:
+3. If the assignment is absent, an authorized administrator must assign the verified identity to the exact account in Meta Business Settings with the authorized tasks to manage campaigns and view performance (`ADVERTISE` and `ANALYZE`). Preserve existing privileges and account ownership. The temporary v2.3.3 assignment tool was removed in v2.3.4 after recovery; routine campaign tools cannot change account membership or administrative access.
+4. Retry one minimal account read after any authorized recovery. If the assignment is already correct but access remains denied, inspect business/app restrictions, security review, and any Meta-requested authorization renewal. In Business Integrations, the application is distinct from the user/system-user name. The historical app is `STOICUS MKT IA` (`1633140634900008`); verify the actual token's application before renewing or replacing anything.
+5. Generate or renew the production token through Meta's supported flow only when the evidence calls for it. A browser login or MCP OAuth refresh does not replace `META_ACCESS_TOKEN`. If replacement is necessary, use the existing Worker secret, without committing or sharing its value:
 
    ```bash
    wrangler secret put META_ACCESS_TOKEN
    ```
 
-7. Run the read-only preflight in this order:
+6. Run the read-only preflight in this order:
 
    - `meta_get_token_permissions`
    - `meta_get_ad_account`
    - `meta_list_campaigns`
 
-8. Do not call any campaign or ad write tool until all three reads succeed for the configured account. Remove the temporary recovery tool and its `META_BUSINESS_ID` setting in the next deployment after access is verified.
+7. Do not call any campaign or ad write tool until all three reads succeed for the configured account. Readiness flags do not independently prove write permission. Execute only an already authorized, necessary mutation and verify its read-back; do not create a change solely as an access test.
+
+The v2.3.4 source and Wrangler configuration no longer use `META_BUSINESS_ID`. Deployments with `--keep-vars` may retain its old Cloudflare binding. Remove only that unused binding through the normal deployment administration surface; preserve all other variables, secrets, and the deployment flag. An old retained value cannot enable account assignment because the recovery tool and its handlers are absent.
 
 Do not change the user's Meta password again solely to repair this connector. Error `#200` confirms that the requested operation was denied; the exact message and administrative evidence determine the cause. Granted scopes do not prove asset access, and denied API access does not prove that ads stopped delivering. Do not loop on denied reads or infer that concurrent chats caused a checkpoint solely from their timing.
 
@@ -36,7 +37,7 @@ Official SDK references: [SystemUser](https://github.com/facebook/facebook-pytho
 
 ## Concurrent ChatGPT sessions
 
-Connector version 2.3.3 combines two account-scoped Durable Objects and the deliberately temporary, fixed-scope assignment recovery described above:
+Connector version 2.3.4 retains two account-scoped Durable Objects:
 
 - `META_API_GATE` serializes all Meta Graph requests across chats, spaces attempts by at least 250 ms, applies one bounded retry only to a short rate-limited `GET`, and enters cooldown after a persistent or long limit. It never retries a `POST`.
 - `META_WRITE_LOCK` provides the exclusive write lease described below.
@@ -50,9 +51,15 @@ The write lease behaves as follows:
 - The owning session may release it with `meta_release_write_lease`; otherwise it expires automatically.
 - Validate-only requests do not acquire the lease.
 
+The holder is the technical MCP session identifier (`this.ctx.id`), not the visible ChatGPT conversation. A client may use different MCP sessions for successive calls in the same chat, so an apparent single operator can receive `WRITE_LOCKED` until the earlier 10-minute lease expires. Respect the returned expiration; do not retry in a loop or replace the holder with a shared user/token identity, which would collapse protection between concurrent chats. Only the original technical session may release its lease.
+
 The lease coordinates real writes only; `META_API_GATE` separately throttles all Graph reads and writes. Neither mechanism cures Meta permission errors. Resume recurring reviews only after account access is restored; keep denied checks brief and do not create overlapping replacement monitors.
 
 Operationally, keep one control chat for mutations and use any additional chats only for reports, reviews, or planning.
+
+## Delivery and review diagnostics
+
+`meta_list_ads` requests `issues_info`, `ad_review_feedback`, and `failed_delivery_checks` in its existing read-only ads request. It preserves the Meta values, creative details, ownership checks, and cursor pagination without changing its input schema. These fields are exposed by the [official Meta Ad SDK object](https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/adobjects/ad.py). An omitted diagnostic field does not prove there is no issue. A rejected field request returns the explicit Meta error; it does not silently retry a reduced inventory or change delivery status.
 
 ## Production preflight
 

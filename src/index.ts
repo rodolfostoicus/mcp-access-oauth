@@ -16,13 +16,11 @@ const META_GET_RETRY_DELAY_MS = 1_000;
 const META_GET_MAX_INLINE_RETRY_DELAY_MS = 5_000;
 const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
-const CONNECTOR_VERSION = "2.3.3";
-const SELF_ASSIGNMENT_TASKS = ["ADVERTISE", "ANALYZE"] as const;
+const CONNECTOR_VERSION = "2.3.4";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
 	META_AD_ACCOUNT_ID?: string;
-	META_BUSINESS_ID?: string;
 	META_API_GATE?: DurableObjectNamespace;
 	META_API_VERSION?: string;
 	META_WRITE_LOCK?: DurableObjectNamespace;
@@ -266,16 +264,6 @@ function assertWritesEnabled(env: MetaEnv) {
 			"Meta write tools are disabled by META_WRITE_ENABLED. Enable only after ads_management is granted.",
 		);
 	}
-}
-
-function getConfiguredBusinessId(env: MetaEnv) {
-	const businessId = env.META_BUSINESS_ID?.trim();
-	if (!businessId || !META_ID_PATTERN.test(businessId) || businessId.length > 30) {
-		throw new Error(
-			"META_BUSINESS_ID must be configured as the numeric Business Portfolio ID (at most 30 digits).",
-		);
-	}
-	return businessId;
 }
 
 function getMetaGateStub(env: MetaEnv) {
@@ -858,208 +846,6 @@ async function inspectBusinessAccess(env: MetaEnv, businessId: string, tokenSubj
 	};
 }
 
-const tokenSubjectSchema = z.object({
-	id: z.string().regex(META_ID_PATTERN),
-	name: z.string().optional(),
-}).passthrough();
-
-async function resolveConfiguredSelfAssignmentScope(
-	env: MetaEnv,
-	businessId: string,
-	tokenSubject: z.infer<typeof tokenSubjectSchema>,
-) {
-	const { accountId, accountNumericId } = getMetaConfig(env);
-	const systemUserScan = await scanBusinessEdge(
-		env,
-		businessId,
-		"system_users",
-		tokenSubject.id,
-		true,
-	);
-	if (
-		systemUserScan.diagnostic_error ||
-		systemUserScan.identity_warning ||
-		!systemUserScan.scan_complete ||
-		systemUserScan.match_ambiguous
-	) {
-		const reason = systemUserScan.match_ambiguous
-			? "More than one Business system-user row maps to the live token subject."
-			: systemUserScan.identity_warning
-				? systemUserScan.identity_warning
-				: systemUserScan.diagnostic_error || "The bounded system-user scan was incomplete.";
-		throw new Error(`Cannot uniquely resolve the token subject to one Business system user. ${reason}`);
-	}
-	if (!systemUserScan.match_found || !systemUserScan.match) {
-		const suffix = systemUserScan.diagnostic_error
-			? ` ${systemUserScan.diagnostic_error}`
-			: systemUserScan.scan_complete
-				? " The token subject is not a system user of the configured Business Portfolio."
-				: " The bounded system-user scan was incomplete.";
-		throw new Error(`Cannot confirm the token subject as a Business system user.${suffix}`);
-	}
-	const systemUser = z.object({
-		id: z.string().regex(META_ID_PATTERN),
-		name: z.string(),
-		role: z.string(),
-		system_user_id: z.string().regex(META_ID_PATTERN).optional(),
-	}).parse(systemUserScan.match);
-	if (systemUser.id !== tokenSubject.id && systemUser.system_user_id !== tokenSubject.id) {
-		throw new Error("The Business system-user match does not map to the live token subject.");
-	}
-	if (systemUser.role !== "ADMIN") {
-		throw new Error("The live token subject is not an ADMIN system user of the configured Business Portfolio.");
-	}
-
-	const clientAccountScan = await scanBusinessEdge(
-		env,
-		businessId,
-		"client_ad_accounts",
-		accountId,
-	);
-	if (!clientAccountScan.match_found || !clientAccountScan.match) {
-		const suffix = clientAccountScan.diagnostic_error
-			? ` ${clientAccountScan.diagnostic_error}`
-			: clientAccountScan.scan_complete
-				? " The configured ad account is not a client ad account of the configured Business Portfolio."
-				: " The bounded client-account scan was incomplete.";
-		throw new Error(`Cannot confirm the configured ad account on client_ad_accounts.${suffix}`);
-	}
-	const clientAccount = z.object({
-		id: z.string().regex(/^act_\d+$/),
-		account_id: z.string().regex(META_ID_PATTERN),
-		name: z.string(),
-	}).passthrough().parse(clientAccountScan.match);
-	if (clientAccount.id !== accountId || clientAccount.account_id !== accountNumericId) {
-		throw new Error("The client ad-account match does not equal the configured ad account.");
-	}
-	return {
-		account: {
-			account_id: clientAccount.account_id,
-			id: clientAccount.id,
-			name: clientAccount.name,
-		},
-		system_user: {
-			id: systemUser.id,
-			name: systemUser.name,
-			role: systemUser.role,
-			...(systemUser.system_user_id ? { system_user_id: systemUser.system_user_id } : {}),
-		},
-	};
-}
-
-async function scanConfiguredAssignedUser(
-	env: MetaEnv,
-	businessId: string,
-	systemUserId: string,
-) {
-	const { accountId } = getMetaConfig(env);
-	const assignedUserSchema = z.object({
-		id: z.string().regex(META_ID_PATTERN),
-		name: z.string().optional(),
-		tasks: z.array(z.string()).max(100),
-		user_type: z.string().min(1).max(100),
-	}).passthrough();
-	const assignedSystemUserSchema = assignedUserSchema.extend({
-		user_type: z.literal("SYSTEM_USER"),
-	});
-	const pageSchema = z.object({
-		data: z.array(assignedUserSchema).max(25),
-		paging: z.object({
-			next: z.string().optional(),
-			cursors: z.object({
-				after: z.string().min(1).max(2_000).optional(),
-			}).optional(),
-		}).optional(),
-	});
-	let match: z.infer<typeof assignedUserSchema> | null = null;
-	let scanComplete = false;
-	let recordsScanned = 0;
-	let pagesRead = 0;
-	let diagnosticError: string | undefined;
-	let after: string | undefined;
-	const seenCursors = new Set<string>();
-	try {
-		for (let page = 0; page < 3; page++) {
-			const params: Record<string, string | number> = {
-				business: businessId,
-				fields: "id,name,user_type,tasks",
-				limit: 25,
-			};
-			if (after) params.after = after;
-			const response = pageSchema.parse(
-				await callMetaGraph(env, "GET", `${accountId}/assigned_users`, params),
-			);
-			pagesRead += 1;
-			recordsScanned += response.data.length;
-			const candidate = response.data.find((item) => item.id === systemUserId);
-			match = candidate ? assignedSystemUserSchema.parse(candidate) : null;
-			scanComplete = !response.paging?.next;
-			if (match || scanComplete) break;
-			const nextAfter = response.paging?.cursors?.after;
-			if (!nextAfter || seenCursors.has(nextAfter)) {
-				diagnosticError = "Pagination did not provide a new cursor; assigned-user result is incomplete.";
-				break;
-			}
-			seenCursors.add(nextAfter);
-			after = nextAfter;
-		}
-	} catch (error) {
-		diagnosticError = businessDiagnosticError(error);
-	}
-	if (!match && (diagnosticError || !scanComplete)) {
-		throw new Error(
-			`Cannot safely determine current assigned-user tasks. ${diagnosticError || "The bounded assigned-user scan was incomplete."}`,
-		);
-	}
-	const currentTasks = match?.tasks ?? [];
-	const tasksWithinBoundedScope = currentTasks.every(
-		(task) => SELF_ASSIGNMENT_TASKS.includes(task as typeof SELF_ASSIGNMENT_TASKS[number]),
-	);
-	const requiredTasksPresent = SELF_ASSIGNMENT_TASKS.every((task) => currentTasks.includes(task));
-	return {
-		match_found: match !== null,
-		assigned_user: match ? {
-			id: match.id,
-			name: match.name,
-			tasks: match.tasks,
-			user_type: match.user_type,
-		} : null,
-		current_tasks: currentTasks,
-		required_tasks_present: requiredTasksPresent,
-		tasks_within_bounded_scope: tasksWithinBoundedScope,
-		exact_bounded_tasks_present: requiredTasksPresent && tasksWithinBoundedScope,
-		records_scanned: recordsScanned,
-		pages_read: pagesRead,
-		scan_complete: scanComplete,
-	};
-}
-
-async function inspectConfiguredAccountAccess(env: MetaEnv) {
-	const { accountId, accountNumericId } = getMetaConfig(env);
-	try {
-		const account = z.object({
-			id: z.string().regex(/^act_\d+$/),
-			account_id: z.union([
-				z.string().regex(META_ID_PATTERN),
-				z.number().int().safe().nonnegative(),
-			]).transform(String),
-			name: z.string(),
-			account_status: z.number().int(),
-		}).parse(await callMetaGraph(env, "GET", accountId, {
-			fields: "id,account_id,name,account_status",
-		}));
-		if (account.id !== accountId || account.account_id !== accountNumericId) {
-			throw new Error("Account access response does not match the configured ad account.");
-		}
-		return { accessible: true as const, account };
-	} catch (error) {
-		return {
-			accessible: false as const,
-			diagnostic_error: businessDiagnosticError(error),
-		};
-	}
-}
-
 function isoDateDaysAgo(daysAgo: number) {
 	const date = new Date();
 	date.setUTCDate(date.getUTCDate() - daysAgo);
@@ -1553,163 +1339,6 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 		);
 
 		this.server.registerTool(
-			"meta_recovery_assign_self_to_configured_account",
-			{
-				annotations: {
-					destructiveHint: false,
-					idempotentHint: false,
-					openWorldHint: true,
-					readOnlyHint: false,
-				},
-				description:
-					"TEMPORARY RECOVERY WRITE/PREFLIGHT. Resolve the live /me subject to its app-scoped ADMIN system-user row, then assign only ADVERTISE and ANALYZE on the configured ad account. The configured Business Portfolio must contain the account on client_ad_accounts. Defaults to read-only preflight; a real write requires the exact returned confirmation, the account write lease, and bounded assigned_users read-back verification. Accepts no account, user, Business, or task overrides.",
-				inputSchema: {
-					confirmation_phrase: z.string().max(1_000).optional(),
-					validate_only: z.boolean().default(true),
-				},
-			},
-			async ({ confirmation_phrase, validate_only }) => {
-				let writeAttempted = false;
-				let auditRecorded = false;
-				try {
-					const env = this.env as MetaEnv;
-					assertWritesEnabled(env);
-					const { accountId } = getMetaConfig(env);
-					const businessId = getConfiguredBusinessId(env);
-					const tokenSubject = tokenSubjectSchema.parse(
-						await callMetaGraph(env, "GET", "me", { fields: "id,name" }),
-					);
-					const scope = await resolveConfiguredSelfAssignmentScope(
-						env,
-						businessId,
-						tokenSubject,
-					);
-					const requiredConfirmation =
-						`ASSIGN SYSTEM USER ${scope.system_user.id} ADVERTISE ANALYZE ON ${accountId} VIA BUSINESS ${businessId}`;
-					if (!validate_only) {
-						assertConfirmation(confirmation_phrase || "", requiredConfirmation);
-					}
-
-					const before = await scanConfiguredAssignedUser(
-						env,
-						businessId,
-						scope.system_user.id,
-					);
-					const unexpectedTasks = before.current_tasks.filter(
-						(task) => !SELF_ASSIGNMENT_TASKS.includes(task as typeof SELF_ASSIGNMENT_TASKS[number]),
-					);
-					if (unexpectedTasks.length > 0) {
-						throw new Error(
-							"The existing assigned-user row contains tasks outside the bounded ADVERTISE + ANALYZE scope. No POST was attempted because the fixed payload could revoke existing privileges.",
-						);
-					}
-					const accountAccessBefore = await inspectConfiguredAccountAccess(env);
-					if (before.exact_bounded_tasks_present) {
-						if (!accountAccessBefore.accessible) {
-							throw new Error(
-								"The exact assigned-user row already contains ADVERTISE + ANALYZE, but direct account access is not yet confirmed. No assignment POST was attempted; wait for propagation or investigate account access before retrying.",
-							);
-						}
-						return asToolResult({
-							mode: "no_change",
-							business_id: businessId,
-							token_subject: { id: tokenSubject.id, name: tokenSubject.name },
-							scope,
-							required_tasks: SELF_ASSIGNMENT_TASKS,
-							required_confirmation: requiredConfirmation,
-							before,
-							account_access_before: accountAccessBefore,
-							verified: true,
-						});
-					}
-					if (validate_only) {
-						return asToolResult({
-							mode: "preflight",
-							business_id: businessId,
-							token_subject: { id: tokenSubject.id, name: tokenSubject.name },
-							scope,
-							required_tasks: SELF_ASSIGNMENT_TASKS,
-							required_confirmation: requiredConfirmation,
-							before,
-							account_access_before: accountAccessBefore,
-							write_attempted: false,
-						});
-					}
-
-					await acquireAccountWriteLease(env, this.ctx.id.toString(), requiredConfirmation);
-					writeAttempted = true;
-					let writeResult: z.infer<typeof writeResponseSchema> | undefined;
-					let writeError: unknown;
-					try {
-						writeResult = writeResponseSchema.parse(
-							await callMetaGraph(env, "POST", `${accountId}/assigned_users`, {
-								tasks: [...SELF_ASSIGNMENT_TASKS],
-								user: scope.system_user.id,
-							}),
-						);
-					} catch (error) {
-						writeError = error;
-					}
-
-					let after: Awaited<ReturnType<typeof scanConfiguredAssignedUser>> | undefined;
-					let accountAccessAfter: Awaited<ReturnType<typeof inspectConfiguredAccountAccess>> | undefined;
-					try {
-						after = await scanConfiguredAssignedUser(
-							env,
-							businessId,
-							scope.system_user.id,
-						);
-						accountAccessAfter = await inspectConfiguredAccountAccess(env);
-					} catch {}
-					const verified = Boolean(
-						after?.exact_bounded_tasks_present && accountAccessAfter?.accessible,
-					);
-					const responseConfirmed = writeResult?.success === true;
-					const reconciled = verified && (!responseConfirmed || writeError !== undefined);
-					auditMutation("assign_self_system_user", {
-						account_id: accountId,
-						business_id: businessId,
-						assigned_user_id: scope.system_user.id,
-						reconciled,
-						subject_id: tokenSubject.id,
-						tasks: SELF_ASSIGNMENT_TASKS,
-						verified,
-						write_response_confirmed: responseConfirmed,
-					});
-					auditRecorded = true;
-					if (!verified) {
-						throw new Error(
-							"Real self-assignment was attempted, but the exact bounded ADVERTISE + ANALYZE task set and direct account access were not both confirmed afterward. Do not retry until fresh administrative reads reconcile the current state.",
-						);
-					}
-					return asToolResult({
-						mode: reconciled ? "reconciled" : "assigned",
-						business_id: businessId,
-						token_subject: { id: tokenSubject.id, name: tokenSubject.name },
-						scope,
-						required_tasks: SELF_ASSIGNMENT_TASKS,
-						required_confirmation: requiredConfirmation,
-						before,
-						write_result: writeResult ? { success: writeResult.success === true } : undefined,
-						write_response_confirmed: responseConfirmed,
-						reconciled_after_ambiguous_write: reconciled,
-						after,
-						account_access_before: accountAccessBefore,
-						account_access_after: accountAccessAfter,
-						verified,
-					});
-				} catch (error) {
-					if (writeAttempted && !auditRecorded) {
-						auditMutation("assign_self_system_user_unverified", {
-							tasks: SELF_ASSIGNMENT_TASKS,
-						});
-					}
-					return asToolError(error);
-				}
-			},
-		);
-
-		this.server.registerTool(
 			"meta_list_campaigns",
 			{
 				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: true },
@@ -1787,7 +1416,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 			{
 				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: true },
 				description:
-					"Read-only. List ads from the configured account or one owned campaign/ad set.",
+					"Read-only. List ads, creative details, and Meta delivery/review diagnostics from the configured account or one owned campaign/ad set. Omitted diagnostic fields do not confirm absence of issues.",
 				inputSchema: {
 					adset_id: z.string().regex(META_ID_PATTERN).optional(),
 					after: z.string().max(2_000).optional(),
@@ -1806,7 +1435,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					if (campaign_id) await getOwnedObject(env, "CAMPAIGN", campaign_id);
 					const params: Record<string, string | number> = {
 						fields:
-							"id,name,adset_id,campaign_id,status,effective_status,creative{id,name,object_story_spec,image_hash,thumbnail_url},created_time,updated_time",
+							"id,name,adset_id,campaign_id,status,effective_status,issues_info,ad_review_feedback,failed_delivery_checks,creative{id,name,object_story_spec,image_hash,thumbnail_url},created_time,updated_time",
 						limit,
 					};
 					if (after) params.after = after;
