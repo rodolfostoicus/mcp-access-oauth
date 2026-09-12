@@ -801,8 +801,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.5");
-  assert.equal(h.metadata.version, "2.3.5");
+  assert.equal(result.connector_version, "2.3.6");
+  assert.equal(h.metadata.version, "2.3.6");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -828,8 +828,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.5");
-  assert.equal(h.metadata.version, "2.3.5");
+  assert.equal(result.connector_version, "2.3.6");
+  assert.equal(h.metadata.version, "2.3.6");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1527,7 +1527,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.5");
+  assert.equal(result.connector_version, "2.3.6");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1601,7 +1601,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.5");
+  assert.equal(result.connector_version, "2.3.6");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1807,7 +1807,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.5");
+    assert.equal(result.connector_version, "2.3.6");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -2512,4 +2512,272 @@ for (const successorExpired of [false, true]) test(`expired status owner cannot 
   assert.equal(stale.status, 409);
   assert.deepEqual(p.runtime.values.get("lease"), successor);
   assert.equal(p.runtime.storageWrites.length, writes);
+});
+
+function geoFixture() {
+  const fixture = ageFixture();
+  fixture.targeting.geo_locations = { countries: ["BR"], location_types: ["home", "recent", "frequently_in"] };
+  fixture.targeting.excluded_geo_locations = { countries: ["AR", "PY", "UY"], regions: [{ key: "460" }] };
+  fixture.targeting.targeting_automation = { advantage_audience: 1, individual_setting: { geo: 1, age: 0 }, shared_audiences: 0 };
+  return fixture;
+}
+
+function geoInput(overrides = {}) {
+  return { adset_id: ADSET, expected_name: ADSET_NAME, region_keys: ["452", "456", "459"], ...overrides };
+}
+
+function geoRealInput(overrides = {}) {
+  return geoInput({
+    validate_only: false,
+    confirmation_phrase: "UPDATE ADSET GEO " + ADSET + " REGIONS 452,456,459 GEO_EXPANSION 0",
+    ...overrides,
+  });
+}
+
+// Execute the production account gate and durable lock across two transports.
+async function geoPair(options = {}) {
+  const runtime = sharedStatusRuntime();
+  const clock = statusTestClock();
+  const state = { value: structuredClone(options.initial ?? geoFixture()) };
+  const initial = structuredClone(state.value);
+  const setup = {
+    sharedRuntime: runtime, clock, useGate: true,
+    writeLockRespond: options.writeLockRespond,
+    async respond(call) {
+      const override = options.respond && await options.respond(call, state, runtime, clock);
+      if (override !== undefined) return override;
+      if (call.path === ADSET && call.method === "GET") return state.value;
+      if (call.path === ADSET && call.method === "POST") {
+        if (call.params.execution_options) {
+          assert.deepEqual(call.params.execution_options, ["validate_only"]);
+          assert.deepEqual(Object.keys(call.params).sort(), ["execution_options", "targeting"]);
+        } else {
+          assert.deepEqual(Object.keys(call.params), ["targeting"]);
+          state.value = { ...state.value, targeting: structuredClone(call.params.targeting) };
+          state.value.targeting.geo_locations.regions = state.value.targeting.geo_locations.regions
+            .map(({ key }) => ({ key, name: "Display " + key, country: "BR" })).reverse();
+        }
+        return { success: true };
+      }
+    },
+  };
+  const first = await harness({ ...setup, sessionId: "geo-transport-a" });
+  const second = await harness({ ...setup, sessionId: "geo-transport-b" });
+  return { first, second, runtime, clock, state, initial };
+}
+
+function realGeoPosts(runtime) {
+  return runtime.calls.filter(c => c.method === "POST" && !c.params.execution_options);
+}
+
+test("geo restriction previews the exact change and leaves the complete ad set unchanged", async () => {
+  const p = await geoPair();
+  const result = toolPayload(await p.first.invoke("meta_update_adset_geo", geoInput()));
+  assert.equal(result.mode, "validate_only");
+  assert.equal(result.verified_unchanged, true);
+  assert.equal(result.required_confirmation, geoRealInput().confirmation_phrase);
+  assert.deepEqual(p.state.value, p.initial);
+  const proposed = structuredClone(p.initial);
+  proposed.targeting.geo_locations = { regions: [{ key: "452" }, { key: "456" }, { key: "459" }], location_types: ["home", "recent", "frequently_in"] };
+  proposed.targeting.targeting_automation.individual_setting.geo = 0;
+  assert.deepEqual(result.proposed, proposed);
+  assert.equal(realGeoPosts(p.runtime).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+for (const automationPresent of [true, false]) test("geo restriction preserves all other settings and verifies Graph region enrichment (automation=" + automationPresent + ")", async () => {
+  const initial = geoFixture();
+  if (!automationPresent) {
+    delete initial.targeting.targeting_automation;
+    initial.targeting.age_min = 18;
+    initial.targeting.age_max = 65;
+    delete initial.targeting.flexible_spec;
+    initial.destination_type = "WEBSITE";
+    initial.optimization_goal = "OFFSITE_CONVERSIONS";
+    initial.effective_status = "CAMPAIGN_PAUSED";
+  }
+  const p = await geoPair({ initial });
+  const result = toolPayload(await p.first.invoke("meta_update_adset_geo", geoRealInput({ region_keys: ["459", "452", "456"] })));
+  assert.equal(result.mode, "updated");
+  assert.equal(result.verified, true);
+  assert.equal(result.after.status, p.initial.status);
+  const post = realGeoPosts(p.runtime)[0];
+  const expected = structuredClone(initial.targeting);
+  expected.geo_locations = { regions: [{ key: "452" }, { key: "456" }, { key: "459" }], location_types: ["home", "recent", "frequently_in"] };
+  expected.targeting_automation = automationPresent
+    ? { advantage_audience: 1, individual_setting: { geo: 0, age: 0 }, shared_audiences: 0 }
+    : { individual_setting: { geo: 0 } };
+  assert.deepEqual(post.params.targeting, expected);
+  assert.equal(realGeoPosts(p.runtime).length, 1);
+  assert.equal(p.runtime.values.has("lease"), false);
+  assert.ok(p.runtime.fetchSignals.filter(Boolean).length >= 2);
+  const repeated = toolPayload(await p.second.invoke("meta_update_adset_geo", geoRealInput()));
+  assert.equal(repeated.mode, "no_change");
+  assert.equal(repeated.verified, true);
+  assert.equal(realGeoPosts(p.runtime).length, 1);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("geo restriction supports a narrower subset of already included states", async () => {
+  const initial = geoFixture();
+  initial.targeting.geo_locations = { regions: [{ key: "452", name: "Parana", country: "BR" }, { key: "456", name: "RS", country: "BR" }, { key: "459", name: "SC", country: "BR" }] };
+  const p = await geoPair({ initial });
+  const result = toolPayload(await p.first.invoke("meta_update_adset_geo", geoRealInput({
+    region_keys: ["459"], confirmation_phrase: "UPDATE ADSET GEO " + ADSET + " REGIONS 459 GEO_EXPANSION 0",
+  })));
+  assert.equal(result.verified, true);
+  assert.deepEqual(realGeoPosts(p.runtime)[0].params.targeting.geo_locations, { regions: [{ key: "459" }] });
+});
+
+for (const [label, geo] of [
+  ["city coverage", { cities: [{ key: "100" }] }],
+  ["radius coverage", { custom_locations: [{ latitude: -26, longitude: -49, radius: 80 }] }],
+  ["mixed country/regions", { countries: ["BR"], regions: [{ key: "459" }] }],
+  ["additional country", { countries: ["BR", "AR"] }],
+  ["foreign country", { countries: ["AR"] }],
+  ["country group", { country_groups: ["worldwide"] }],
+  ["state expansion", { regions: [{ key: "459" }] }],
+]) test("geo restriction rejects " + label + " before any POST", async () => {
+  const initial = geoFixture();
+  initial.targeting.geo_locations = geo;
+  const p = await geoPair({ initial });
+  const result = await p.first.invoke("meta_update_adset_geo", geoRealInput());
+  assert.equal(result.isError, true);
+  assert.equal(p.runtime.calls.filter(c => c.method === "POST").length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+  assert.deepEqual(p.state.value, p.initial);
+});
+
+for (const region_keys of [[], ["460"], ["452", "452"]]) test("geo restriction rejects invalid region input " + JSON.stringify(region_keys), async () => {
+  const p = await geoPair();
+  await assert.rejects(p.first.invoke("meta_update_adset_geo", geoInput({ region_keys })));
+  assert.equal(p.runtime.calls.length, 0);
+  assert.equal(p.runtime.lockCalls.length, 0);
+});
+
+test("geo restriction rejects stale identity/name/status and incomplete geography before validation", async () => {
+  for (const override of [{ id: "999999" }, { account_id: "999999" }, { name: "Stale name" }, { status: "ARCHIVED" }, { targeting: {} }]) {
+    const p = await geoPair({ initial: { ...geoFixture(), ...override } });
+    const result = await p.first.invoke("meta_update_adset_geo", geoRealInput());
+    assert.equal(result.isError, true);
+    assert.equal(p.runtime.calls.filter(c => c.method === "POST").length, 0);
+    assert.equal(p.runtime.values.has("lease"), false);
+  }
+});
+
+test("geo restriction validates exact confirmation before reads or locks", async () => {
+  const p = await geoPair();
+  const result = await p.first.invoke("meta_update_adset_geo", geoRealInput({ confirmation_phrase: "incorrect" }));
+  assert.equal(result.isError, true);
+  assert.equal(p.runtime.calls.length, 0);
+  assert.equal(p.runtime.lockCalls.length, 0);
+});
+
+test("geo restriction honors the write switch and fails before reads", async () => {
+  const h = await harness({ env: { META_WRITE_ENABLED: "false" } });
+  const result = await h.invoke("meta_update_adset_geo", geoInput());
+  assert.equal(result.isError, true);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.lockCalls.length, 0);
+});
+
+test("geo restriction stops on failed Meta validation without a real update", async () => {
+  const p = await geoPair({ respond(call) {
+    if (call.method === "POST") return { success: false };
+  } });
+  const result = await p.first.invoke("meta_update_adset_geo", geoRealInput());
+  assert.equal(result.isError, true);
+  assert.equal(realGeoPosts(p.runtime).length, 0);
+  assert.deepEqual(p.state.value, p.initial);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("geo restriction detects concurrent targeting changes after validation without a real update", async () => {
+  let reads = 0;
+  const p = await geoPair({ respond(call, state) {
+    if (call.path === ADSET && call.method === "GET" && ++reads === 2) {
+      state.value.targeting.age_max = 61;
+      return state.value;
+    }
+  } });
+  const result = await p.first.invoke("meta_update_adset_geo", geoRealInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /changed during geography validation/);
+  assert.equal(realGeoPosts(p.runtime).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+for (const [label, drift] of [
+  ["age", value => { value.targeting.age_max = 65; }],
+  ["configured status", value => { value.status = "PAUSED"; }],
+  ["budget", value => { value.lifetime_budget = "90000"; }],
+  ["geographic expansion", value => { value.targeting.targeting_automation.individual_setting.geo = 1; }],
+  ["omitted geographic expansion", value => { delete value.targeting.targeting_automation.individual_setting.geo; }],
+  ["excluded geography", value => { delete value.targeting.excluded_geo_locations; }],
+  ["extra geographic inclusion", value => { value.targeting.geo_locations.countries = ["BR"]; }],
+  ["foreign metadata", value => { value.targeting.geo_locations.regions[0].country = "AR"; }],
+]) test("geo restriction fails verification after " + label + " drift without retry or rollback", async () => {
+  let posted = false;
+  const p = await geoPair({ respond(call, state) {
+    if (call.path === ADSET && call.method === "POST" && !call.params.execution_options) {
+      state.value.targeting = structuredClone(call.params.targeting);
+      posted = true;
+      return { success: true };
+    }
+    if (call.path === ADSET && call.method === "GET" && posted) {
+      drift(state.value);
+      return state.value;
+    }
+  } });
+  const result = await p.first.invoke("meta_update_adset_geo", geoRealInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+  assert.equal(realGeoPosts(p.runtime).length, 1);
+  assertStatusLeaseRetained(p.runtime, p.clock);
+});
+
+test("geo restriction keeps the operation lease after a lost mutation response", async () => {
+  const p = await geoPair({ respond(call) {
+    if (call.path === ADSET && call.method === "POST" && !call.params.execution_options) throw new Error("Offline connection lost after dispatch");
+  } });
+  const result = await p.first.invoke("meta_update_adset_geo", geoRealInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+  assert.equal(realGeoPosts(p.runtime).length, 1);
+  assertStatusLeaseRetained(p.runtime, p.clock);
+});
+
+test("geo restriction excludes a competing transport throughout validation and mutation", async () => {
+  const entered = statusDeferred();
+  const resume = statusDeferred();
+  let firstValidation = true;
+  const p = await geoPair({ async respond(call) {
+    if (call.path === ADSET && call.params.execution_options && firstValidation) {
+      firstValidation = false;
+      entered.resolve();
+      await resume.promise;
+    }
+  } });
+  const firstCall = p.first.invoke("meta_update_adset_geo", geoRealInput());
+  await entered.promise;
+  const competing = await p.second.invoke("meta_update_adset_geo", geoRealInput());
+  assert.equal(competing.isError, true);
+  assert.match(competing.content[0].text, /WRITE_LOCKED/);
+  assert.equal(p.runtime.calls.filter(c => c.method === "GET").length, 1);
+  resume.resolve();
+  assert.equal(toolPayload(await firstCall).verified, true);
+  assert.equal(realGeoPosts(p.runtime).length, 1);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("geo restriction fences an expired operation before dispatching the real POST", async () => {
+  let reads = 0;
+  const p = await geoPair({ respond(call, _state, _runtime, clock) {
+    if (call.path === ADSET && call.method === "GET" && ++reads === 2) clock.advance(600001);
+  } });
+  const result = await p.first.invoke("meta_update_adset_geo", geoRealInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_LEASE_EXPIRED/);
+  assert.equal(realGeoPosts(p.runtime).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
 });
