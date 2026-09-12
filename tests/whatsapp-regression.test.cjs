@@ -803,8 +803,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.13");
-  assert.equal(h.metadata.version, "2.3.13");
+  assert.equal(result.connector_version, "2.3.14");
+  assert.equal(h.metadata.version, "2.3.14");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -830,8 +830,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.13");
-  assert.equal(h.metadata.version, "2.3.13");
+  assert.equal(result.connector_version, "2.3.14");
+  assert.equal(h.metadata.version, "2.3.14");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1529,7 +1529,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.13");
+  assert.equal(result.connector_version, "2.3.14");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1603,7 +1603,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.13");
+  assert.equal(result.connector_version, "2.3.14");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1809,7 +1809,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.13");
+    assert.equal(result.connector_version, "2.3.14");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -4318,4 +4318,131 @@ test("creative asset upload accepts documented hash-only response and reports Me
   assert.equal(result.meta_image_name, "Meta generated name");
   assert.equal(result.image_name, UPLOAD_ASSET_NAME);
   assert.equal(result.name_verification, "read_from_account_library");
+});
+
+// v2.3.14 explicitly reconciles the same durable creative operation. Fixtures
+// represent a successful create whose original administrative label changed.
+async function seededCreativeResume(options = {}) {
+  const h = await creativeReplacementHarness(options);
+  const preview = toolPayload(await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput()));
+  const fingerprint = preview.required_confirmation.match(/SHA256 ([a-f0-9]{64})$/)[1];
+  const journal = { ad_id: BREVAR_AD, request_id: REQUEST_ID, fingerprint, stage: "CREATIVE_CREATED", creative_id: BREVAR_NEW_CREATIVE, before: preview.before, proposed: preview.proposed };
+  h.state.newCreative = { ...structuredClone(preview.proposed), id: BREVAR_NEW_CREATIVE, account_id: ACCOUNT, name: "Meta generated administrative label" };
+  h.runtime.values.set(`brevar-creative:${REQUEST_ID}`, structuredClone(journal));
+  h.runtime.values.set(`brevar-creative-ad:${BREVAR_AD}`, { request_id: REQUEST_ID, stage: journal.stage });
+  return { ...h, journal };
+}
+function resumeInput(h, overrides = {}) {
+  return { ad_id: BREVAR_AD, expected_name: h.journal.before.ad.name, request_id: REQUEST_ID, creative_id: BREVAR_NEW_CREATIVE,
+    expected_fingerprint: h.journal.fingerprint, expected_stage: "CREATIVE_CREATED", expected_creative_name: h.state.newCreative.name, ...overrides };
+}
+async function resumeConfirmed(h, overrides = {}) {
+  const input = resumeInput(h, overrides);
+  const preview = toolPayload(await h.invoke("meta_resume_brevar_ad_creative", input));
+  return h.invoke("meta_resume_brevar_ad_creative", { ...input, validate_only: false, confirmation_phrase: preview.required_confirmation });
+}
+
+test("creative operation inspection reads exact journal and full creative while preserving another holder's lease", async () => {
+  const h = await seededCreativeResume();
+  await h.runtime.lock.fetch(new Request("https://meta-write-lock.internal/lease", { method: "POST", body: JSON.stringify({ action: "acquire", holder: "private-foreign-holder", operation: "existing operation", ttl_ms: 60000 }) }));
+  const lease = structuredClone(h.runtime.values.get("lease"));
+  const journal = structuredClone(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`));
+  const writes = h.runtime.storageWrites.length, posts = postCalls(h).length;
+  const result = toolPayload(await h.invoke("meta_get_brevar_creative_operation", { ad_id: BREVAR_AD, expected_name: h.journal.before.ad.name, request_id: REQUEST_ID }));
+  assert.equal(result.mode, "read_only"); assert.equal(result.content_verified, true); assert.equal(result.eligible, true);
+  assert.equal(result.administrative_name.matches, false); assert.equal(result.administrative_name.actual, h.state.newCreative.name);
+  assert.deepEqual(result.journal.proposed, h.journal.proposed); assert.deepEqual(result.created_creative, h.state.newCreative);
+  assert.deepEqual(h.runtime.values.get("lease"), lease); assert.deepEqual(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`), journal);
+  assert.equal(h.runtime.storageWrites.length, writes); assert.equal(postCalls(h).length, posts);
+  assert.equal(JSON.stringify(result).includes("private-foreign-holder"), false);
+});
+
+test("creative resume previews without POST or journal mutation, then attaches the existing ID once after 31 seconds", async () => {
+  let validationAt, attachedAt, clock;
+  const h = await seededCreativeResume({ respond(call) {
+    if (call.path === BREVAR_AD && call.method === "POST") {
+      if (call.params.execution_options) validationAt = clock.Date.now(); else attachedAt = clock.Date.now();
+    }
+  } });
+  clock = h.clock;
+  const beforeJournal = structuredClone(h.journal);
+  const posts = postCalls(h).length, writes = h.runtime.storageWrites.length;
+  const preview = toolPayload(await h.invoke("meta_resume_brevar_ad_creative", resumeInput(h)));
+  assert.equal(preview.mode, "resume_preview"); assert.equal(postCalls(h).length, posts); assert.equal(h.runtime.storageWrites.length, writes);
+  const result = toolPayload(await h.invoke("meta_resume_brevar_ad_creative", { ...resumeInput(h), validate_only: false, confirmation_phrase: preview.required_confirmation }));
+  assert.equal(result.mode, "resumed"); assert.equal(result.verified, true); assert.equal(result.journal_stage_after, "COMPLETE");
+  assert.equal(h.state.ad.creative.id, BREVAR_NEW_CREATIVE); assert.equal(h.state.ad.status, "PAUSED");
+  assert.deepEqual(realCreativePosts(h).map(c => c.path), [BREVAR_AD]); assert.ok(attachedAt - validationAt >= 31000);
+  const saved = h.runtime.values.get(`brevar-creative:${REQUEST_ID}`);
+  assert.equal(saved.stage, "COMPLETE"); assert.equal(saved.fingerprint, beforeJournal.fingerprint);
+  assert.deepEqual(saved.before, beforeJournal.before); assert.deepEqual(saved.proposed, beforeJournal.proposed);
+  assert.equal(saved.creative_id, BREVAR_NEW_CREATIVE); assert.equal(h.runtime.values.has("lease"), false);
+});
+
+for (const [name, modify, override] of [
+  ["creative ID", () => {}, { creative_id: "989898" }],
+  ["fingerprint", () => {}, { expected_fingerprint: "e".repeat(64) }],
+  ["reviewed administrative name", () => {}, { expected_creative_name: "Different unseen label" }],
+  ["stage", () => {}, { expected_stage: "ATTACH_PENDING" }],
+  ["active ad", h => { h.state.ad.status = "ACTIVE"; }, {}],
+  ["headline", h => { h.state.newCreative.object_story_spec.link_data.name = "Altered headline"; }, {}],
+  ["image", h => { h.state.newCreative.object_story_spec.link_data.image_hash = "e".repeat(32); }, {}],
+  ["link", h => { h.state.newCreative.object_story_spec.link_data.link = "https://evil.example"; }, {}],
+  ["Page", h => { h.state.newCreative.object_story_spec.page_id = "555"; }, {}],
+  ["parent budget", h => { h.state.campaign.lifetime_budget = "90000"; }, {}],
+  ["parent age", h => { h.state.adset.targeting.age_max = 65; }, {}],
+]) {
+  test(`creative resume rejects ${name} drift without a POST or journal mutation`, async () => {
+    const h = await seededCreativeResume(); modify(h);
+    const posts = postCalls(h).length, writes = h.runtime.storageWrites.length;
+    const result = await h.invoke("meta_resume_brevar_ad_creative", resumeInput(h, override));
+    assert.equal(result.isError, true); assert.equal(postCalls(h).length, posts); assert.equal(h.runtime.storageWrites.length, writes);
+  });
+}
+
+test("creative resume re-reads the unattached created creative after its 31-second validation gap", async () => {
+  const h = await seededCreativeResume({ respond(call, state) {
+    if (call.path === BREVAR_AD && call.method === "POST" && call.params.execution_options) state.newCreative.object_story_spec.link_data.message = "Changed during validation";
+  } });
+  const result = await resumeConfirmed(h);
+  assert.equal(result.isError, true); assert.match(result.content[0].text, /Creative read-back mismatch/);
+  assert.equal(realCreativePosts(h).length, 0); assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "CREATIVE_CREATED");
+});
+
+test("ATTACH_PENDING with original creative never retries; already associated exact creative can only complete the journal", async () => {
+  const h = await seededCreativeResume();
+  h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage = "ATTACH_PENDING";
+  h.runtime.values.get(`brevar-creative-ad:${BREVAR_AD}`).stage = "ATTACH_PENDING";
+  const posts = postCalls(h).length;
+  const noAttach = await h.invoke("meta_resume_brevar_ad_creative", resumeInput(h, { expected_stage: "ATTACH_PENDING" }));
+  assert.equal(noAttach.isError, true); assert.match(noAttach.content[0].text, /ad.creative/); assert.equal(postCalls(h).length, posts);
+  h.state.ad.creative = { id: BREVAR_NEW_CREATIVE };
+  const result = toolPayload(await resumeConfirmed(h, { expected_stage: "ATTACH_PENDING" }));
+  assert.equal(result.mode, "reconciled_complete"); assert.equal(result.meta_write_performed, false);
+  assert.equal(postCalls(h).length, posts); assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "COMPLETE");
+});
+
+test("creative resume lost attachment response preserves intent and reconciles the same UUID without another POST", async () => {
+  let lose = true;
+  const h = await seededCreativeResume({ respond(call, state) {
+    if (lose && call.path === BREVAR_AD && call.method === "POST" && !call.params.execution_options) {
+      lose = false; state.ad.creative = { id: BREVAR_NEW_CREATIVE }; return { rawBody: "Lost response", httpStatus: 502 };
+    }
+  } });
+  const uncertain = await resumeConfirmed(h);
+  assert.equal(uncertain.isError, true); assert.match(uncertain.content[0].text, /ATTACH_PENDING/);
+  assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "ATTACH_PENDING");
+  h.clock.advance(11 * 60 * 1_000);
+  const posts = postCalls(h).length;
+  const recovered = toolPayload(await resumeConfirmed(h, { expected_stage: "ATTACH_PENDING" }));
+  assert.equal(recovered.mode, "reconciled_complete"); assert.equal(postCalls(h).length, posts);
+});
+
+test("normal creative replacement allows only administrative label rewriting while preserving the visible headline", async () => {
+  const h = await creativeReplacementHarness({ respond(call, state) {
+    if (call.path === BREVAR_NEW_CREATIVE && call.method === "GET") state.newCreative.name = "Meta rewritten administrative label";
+  } });
+  const result = toolPayload(await replaceCreative(h));
+  assert.equal(result.verified, true); assert.equal(result.administrative_name.matches, false);
+  assert.equal(result.after.creative.object_story_spec.link_data.name, creativeReplaceInput().headline);
 });
