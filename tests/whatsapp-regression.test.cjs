@@ -151,7 +151,7 @@ async function harness(options = {}) {
       if (name === "agents/mcp") return { McpAgent: MockAgent };
       if (name === "zod") return { z };
       if (name === "./access-handler") return { handleAccessRequest() { throw new Error("Authentication must not run."); } };
-      if (name === "./creative-assets") return { getCreativeAssetResponse() { return null; } };
+      if (name === "./creative-assets") return { getCreativeAssetResponse(request) { return options.creativeAssetResponse?.(request) ?? null; } };
       throw new Error(`Unexpected module in offline test: ${name}`);
     },
     fetch: mockFetch,
@@ -161,6 +161,8 @@ async function harness(options = {}) {
     Request,
     Response,
     AbortSignal,
+    TextEncoder,
+    btoa,
     Error,
     crypto: webcrypto,
     Date: options.clock?.Date ?? Date,
@@ -801,8 +803,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.7");
-  assert.equal(h.metadata.version, "2.3.7");
+  assert.equal(result.connector_version, "2.3.8");
+  assert.equal(h.metadata.version, "2.3.8");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -828,8 +830,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.7");
-  assert.equal(h.metadata.version, "2.3.7");
+  assert.equal(result.connector_version, "2.3.8");
+  assert.equal(h.metadata.version, "2.3.8");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1527,7 +1529,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.7");
+  assert.equal(result.connector_version, "2.3.8");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1601,7 +1603,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.7");
+  assert.equal(result.connector_version, "2.3.8");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1807,7 +1809,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.7");
+    assert.equal(result.connector_version, "2.3.8");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -2144,6 +2146,13 @@ function sharedStatusRuntime() {
       storage: {
         async get(key) { return structuredClone(values.get(key)); },
         async put(key, value) {
+          if (typeof key === "object") {
+            for (const [entryKey, entryValue] of Object.entries(key)) {
+              storageWrites.push({ action: "put", key: entryKey, value: structuredClone(entryValue) });
+              values.set(entryKey, structuredClone(entryValue));
+            }
+            return;
+          }
           storageWrites.push({ action: "put", key, value: structuredClone(value) });
           values.set(key, structuredClone(value));
         },
@@ -2838,4 +2847,830 @@ test("geo restriction fences an expired operation before dispatching the real PO
   assert.match(result.content[0].text, /WRITE_LEASE_EXPIRED/);
   assert.equal(realGeoPosts(p.runtime).length, 0);
   assert.equal(p.runtime.values.has("lease"), false);
+});
+
+// The BREVAR profile is tested as a user-visible contract: its eligible audience,
+// local delivery hours, immutable commercial settings, and write uncertainty.
+function brevarProfileFixture() {
+  const value = geoFixture();
+  delete value.lifetime_budget;
+  delete value.adset_schedule;
+  value.pacing_type = ["standard"];
+  value.optimization_goal = "CONVERSATIONS";
+  value.destination_type = "WHATSAPP";
+  value.start_time = "2026-09-04T08:00:00-0200";
+  value.end_time = "2026-10-02T23:59:00-0200";
+  value.targeting.genders = [2];
+  value.targeting.targeting_optimization = "none";
+  value.targeting.targeting_relaxation_types = { lookalike: 1, custom_audience: 1 };
+  value.targeting.excluded_geo_locations = {
+    countries: ["AR", "PY", "UY"],
+    regions: [{ key: "456", name: "Rio Grande do Sul", country: "BR" }, { key: "460", name: "Sao Paulo", country: "BR" }],
+    location_types: ["home", "recent"],
+  };
+  value.targeting_optimization_types = [{ key: "detailed_targeting", value: 0 }, { key: "lookalike", value: 0 }];
+  return value;
+}
+
+function brevarProfileInput(overrides = {}) {
+  return { adset_id: ADSET, expected_name: ADSET_NAME, expected_campaign_name: CAMPAIGN_NAME, ...overrides };
+}
+
+function brevarProfileRealInput(overrides = {}) {
+  const input = brevarProfileInput({ validate_only: false, ...overrides });
+  return {
+    ...input,
+    confirmation_phrase: `CONFIGURE BREVAR ADSET ${ADSET} SOUTH_BR PHYSICIANS_10 AGE 25 50 HOURS 06-23 AMERICA_SAO_PAULO${input.name ? " NAME " + input.name : ""}`,
+    ...overrides,
+  };
+}
+
+async function brevarProfilePair(options = {}) {
+  const runtime = sharedStatusRuntime();
+  const clock = statusTestClock();
+  const state = {
+    value: structuredClone(options.initial ?? brevarProfileFixture()),
+    campaign: structuredClone(options.campaign ?? { ...campaignFixture, status: "ACTIVE", effective_status: "ACTIVE", lifetime_budget: "70000", bid_strategy: "LOWEST_COST_WITHOUT_CAP", start_time: "2026-09-04T08:00:00-0200", stop_time: "2026-10-02T23:59:00-0200" }),
+    account: { id: `act_${ACCOUNT}`, account_id: ACCOUNT, account_status: 1, currency: "BRL", timezone_name: options.timezone ?? "America/Noronha" },
+  };
+  const initial = structuredClone(state);
+  const setup = {
+    sharedRuntime: runtime, clock, useGate: true,
+    async respond(call) {
+      const override = options.respond && await options.respond(call, state, runtime, clock);
+      if (override !== undefined) return override;
+      if (call.path === ADSET && call.method === "GET") return state.value;
+      if (call.path === CAMPAIGN && call.method === "GET") return state.campaign;
+      if (call.path === `act_${ACCOUNT}` && call.method === "GET") return state.account;
+      if (call.method === "POST") {
+        assert.equal(call.path, ADSET, "the profile must never write to its campaign or account");
+        const allowed = ["adset_schedule", "pacing_type", "targeting"];
+        if (call.params.name !== undefined) allowed.push("name");
+        if (call.params.execution_options !== undefined) {
+          allowed.push("execution_options");
+          assert.deepEqual(call.params.execution_options, ["validate_only"]);
+        }
+        assert.deepEqual(Object.keys(call.params).sort(), allowed.sort(), "profile updates cannot write budget, dates, destination, optimization or status");
+        assert.equal(Object.hasOwn(call.params.targeting, "targeting_optimization"), false, "removed legacy field must not be sent");
+        assert.equal(Object.hasOwn(call.params.targeting, "targeting_optimization_types"), false, "read-only expansion diagnostics cannot be sent as targeting");
+        if (!call.params.execution_options) {
+          for (const key of allowed) state.value[key] = structuredClone(call.params[key]);
+        }
+        return { success: true };
+      }
+    },
+  };
+  const first = await harness({ ...setup, sessionId: "brevar-profile-a" });
+  const second = await harness({ ...setup, sessionId: "brevar-profile-b" });
+  return { first, second, state, initial, runtime, clock };
+}
+
+function brevarProfilePosts(runtime) { return runtime.calls.filter(c => c.method === "POST" && c.path === ADSET); }
+function brevarProfileRealPosts(runtime) { return brevarProfilePosts(runtime).filter(c => !c.params.execution_options); }
+
+function assertBrevarSchedule(schedule, start, end) {
+  assert.ok(Array.isArray(schedule) && schedule.length > 0);
+  const actual = new Map();
+  for (const window of schedule) {
+    assert.equal(window.timezone_type, "ADVERTISER");
+    assert.equal(window.start_minute, start);
+    assert.equal(window.end_minute, end);
+    for (const day of window.days) {
+      assert.ok(Number.isInteger(day) && day >= 0 && day <= 6);
+      assert.equal(actual.has(day), false, "delivery windows must not overlap on any day");
+      actual.set(day, true);
+    }
+  }
+  assert.deepEqual([...actual.keys()].sort(), [0, 1, 2, 3, 4, 5, 6]);
+}
+
+test("BREVAR profile defaults to validation and proves the complete ad set and parent unchanged", async () => {
+  const p = await brevarProfilePair();
+  const result = toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileInput()));
+  assert.equal(result.mode, "validate_only");
+  assert.equal(result.verified_unchanged, true);
+  assert.equal(result.required_confirmation, brevarProfileRealInput().confirmation_phrase);
+  assert.deepEqual(p.state, p.initial);
+  assert.equal(brevarProfilePosts(p.runtime).length, 1);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+  for (const path of [ADSET, CAMPAIGN, `act_${ACCOUNT}`]) {
+    assert.ok(p.runtime.calls.filter(c => c.method === "GET" && c.path === path).length >= 2, `${path} must be re-read after Meta validation`);
+  }
+});
+
+for (const timezone of ["America/Noronha", "America/Sao_Paulo"]) test(`BREVAR profile preserves the CBO lifetime cap and maps 06-23 Brasilia to ${timezone}`, async () => {
+  const p = await brevarProfilePair({ timezone });
+  const result = toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput()));
+  assert.equal(result.verified, true);
+  assert.equal(result.mode, "updated");
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 1);
+  const post = brevarProfileRealPosts(p.runtime)[0].params;
+  assertBrevarSchedule(post.adset_schedule, timezone === "America/Noronha" ? 420 : 360, timezone === "America/Noronha" ? 1440 : 1380);
+  assert.ok(post.pacing_type.includes("day_parting"));
+  assert.ok(post.pacing_type.includes("standard"), "other existing pacing flags survive");
+  assert.equal(post.targeting.age_min, 25);
+  assert.equal(post.targeting.age_max, 50);
+  assert.equal(post.targeting.user_age_unknown, false);
+  assert.ok(post.targeting.genders === undefined || post.targeting.genders.length === 0 || JSON.stringify(post.targeting.genders.slice().sort()) === "[1,2]", "the audience includes both sexes");
+  assert.deepEqual(post.targeting.geo_locations.regions.map(r => String(r.key)).sort(), ["452", "456", "459"]);
+  assert.equal(post.targeting.geo_locations.countries, undefined);
+  assert.deepEqual(post.targeting.geo_locations.location_types, p.initial.value.targeting.geo_locations.location_types);
+  assert.deepEqual(post.targeting.excluded_geo_locations.countries, ["AR", "PY", "UY"]);
+  assert.deepEqual(post.targeting.excluded_geo_locations.regions, [{ key: "460", name: "Sao Paulo", country: "BR" }]);
+  assert.equal(post.targeting.targeting_automation.advantage_audience, 0);
+  assert.equal(post.targeting.targeting_automation.individual_setting.geo, 0);
+  assert.equal(post.targeting.targeting_automation.individual_setting.age, 0);
+  assert.equal(post.targeting.targeting_relaxation_types.lookalike, 0);
+  assert.equal(post.targeting.targeting_relaxation_types.custom_audience, 0);
+  assert.equal(post.targeting.flexible_spec.length, 1);
+  assert.deepEqual(Object.keys(post.targeting.flexible_spec[0]), ["work_positions"]);
+  assert.equal(post.targeting.flexible_spec[0].work_positions.length, 10);
+  assert.equal(new Set(post.targeting.flexible_spec[0].work_positions.map(p => p.id)).size, 10);
+  assert.deepEqual(post.targeting.flexible_spec[0].work_positions.map(p => p.id).sort(), [
+    "125395097503911", "138787906146791", "1423257317968087", "1597521383816555", "359815664202923",
+    "588508654618832", "649354901854686", "761820927245398", "896416657056805", "941373515875427",
+  ].sort());
+  assert.deepEqual(post.targeting.publisher_platforms, p.initial.value.targeting.publisher_platforms);
+  for (const field of ["status", "campaign_id", "lifetime_budget", "daily_budget", "optimization_goal", "destination_type", "promoted_object", "start_time", "end_time", "billing_event", "bid_strategy", "bid_amount"]) {
+    assert.deepEqual(p.state.value[field], p.initial.value[field], field + " must remain unchanged");
+  }
+  assert.deepEqual(p.state.campaign, p.initial.campaign);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("BREVAR profile permits existing ABO lifetime budget and an explicitly confirmed rename without changing configured pause", async () => {
+  const initial = brevarProfileFixture();
+  initial.lifetime_budget = "40000";
+  initial.status = "PAUSED";
+  initial.effective_status = "PAUSED";
+  const campaign = { ...campaignFixture };
+  const name = "BREVAR | MEDICOS 25-50 | SUL | 06-23";
+  const p = await brevarProfilePair({ initial, campaign });
+  const result = toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput({ name })));
+  assert.equal(result.verified, true);
+  assert.equal(p.state.value.name, name);
+  assert.equal(p.state.value.lifetime_budget, "40000");
+  assert.equal(p.state.value.status, "PAUSED");
+  assert.deepEqual(p.state.campaign, campaign);
+  assert.equal(p.runtime.calls.some(c => c.method === "POST" && c.path !== ADSET), false);
+});
+
+for (const [label, amend] of [
+  ["daily CBO budget", s => { delete s.campaign.lifetime_budget; s.campaign.daily_budget = "2000"; }],
+  ["daily ABO budget", s => { delete s.campaign.lifetime_budget; s.value.daily_budget = "2000"; }],
+  ["missing lifetime budget", s => { delete s.campaign.lifetime_budget; }],
+  ["competing CBO and ABO lifetime budgets", s => { s.value.lifetime_budget = "40000"; }],
+  ["expired end date", s => { s.value.end_time = "2026-09-11T22:00:00-0300"; }],
+  ["expired parent end date", s => { s.campaign.stop_time = "2026-09-11T22:00:00-0300"; }],
+  ["unsupported account timezone", s => { s.account.timezone_name = "UTC"; }],
+  ["different course parent", s => { s.campaign.name = "ATLS isolated campaign"; }],
+  ["stale parent name", s => { s.campaign.name = "BREVAR changed campaign"; }],
+  ["wrong ad set account", s => { s.value.account_id = "999999"; }],
+  ["wrong parent account", s => { s.campaign.account_id = "999999"; }],
+  ["archived ad set", s => { s.value.status = "ARCHIVED"; }],
+  ["missing detailed expansion proof", s => { s.value.targeting_optimization_types = [{ key: "lookalike", value: 0 }]; }],
+  ["lookalike expansion enabled", s => { s.value.targeting_optimization_types = [{ key: "detailed_targeting", value: 0 }, { key: "lookalike", value: 1 }]; }],
+  ["Brazil excluded", s => { s.value.targeting.excluded_geo_locations.countries.push("BR"); }],
+  ["accelerated pacing", s => { s.value.pacing_type = ["no_pacing"]; }],
+]) test("BREVAR profile refuses " + label + " before validation without changing any object", async () => {
+  const p = await brevarProfilePair();
+  amend(p.state);
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput());
+  assert.equal(result.isError, true);
+  assert.equal(brevarProfilePosts(p.runtime).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("BREVAR profile checks the write switch and exact rename confirmation before reads or locking", async () => {
+  const h = await harness({ env: { META_WRITE_ENABLED: "false" } });
+  const disabled = await h.invoke("meta_configure_brevar_adset", brevarProfileInput());
+  assert.equal(disabled.isError, true);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.lockCalls.length, 0);
+  const p = await brevarProfilePair();
+  const mismatch = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput({ name: "BREVAR renamed", confirmation_phrase: brevarProfileRealInput().confirmation_phrase }));
+  assert.equal(mismatch.isError, true);
+  assert.equal(p.runtime.calls.length, 0);
+  assert.equal(p.runtime.lockCalls.length, 0);
+});
+
+test("BREVAR profile reports Instagram native editing restriction 1991005 and stops after one validation", async () => {
+  const p = await brevarProfilePair({ respond(call) {
+    if (call.method === "POST") return { httpStatus: 400, body: { error: { message: "Editing boosted Instagram posts is only allowed in the Instagram app", code: 10, error_subcode: 1991005, type: "OAuthException" } } };
+  } });
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /1991005/);
+  assert.equal(brevarProfilePosts(p.runtime).length, 1);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 0);
+  assert.deepEqual(p.state, p.initial);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+for (const [label, amend] of [
+  ["parent budget", s => { s.campaign.lifetime_budget = "80000"; }],
+  ["parent configured status", s => { s.campaign.status = "PAUSED"; }],
+  ["ad set targeting", s => { s.value.targeting.age_max = 64; }],
+  ["account timezone", s => { s.account.timezone_name = "America/Sao_Paulo"; }],
+]) test("BREVAR profile rejects concurrent " + label + " change after validation before its real write", async () => {
+  let validated = false;
+  const p = await brevarProfilePair({ respond(call, state) {
+    if (call.path === ADSET && call.params.execution_options) validated = true;
+    if (call.method === "GET" && validated) { amend(state); validated = false; }
+  } });
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput());
+  assert.equal(result.isError, true);
+  assert.equal(brevarProfilePosts(p.runtime).length, 1);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+for (const [label, drift] of [
+  ["age", s => { s.value.targeting.age_max = 65; }],
+  ["medical profession", s => { s.value.targeting.flexible_spec[0].work_positions.pop(); }],
+  ["geographic expansion", s => { s.value.targeting.targeting_automation.individual_setting.geo = 1; }],
+  ["detailed expansion", s => { s.value.targeting_optimization_types = [{ key: "detailed_targeting", value: 1 }, { key: "lookalike", value: 0 }]; }],
+  ["missing expansion proof", s => { delete s.value.targeting_optimization_types; }],
+  ["daily schedule", s => { s.value.adset_schedule[0].start_minute += 60; }],
+  ["configured status", s => { s.value.status = "PAUSED"; }],
+  ["parent lifetime budget", s => { s.campaign.lifetime_budget = "80000"; }],
+]) test("BREVAR profile retains its lease after post-write " + label + " drift and never retries or rolls back", async () => {
+  let posted = false;
+  const p = await brevarProfilePair({ respond(call, state) {
+    if (call.method === "POST" && call.path === ADSET && !call.params.execution_options) posted = true;
+    if (call.method === "GET" && posted) { drift(state); posted = false; }
+  } });
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 1);
+  assertStatusLeaseRetained(p.runtime, p.clock);
+});
+
+test("BREVAR profile retains its lease when a real mutation loses its response without repeating the POST", async () => {
+  const p = await brevarProfilePair({ respond(call) {
+    if (call.path === ADSET && call.method === "POST" && !call.params.execution_options) throw new Error("Offline lost mutation response");
+  } });
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 1);
+  assertStatusLeaseRetained(p.runtime, p.clock);
+});
+
+test("BREVAR profile prevents overlapping transports before the competitor can read Graph", async () => {
+  const entered = statusDeferred();
+  const resume = statusDeferred();
+  let first = true;
+  const p = await brevarProfilePair({ async respond(call) {
+    if (call.path === ADSET && call.params.execution_options && first) {
+      first = false;
+      entered.resolve();
+      await resume.promise;
+    }
+  } });
+  const running = p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput());
+  await entered.promise;
+  const count = p.runtime.calls.length;
+  const competing = await p.second.invoke("meta_configure_brevar_adset", brevarProfileRealInput());
+  assert.equal(competing.isError, true);
+  assert.match(competing.content[0].text, /WRITE_LOCKED/);
+  assert.equal(p.runtime.calls.length, count);
+  resume.resolve();
+  assert.equal(toolPayload(await running).verified, true);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 1);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("BREVAR profile fences lease expiry after validation before a real Graph POST", async () => {
+  let validated = false;
+  const p = await brevarProfilePair({ respond(call, _state, _runtime, clock) {
+    if (call.path === ADSET && call.params.execution_options) validated = true;
+    if (call.method === "GET" && validated) { clock.advance(600001); validated = false; }
+  } });
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_LEASE_EXPIRED/);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("BREVAR profile replaces old student/interests/age-range targeting with the sole medical job clause", async () => {
+  const initial = brevarProfileFixture();
+  initial.targeting.age_range = [24, 65];
+  initial.targeting.interests = [{ id: "800001", name: "Medicine interest" }];
+  initial.targeting.education_majors = [{ id: "800002", name: "Medicine students" }];
+  initial.targeting.education_statuses = [1, 2];
+  initial.targeting.flexible_spec = [{ interests: [{ id: "800003" }], education_majors: [{ id: "800004" }] }];
+  const p = await brevarProfilePair({ initial });
+  const result = toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput()));
+  assert.equal(result.verified, true);
+  const written = brevarProfileRealPosts(p.runtime)[0].params.targeting;
+  for (const field of ["age_range", "interests", "education_majors", "education_statuses"]) assert.equal(Object.hasOwn(written, field), false);
+  assert.deepEqual(Object.keys(written.flexible_spec[0]), ["work_positions"]);
+  assert.equal(written.flexible_spec[0].work_positions.length, 10);
+});
+
+test("BREVAR profile accepts equivalent display names, week-window splitting and effective review status, then performs a no-op", async () => {
+  let posted = false;
+  const p = await brevarProfilePair({ respond(call, state) {
+    if (call.path === ADSET && call.method === "POST" && !call.params.execution_options) posted = true;
+    if (call.path === ADSET && call.method === "GET" && posted) {
+      posted = false;
+      state.value.targeting.genders = [0];
+      state.value.targeting.geo_locations.regions = state.value.targeting.geo_locations.regions.map(r => ({ ...r, country: "BR", name: "Localized region " + r.key })).reverse();
+      state.value.targeting.flexible_spec[0].work_positions = state.value.targeting.flexible_spec[0].work_positions.map(p => ({ ...p, name: "Localized profession " + p.id })).reverse();
+      const window = state.value.adset_schedule[0];
+      state.value.adset_schedule = window.days.map(day => ({ ...window, days: [day] })).reverse();
+      state.value.effective_status = "IN_PROCESS";
+      state.campaign.effective_status = "IN_PROCESS";
+      return state.value;
+    }
+  } });
+  const result = toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput()));
+  assert.equal(result.verified, true);
+  assert.equal(result.after.status, "ACTIVE");
+  assert.equal(result.after.effective_status, "IN_PROCESS");
+  assert.equal(p.runtime.values.has("lease"), false);
+  const beforeRepeating = brevarProfilePosts(p.runtime).length;
+  const repeated = toolPayload(await p.second.invoke("meta_configure_brevar_adset", brevarProfileRealInput()));
+  assert.equal(repeated.mode, "no_change");
+  assert.equal(repeated.verified, true);
+  assert.equal(brevarProfilePosts(p.runtime).length, beforeRepeating, "an equivalent profile needs no validation or mutation POST");
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("BREVAR profile does not introduce an unsupported individual age setting when absent", async () => {
+  const initial = brevarProfileFixture();
+  delete initial.targeting.targeting_automation.individual_setting.age;
+  const p = await brevarProfilePair({ initial });
+  const result = toolPayload(await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput()));
+  assert.equal(result.verified, true);
+  assert.equal(brevarProfileRealPosts(p.runtime).length, 1);
+  for (const post of brevarProfilePosts(p.runtime)) {
+    assert.equal(Object.hasOwn(post.params.targeting.targeting_automation.individual_setting, "age"), false);
+    assert.equal(post.params.targeting.age_min, 25);
+    assert.equal(post.params.targeting.age_max, 50);
+    assert.equal(post.params.targeting.user_age_unknown, false);
+  }
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("BREVAR profile rejects an existing enabled individual age expansion before any POST", async () => {
+  const initial = brevarProfileFixture();
+  initial.targeting.targeting_automation.individual_setting.age = 1;
+  const p = await brevarProfilePair({ initial });
+  const result = await p.first.invoke("meta_configure_brevar_adset", brevarProfileRealInput());
+  assert.equal(result.isError, true);
+  assert.equal(brevarProfilePosts(p.runtime).length, 0);
+  assert.deepEqual(p.state, p.initial);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+
+// BREVAR replacement runs the actual durable lock/journal. No Meta request,
+// production credential, real network, or external object is used by these tests.
+const BREVAR_AD = "900090";
+const BREVAR_OLD_CREATIVE = "900091";
+const BREVAR_NEW_CREATIVE = "900092";
+const BREVAR_PAGE = "102139681237405";
+const BREVAR_PHONE = "554791822809";
+const BREVAR_IMAGE_HASH = "a".repeat(32);
+function creativeReplaceInput(overrides = {}) {
+  return { ad_id: BREVAR_AD, expected_name: "BREVAR | CONVITE | V1", message: "Treinamento supervisionado para médicos e médicas. Blumenau, 3 de outubro.", headline: "BREVAR em Blumenau", description: "Livro físico e prática supervisionada", image_hash: BREVAR_IMAGE_HASH, link_url: `https://wa.me/${BREVAR_PHONE}?text=Tenho%20interesse`, request_id: REQUEST_ID, ...overrides };
+}
+async function creativeReplacementHarness(options = {}) {
+  const clock = options.clock ?? statusTestClock();
+  const runtime = options.runtime ?? sharedStatusRuntime();
+  const state = options.state ?? {
+    ad: { id: BREVAR_AD, account_id: ACCOUNT, name: "BREVAR | CONVITE | V1", adset_id: ADSET, campaign_id: CAMPAIGN, status: "PAUSED", effective_status: "WITH_ISSUES", creative: { id: BREVAR_OLD_CREATIVE }, tracking_specs: [{ "action.type": ["offsite_conversion"] }] },
+    adset: { ...ageFixture(), destination_type: "WHATSAPP", optimization_goal: "CONVERSATIONS", promoted_object: { page_id: BREVAR_PAGE, whatsapp_phone_number: BREVAR_PHONE } },
+    campaign: { ...campaignFixture, lifetime_budget: "70000", stop_time: "2026-10-02T23:59:00-0200" },
+    oldCreative: { id: BREVAR_OLD_CREATIVE, account_id: ACCOUNT, name: "Old creative", object_story_spec: { page_id: BREVAR_PAGE, instagram_actor_id: "102009001", link_data: { image_hash: "b".repeat(32), message: "Médicos e acadêmicos", name: "BREVAR", link: `https://wa.me/${BREVAR_PHONE}`, call_to_action: { type: "WHATSAPP_MESSAGE", value: { link: `https://wa.me/${BREVAR_PHONE}`, app_destination: "WHATSAPP" } } } }, url_tags: "utm_source=meta" },
+    newCreative: null,
+  };
+  if (options.adjustState) options.adjustState(state);
+  const h = await harness({ useGate: true, clock, sharedRuntime: runtime, writeLockRespond: options.writeLockRespond, respond: async (call) => {
+    const override = options.respond && await options.respond(call, state);
+    if (override !== undefined) return override;
+    if (call.method === "GET" && call.path === BREVAR_AD) return structuredClone(state.ad);
+    if (call.method === "GET" && call.path === ADSET) return structuredClone(state.adset);
+    if (call.method === "GET" && call.path === CAMPAIGN) return structuredClone(state.campaign);
+    if (call.method === "GET" && call.path === BREVAR_OLD_CREATIVE) return structuredClone(state.oldCreative);
+    if (call.method === "GET" && call.path === BREVAR_NEW_CREATIVE) return structuredClone(state.newCreative);
+    if (call.method === "GET" && call.path === `act_${ACCOUNT}/adimages`) return { data: [{ hash: BREVAR_IMAGE_HASH }] };
+    if (call.method === "POST" && call.path === `act_${ACCOUNT}/adcreatives`) {
+      state.newCreative = { ...structuredClone(call.params), id: BREVAR_NEW_CREATIVE, account_id: ACCOUNT };
+      return { id: BREVAR_NEW_CREATIVE };
+    }
+    if (call.method === "POST" && call.path === BREVAR_AD && !call.params.execution_options) {
+      state.ad.creative = { id: BREVAR_NEW_CREATIVE };
+      state.ad.effective_status = "PENDING_REVIEW";
+      if (options.afterAttach) options.afterAttach(state);
+      return { success: true };
+    }
+    if (call.method === "POST") return { success: true };
+  } });
+  return { ...h, state, clock, runtime };
+}
+async function replaceCreative(h, overrides = {}) {
+  const input = creativeReplaceInput(overrides);
+  const preview = toolPayload(await h.invoke("meta_update_brevar_ad_creative", input));
+  return h.invoke("meta_update_brevar_ad_creative", { ...input, validate_only: false, confirmation_phrase: preview.required_confirmation });
+}
+function realCreativePosts(h) { return postCalls(h).filter((call) => !call.params.execution_options); }
+
+test("creative replacement defaults to inline-only validation and verifies the complete hierarchy without creating anything", async () => {
+  const h = await creativeReplacementHarness();
+  const result = toolPayload(await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput()));
+  assert.equal(result.mode, "validate_only"); assert.equal(result.verified_unchanged, true);
+  assert.equal(result.proposed.object_story_spec.link_data.call_to_action.type, "WHATSAPP_MESSAGE");
+  assert.deepEqual(result.proposed.object_story_spec.link_data.call_to_action.value, { app_destination: "WHATSAPP", link: creativeReplaceInput().link_url });
+  assert.equal(result.proposed.object_story_spec.instagram_actor_id, "102009001");
+  assert.deepEqual(postCalls(h).map((call) => [call.path, call.params.execution_options]), [[`act_${ACCOUNT}/ads`, ["validate_only"]]]);
+  assert.equal(realCreativePosts(h).length, 0);
+  assert.equal(h.runtime.values.has(`brevar-creative:${REQUEST_ID}`), false);
+  assert.equal(h.runtime.values.has("lease"), false);
+});
+
+test("creative replacement updates the existing ad ID only and replay verifies current settings with zero POSTs", async () => {
+  const h = await creativeReplacementHarness();
+  const before = structuredClone(h.state);
+  const preview = toolPayload(await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput()));
+  const input = creativeReplaceInput({ validate_only: false, confirmation_phrase: preview.required_confirmation });
+  const result = toolPayload(await h.invoke("meta_update_brevar_ad_creative", input));
+  assert.equal(result.verified, true); assert.equal(result.ad_id, BREVAR_AD); assert.equal(result.creative_id, BREVAR_NEW_CREATIVE);
+  assert.deepEqual(h.state.adset, before.adset); assert.deepEqual(h.state.campaign, before.campaign);
+  assert.equal(h.state.ad.status, "PAUSED");
+  assert.deepEqual(realCreativePosts(h).map((c) => c.path), [`act_${ACCOUNT}/adcreatives`, BREVAR_AD]);
+  assert.deepEqual(Object.keys(realCreativePosts(h)[1].params), ["creative"]);
+  assert.deepEqual(realCreativePosts(h)[1].params.creative, { creative_id: BREVAR_NEW_CREATIVE });
+  assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "COMPLETE");
+  assert.equal(h.runtime.values.get(`brevar-creative-ad:${BREVAR_AD}`).stage, "COMPLETE");
+  assert.equal(h.runtime.values.has("lease"), false);
+  const posts = postCalls(h).length;
+  const replay = toolPayload(await h.invoke("meta_update_brevar_ad_creative", input));
+  assert.equal(replay.mode, "idempotent_replay"); assert.equal(replay.verified, true);
+  assert.equal(postCalls(h).length, posts);
+});
+
+for (const [name, adjustment, inputOverride, error] of [
+  ["active ads", s => { s.ad.status = "ACTIVE"; }, {}, /configured PAUSED/],
+  ["other courses", s => { s.ad.name = "ATLS"; s.campaign.name = "ATLS"; }, { expected_name: "ATLS" }, /limited to.*BREVAR/],
+  ["native Instagram boosts", s => { s.oldCreative.source_instagram_media_id = "1028"; }, {}, /native workflow/],
+  ["existing posts", s => { s.oldCreative.object_story_id = `${BREVAR_PAGE}_12`; }, {}, /native workflow/],
+  ["wrong WhatsApp phone", () => {}, { link_url: "https://wa.me/5599999999999" }, /approved BREVAR phone/],
+  ["non-approved site", s => { s.adset.destination_type = "ON_POST"; s.adset.optimization_goal = "POST_ENGAGEMENT"; }, { link_url: "https://evil.example/produtos/72/curso-brevar-fundamentos-t04-blumenau-sc/" }, /approved BREVAR course URL/],
+  ["foreign ad accounts", s => { s.ad.account_id = "3"; }, {}, /does not belong/],
+  ["foreign creatives", s => { s.oldCreative.account_id = "3"; }, {}, /Creative identity or account/],
+  ["wrong Page", s => { s.oldCreative.object_story_spec.page_id = "3"; }, {}, /Stoicus Page/],
+]) {
+  test(`creative replacement refuses ${name} before any POST`, async () => {
+    const h = await creativeReplacementHarness({ adjustState: adjustment });
+    const result = await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput(inputOverride));
+    assert.equal(result.isError, true); assert.match(result.content[0].text, error);
+    assert.equal(postCalls(h).length, 0); assert.equal(h.runtime.values.has("lease"), false);
+  });
+}
+
+test("creative replacement on-post uses the approved site, preserves Instagram identity and disables no settings", async () => {
+  const h = await creativeReplacementHarness({ adjustState(s) { s.adset.destination_type = "ON_POST"; s.adset.optimization_goal = "POST_ENGAGEMENT"; } });
+  const result = toolPayload(await replaceCreative(h, { link_url: "https://www.stoicus.com.br/produtos/72/curso-brevar-fundamentos-t04-blumenau-sc/?utm_source=meta" }));
+  assert.equal(result.verified, true);
+  assert.equal(result.proposed.object_story_spec.link_data.call_to_action.type, "LEARN_MORE");
+  assert.equal(result.proposed.url_tags, h.state.oldCreative.url_tags);
+});
+
+test("creative replacement rejects an unowned image hash and a failed Meta validation without any create", async () => {
+  for (const phase of ["image", "validation"]) {
+    const h = await creativeReplacementHarness({ respond(call) {
+      if (phase === "image" && call.path.endsWith("/adimages")) return { data: [] };
+      if (phase === "validation" && call.method === "POST") return { success: false };
+    } });
+    const result = await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput());
+    assert.equal(result.isError, true); assert.equal(realCreativePosts(h).length, 0);
+    assert.equal(h.runtime.values.has("lease"), false);
+  }
+});
+
+test("creative replacement detects parent targeting drift after validation before creating a creative", async () => {
+  const h = await creativeReplacementHarness({ respond(call, state) {
+    if (call.path === `act_${ACCOUNT}/ads` && call.method === "POST") state.adset.targeting.age_max = 65;
+  } });
+  const result = await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput());
+  assert.equal(result.isError, true); assert.match(result.content[0].text, /adset.targeting/);
+  assert.equal(realCreativePosts(h).length, 0);
+});
+
+test("creative replacement detects concurrent parent budget change after create and never attaches", async () => {
+  const h = await creativeReplacementHarness({ respond(call, state) {
+    if (call.path === BREVAR_NEW_CREATIVE && call.method === "GET") state.campaign.lifetime_budget = "90000";
+  } });
+  const result = await replaceCreative(h);
+  assert.equal(result.isError, true); assert.match(result.content[0].text, /RECONCILIATION_REQUIRED.*CREATIVE_CREATED/s);
+  assert.equal(realCreativePosts(h).length, 1);
+  assert.equal(h.state.ad.creative.id, BREVAR_OLD_CREATIVE);
+  assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "CREATIVE_CREATED");
+  assert.equal(h.runtime.values.has("lease"), true);
+});
+
+test("creative create outcome uncertainty blocks the same and a different request ID after lease expiry", async () => {
+  const h = await creativeReplacementHarness({ respond(call) {
+    if (call.path.endsWith("/adcreatives") && call.method === "POST") return { rawBody: "unconfirmed", httpStatus: 502 };
+  } });
+  const result = await replaceCreative(h);
+  assert.equal(result.isError, true); assert.match(result.content[0].text, /RECONCILIATION_REQUIRED.*CREATE_PENDING/s);
+  assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "CREATE_PENDING");
+  const posts = postCalls(h).length;
+  h.clock.advance(11 * 60 * 1_000);
+  const same = await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput());
+  assert.equal(same.isError, true); assert.match(same.content[0].text, /CREATE_PENDING/);
+  const other = await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput({ request_id: "22345678-1234-4234-9234-123456789012" }));
+  assert.equal(other.isError, true); assert.match(other.content[0].text, /different request_id cannot bypass/);
+  assert.equal(postCalls(h).length, posts);
+});
+
+test("creative attachment uncertainty leaves durable attachment intent and never repeats attachment", async () => {
+  const h = await creativeReplacementHarness({ afterAttach(state) { state.ad.status = "ACTIVE"; } });
+  const result = await replaceCreative(h);
+  assert.equal(result.isError, true); assert.match(result.content[0].text, /RECONCILIATION_REQUIRED.*ATTACH_PENDING/s);
+  assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "ATTACH_PENDING");
+  const posts = postCalls(h).length;
+  h.clock.advance(11 * 60 * 1_000);
+  const replay = await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput());
+  assert.equal(replay.isError, true); assert.match(replay.content[0].text, /ATTACH_PENDING/);
+  assert.equal(postCalls(h).length, posts);
+});
+
+test("creative replay rejects changed input or externally changed completed ad instead of silently succeeding", async () => {
+  const h = await creativeReplacementHarness();
+  toolPayload(await replaceCreative(h));
+  const posts = postCalls(h).length;
+  const reused = await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput({ headline: "Different" }));
+  assert.equal(reused.isError, true); assert.match(reused.content[0].text, /different creative inputs/);
+  h.state.ad.creative = { id: BREVAR_OLD_CREATIVE };
+  const drift = await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput());
+  assert.equal(drift.isError, true); assert.match(drift.content[0].text, /current settings: ad.creative/);
+  assert.equal(postCalls(h).length, posts);
+});
+
+test("creative final readback checks contents, not just attached creative ID", async () => {
+  const h = await creativeReplacementHarness({ afterAttach(state) { state.newCreative.object_story_spec.link_data.message = "Unexpected changed content"; } });
+  const result = await replaceCreative(h);
+  assert.equal(result.isError, true); assert.match(result.content[0].text, /Creative read-back mismatch: object_story_spec/);
+  assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "ATTACH_PENDING");
+});
+
+
+test("creative replacement removes the academic welcome flow and stale caption, retaining the approved wa.me prefill", async () => {
+  const h = await creativeReplacementHarness({ adjustState(s) {
+    s.oldCreative.object_story_spec.link_data.page_welcome_message = "Informe nome, email; médicos e acadêmicos";
+    s.oldCreative.object_story_spec.link_data.caption = "Meio-Oeste exclusivo";
+  } });
+  const result = toolPayload(await replaceCreative(h));
+  assert.equal(Object.hasOwn(result.proposed.object_story_spec.link_data, "page_welcome_message"), false);
+  assert.equal(Object.hasOwn(result.proposed.object_story_spec.link_data, "caption"), false);
+  assert.equal(result.proposed.object_story_spec.link_data.link, creativeReplaceInput().link_url);
+});
+
+test("creative journal save failure after creation prevents attachment and any subsequent duplicate create", async () => {
+  const h = await creativeReplacementHarness({ writeLockRespond(call) {
+    if (call.payload.action === "creative_journal_put" && call.payload.expected_stage === "CREATE_PENDING") {
+      return { httpStatus: 503, body: { code: "SIMULATED_STORAGE_UNAVAILABLE" } };
+    }
+  } });
+  const result = await replaceCreative(h);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, new RegExp(`CREATE_PENDING, creative ${BREVAR_NEW_CREATIVE}`));
+  assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "CREATE_PENDING");
+  assert.equal(realCreativePosts(h).length, 1);
+  h.clock.advance(11 * 60 * 1_000);
+  const replay = await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput());
+  assert.equal(replay.isError, true); assert.match(replay.content[0].text, /CREATE_PENDING/);
+  assert.equal(realCreativePosts(h).length, 1);
+});
+
+test("creative replacement checks the original ad again after attachment validation to prevent a concurrent creative overwrite", async () => {
+  const h = await creativeReplacementHarness({ respond(call, state) {
+    if (call.path === BREVAR_AD && call.method === "POST" && call.params.execution_options) state.ad.name = "Externally renamed";
+  } });
+  const result = await replaceCreative(h);
+  assert.equal(result.isError, true); assert.match(result.content[0].text, /ad.name/);
+  assert.equal(realCreativePosts(h).length, 1); assert.equal(h.state.ad.creative.id, BREVAR_OLD_CREATIVE);
+  assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "CREATIVE_CREATED");
+});
+
+test("creative replacement never attaches when its operation lease expires after creative creation", async () => {
+  let clock;
+  const h = await creativeReplacementHarness({ respond(call) {
+    if (call.method === "GET" && call.path === BREVAR_NEW_CREATIVE) clock.advance(11 * 60 * 1_000);
+  } });
+  clock = h.clock;
+  const result = await replaceCreative(h);
+  assert.equal(result.isError, true); assert.match(result.content[0].text, /RECONCILIATION_REQUIRED/);
+  assert.equal(realCreativePosts(h).length, 1);
+  assert.equal(h.runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "CREATIVE_CREATED");
+});
+
+test("creative replacement operation lease excludes a second chat during creative creation", async () => {
+  let signalEntered, resolveCreate;
+  const entered = new Promise(resolve => { signalEntered = resolve; });
+  const blocked = new Promise(resolve => { resolveCreate = resolve; });
+  const h = await creativeReplacementHarness({ respond: async call => {
+    if (call.method === "POST" && call.path.endsWith("/adcreatives")) { signalEntered(); await blocked; }
+  } });
+  const preview = toolPayload(await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput()));
+  const input = creativeReplaceInput({ validate_only: false, confirmation_phrase: preview.required_confirmation });
+  const otherInput = creativeReplaceInput({ request_id: "22345678-1234-4234-9234-123456789012" });
+  const otherPreview = toolPayload(await h.invoke("meta_update_brevar_ad_creative", otherInput));
+  const first = h.invoke("meta_update_brevar_ad_creative", input);
+  await entered;
+  const other = await creativeReplacementHarness({ clock: h.clock, runtime: h.runtime, state: h.state });
+  const second = await other.invoke("meta_update_brevar_ad_creative", input);
+  assert.equal(second.isError, true); assert.match(second.content[0].text, /WRITE_LOCKED/);
+  const differentId = await other.invoke("meta_update_brevar_ad_creative", { ...otherInput, validate_only: false, confirmation_phrase: otherPreview.required_confirmation });
+  assert.equal(differentId.isError, true); assert.match(differentId.content[0].text, /WRITE_LOCKED/);
+  resolveCreate();
+  const completed = toolPayload(await first);
+  assert.equal(completed.verified, true);
+  assert.deepEqual(realCreativePosts(h).map(c => c.path), [`act_${ACCOUNT}/adcreatives`, BREVAR_AD]);
+});
+
+
+test("creative create gate denial is explicitly no-dispatch but retains durable intent for reconciliation", async () => {
+  let runtime;
+  const h = await creativeReplacementHarness({ writeLockRespond(call) {
+    if (call.payload.action === "assert_owner" && runtime.values.get(`brevar-creative:${REQUEST_ID}`)?.stage === "CREATE_PENDING") {
+      return { httpStatus: 409, body: { code: "WRITE_LEASE_EXPIRED" } };
+    }
+  } });
+  runtime = h.runtime;
+  const result = await replaceCreative(h);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /gate confirmed no creative-create POST was dispatched/);
+  assert.equal(realCreativePosts(h).length, 0);
+  assert.equal(runtime.values.get(`brevar-creative:${REQUEST_ID}`).stage, "CREATE_PENDING");
+});
+
+test("creative journal rejects stale operation holders after lease takeover and rejects skipped stages", async () => {
+  const h = await creativeReplacementHarness();
+  toolPayload(await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput()));
+  const call = payload => h.runtime.lock.fetch(new Request("https://meta-write-lock.internal/lease", { method: "POST", body: JSON.stringify(payload) }));
+  assert.equal((await call({ action: "acquire", holder: "old", operation: "test", ttl_ms: 60000 })).status, 200);
+  h.clock.advance(61000);
+  assert.equal((await call({ action: "acquire", holder: "new", operation: "test", ttl_ms: 60000 })).status, 200);
+  const record = { fingerprint: "x", stage: "CREATE_PENDING", ad_id: BREVAR_AD, request_id: REQUEST_ID };
+  const stale = await call({ action: "creative_journal_put", holder: "old", request_id: REQUEST_ID, ad_id: BREVAR_AD, expected_stage: "ABSENT", record });
+  assert.equal(stale.status, 409); assert.equal((await stale.json()).code, "WRITE_LOCKED");
+  const skipped = await call({ action: "creative_journal_put", holder: "new", request_id: REQUEST_ID, ad_id: BREVAR_AD, expected_stage: "ABSENT", record: { ...record, stage: "COMPLETE" } });
+  assert.equal(skipped.status, 409); assert.equal((await skipped.json()).code, "CREATIVE_JOURNAL_CONFLICT");
+  assert.equal(h.runtime.values.has(`brevar-creative:${REQUEST_ID}`), false);
+});
+
+
+const UPLOAD_ASSET_PATH = "/creative-assets/brevar-sul-test.jpg";
+const UPLOAD_ASSET_NAME = "brevar-sul-test.jpg";
+const UPLOAD_ASSET_BYTES = Uint8Array.from([255, 216, 255, 99, 255, 217]);
+const UPLOAD_ASSET_HASH = "0123456789abcdef0123456789abcdef";
+
+function publicUploadAsset(request) {
+  assert.equal(request.method, "GET");
+  const url = new URL(request.url);
+  assert.equal(url.origin, "https://creative-assets.internal");
+  if (url.pathname !== UPLOAD_ASSET_PATH) return new Response("Missing", { status: 404 });
+  return new Response(UPLOAD_ASSET_BYTES, { headers: { "Content-Type": "image/jpeg" } });
+}
+
+function uploadAssetInput(overrides = {}) {
+  return {
+    asset_path: UPLOAD_ASSET_PATH,
+    confirmation_phrase: `UPLOAD CREATIVE ASSET act_${ACCOUNT} ${UPLOAD_ASSET_PATH}`,
+    validate_only: false,
+    ...overrides,
+  };
+}
+
+function uploadAssetResponse(call) {
+  if (call.path !== `act_${ACCOUNT}/adimages`) return undefined;
+  if (call.method === "POST") {
+    return { images: { bytes: { hash: UPLOAD_ASSET_HASH, name: "Meta generated name", url: "https://do-not-return.invalid/?access_token=private" } } };
+  }
+  return { data: [{ hash: UPLOAD_ASSET_HASH, name: "Meta generated name", account_id: ACCOUNT, url: "https://do-not-return.invalid/?access_token=private" }] };
+}
+
+test("creative asset preview reports local metadata and performs no Meta call or lease", async () => {
+  const h = await harness({ creativeAssetResponse: publicUploadAsset });
+  const result = toolPayload(await h.invoke("meta_upload_creative_asset", { asset_path: UPLOAD_ASSET_PATH }));
+  assert.equal(result.mode, "local_preview");
+  assert.equal(result.meta_validation_performed, false);
+  assert.equal(result.meta_write_performed, false);
+  assert.equal(result.proposed.mime_type, "image/jpeg");
+  assert.equal(result.proposed.size_bytes, UPLOAD_ASSET_BYTES.length);
+  assert.equal(result.proposed.image_name, UPLOAD_ASSET_NAME);
+  assert.match(result.proposed.sha256, /^[0-9a-f]{64}$/);
+  assert.equal(result.required_confirmation, uploadAssetInput().confirmation_phrase);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.lockCalls.length, 0);
+  assert.equal(JSON.stringify(result).includes(Buffer.from(UPLOAD_ASSET_BYTES).toString("base64")), false);
+});
+
+test("creative asset preview rejects absent manifest paths without any Meta call", async () => {
+  const h = await harness({ creativeAssetResponse: publicUploadAsset });
+  const result = await h.invoke("meta_upload_creative_asset", { asset_path: "/creative-assets/not-registered.jpg" });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /absent from the public manifest/);
+  assert.equal(h.calls.length, 0);
+});
+
+test("creative asset path schema refuses external URLs and traversal", async () => {
+  const h = await harness({ creativeAssetResponse: publicUploadAsset });
+  for (const asset_path of ["https://example.com/ad.jpg", "/creative-assets/../private.jpg", "/creative-assets/a.jpg?token=secret", "/creative-assets/%2E%2E/private.jpg"]) {
+    await assert.rejects(h.invoke("meta_upload_creative_asset", { asset_path }));
+  }
+  assert.equal(h.calls.length, 0);
+});
+
+test("creative asset upload enforces enabled writes and exact account-bound confirmation", async () => {
+  const disabled = await harness({ creativeAssetResponse: publicUploadAsset, env: { META_WRITE_ENABLED: "false" } });
+  const disabledResult = await disabled.invoke("meta_upload_creative_asset", uploadAssetInput());
+  assert.equal(disabledResult.isError, true);
+  assert.match(disabledResult.content[0].text, /disabled/);
+  assert.equal(disabled.calls.length, 0);
+  const h = await harness({ creativeAssetResponse: publicUploadAsset });
+  const wrong = await h.invoke("meta_upload_creative_asset", uploadAssetInput({ confirmation_phrase: "UPLOAD CREATIVE ASSET anything" }));
+  assert.equal(wrong.isError, true);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.lockCalls.length, 0);
+});
+
+test("creative asset upload confirms account identity before dispatch", async () => {
+  const h = await harness({ creativeAssetResponse: publicUploadAsset, respond(call) {
+    if (call.path === `act_${ACCOUNT}`) return { id: "act_888888", account_id: "888888" };
+    return uploadAssetResponse(call);
+  } });
+  const result = await h.invoke("meta_upload_creative_asset", uploadAssetInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /identity was not confirmed/);
+  assert.equal(h.calls.filter(call => call.method === "POST").length, 0);
+  assert.equal(h.lockCalls.at(-1).payload.action, "release_owned");
+});
+
+test("creative asset upload posts only approved bytes and returns a verified account-bound image hash", async () => {
+  const h = await harness({ creativeAssetResponse: publicUploadAsset, respond: uploadAssetResponse });
+  const result = toolPayload(await h.invoke("meta_upload_creative_asset", uploadAssetInput({ bytes: "ATTACKER", url: "https://not-used.invalid" })));
+  assert.equal(result.mode, "uploaded");
+  assert.equal(result.verified, true);
+  assert.equal(result.image_hash, UPLOAD_ASSET_HASH);
+  assert.equal(result.account_id, `act_${ACCOUNT}`);
+  assert.deepEqual(h.calls.map(call => [call.method, call.path]), [
+    ["GET", `act_${ACCOUNT}`], ["POST", `act_${ACCOUNT}/adimages`], ["GET", `act_${ACCOUNT}/adimages`],
+  ]);
+  assert.deepEqual(h.calls[1].params, { bytes: Buffer.from(UPLOAD_ASSET_BYTES).toString("base64") });
+  assert.deepEqual(h.calls[2].params, { fields: "hash,name,account_id", hashes: [UPLOAD_ASSET_HASH], limit: "2" });
+  assert.equal(h.lockCalls.at(-1).payload.action, "release_owned");
+  assert.match(h.lockCalls[0].payload.holder, /^operation:/);
+  assert.equal(JSON.stringify(result).includes("access_token"), false);
+  assert.equal(JSON.stringify(result).includes("do-not-return"), false);
+  assert.equal(JSON.parse(h.auditEvents[0]).operation, "upload_creative_asset");
+});
+
+for (const scenario of ["empty upload", "multiple hashes", "invalid hash", "wrong hash", "wrong name", "wrong account", "read failure", "post failure"]) {
+  test(`creative asset upload retains its lease without retry on uncertain result: ${scenario}`, async () => {
+    const h = await harness({ creativeAssetResponse: publicUploadAsset, respond(call) {
+      if (call.path === `act_${ACCOUNT}/adimages`) {
+        if (call.method === "POST") {
+          if (scenario === "empty upload") return { images: {} };
+          if (scenario === "multiple hashes") return { images: { one: { hash: UPLOAD_ASSET_HASH }, two: { hash: UPLOAD_ASSET_HASH } } };
+          if (scenario === "invalid hash") return { images: { bytes: { hash: "https://unsafe.invalid" } } };
+          if (scenario === "post failure") return { httpStatus: 500, body: { error: { message: "Upload response unavailable" } } };
+        } else {
+          if (scenario === "wrong hash") return { data: [{ hash: "ffffffffffffffffffffffffffffffff", name: "Meta generated name", account_id: ACCOUNT }] };
+          if (scenario === "wrong account") return { data: [{ hash: UPLOAD_ASSET_HASH, name: "Meta generated name", account_id: "888888" }] };
+          if (scenario === "wrong name") return { data: [{ hash: UPLOAD_ASSET_HASH, name: "other.jpg", account_id: ACCOUNT }] };
+          if (scenario === "read failure") return { httpStatus: 500, body: { error: { message: "Read unavailable" } } };
+        }
+      }
+      return uploadAssetResponse(call);
+    } });
+    const result = await h.invoke("meta_upload_creative_asset", uploadAssetInput());
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+    assert.equal(h.calls.filter(call => call.method === "POST").length, 1);
+    assert.equal(h.lockCalls.some(call => /release/.test(call.payload.action)), false);
+    assert.equal(JSON.parse(h.auditEvents[0]).operation, "upload_creative_asset_unverified");
+  });
+}
+
+
+test("creative asset upload accepts documented hash-only response and reports Meta-generated name honestly", async () => {
+  const h = await harness({ creativeAssetResponse: publicUploadAsset, respond(call) {
+    if (call.path === `act_${ACCOUNT}/adimages` && call.method === "POST") return { images: { [UPLOAD_ASSET_HASH]: { hash: UPLOAD_ASSET_HASH } } };
+    return uploadAssetResponse(call);
+  } });
+  const result = toolPayload(await h.invoke("meta_upload_creative_asset", uploadAssetInput()));
+  assert.equal(result.verified, true);
+  assert.equal(result.meta_image_name, "Meta generated name");
+  assert.equal(result.image_name, UPLOAD_ASSET_NAME);
+  assert.equal(result.name_verification, "read_from_account_library");
 });
