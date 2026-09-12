@@ -16,7 +16,9 @@ const META_GET_RETRY_DELAY_MS = 1_000;
 const META_GET_MAX_INLINE_RETRY_DELAY_MS = 5_000;
 const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
-const CONNECTOR_VERSION = "2.3.4";
+const STATUS_POST_TIMEOUT_MS = 30_000;
+const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
+const CONNECTOR_VERSION = "2.3.5";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -43,6 +45,14 @@ const writeLeaseRequestSchema = z.discriminatedUnion("action", [
 	}).strict(),
 	z.object({
 		action: z.literal("release"),
+		holder: z.string().min(1).max(500),
+	}).strict(),
+	z.object({
+		action: z.literal("release_owned"),
+		holder: z.string().min(1).max(500),
+	}).strict(),
+	z.object({
+		action: z.literal("assert_owner"),
 		holder: z.string().min(1).max(500),
 	}).strict(),
 	z.object({ action: z.literal("status") }).strict(),
@@ -88,7 +98,28 @@ export class MetaWriteLock {
 					: { active: false });
 			}
 
-			if (parsed.action === "release") {
+			if (parsed.action === "assert_owner") {
+				if (!active) return jsonResponse({ code: "WRITE_LEASE_EXPIRED" }, 409);
+				if (current.holder !== parsed.holder) {
+					return jsonResponse({
+						code: "WRITE_LOCKED",
+						expires_at: current.expires_at,
+						operation: current.operation,
+					}, 409);
+				}
+				return jsonResponse({ active: true, holder_matches: true, expires_at: current.expires_at });
+			}
+
+			if (parsed.action === "release" || parsed.action === "release_owned") {
+				// Operation owners must never remove a successor's row, even after
+				// that successor expires. Keep legacy session release unchanged.
+				if (parsed.action === "release_owned" && current && current.holder !== parsed.holder) {
+					return jsonResponse({
+						code: "WRITE_LOCKED",
+						expires_at: current.expires_at,
+						operation: current.operation,
+					}, 409);
+				}
 				if (!active) {
 					await this.state.storage.delete("lease");
 					return jsonResponse({ active: false, released: false });
@@ -146,6 +177,7 @@ type MetaGraphCall = {
 	method: "GET" | "POST";
 	params: Record<string, string | number | boolean | object>;
 	path: string;
+	write_lease_holder?: string;
 };
 
 class MetaGraphError extends Error {
@@ -158,6 +190,13 @@ class MetaGraphError extends Error {
 	) {
 		super(message);
 		this.name = "MetaGraphError";
+	}
+}
+
+class MetaWriteNotDispatchedError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "MetaWriteNotDispatchedError";
 	}
 }
 
@@ -306,6 +345,9 @@ async function callWriteLock(
 		throw new Error(`Write-lock service returned an invalid HTTP ${response.status} response.`);
 	}
 	if (!response.ok) {
+		if (result.code === "WRITE_LEASE_EXPIRED") {
+			throw new Error("WRITE_LEASE_EXPIRED: the operation no longer holds an active account lease. No Meta write was dispatched.");
+		}
 		if (result.code === "WRITE_LOCKED") {
 			throw new Error(
 				`WRITE_LOCKED: another MCP session currently owns Meta writes for this account until ${String(result.expires_at || "the lease expires")}. Active operation: ${String(result.operation || "not disclosed")}. Read-only tools remain available.`,
@@ -335,6 +377,33 @@ async function acquireAccountWriteLease(env: MetaEnv, holder: string, operation:
 
 async function releaseAccountWriteLease(env: MetaEnv, holder: string) {
 	return callWriteLock(env, { action: "release", holder });
+}
+
+async function assertAccountOperationLease(env: MetaEnv, holder: string) {
+	const response = await callWriteLock(env, { action: "assert_owner", holder });
+	const proof = z.object({
+		active: z.literal(true),
+		holder_matches: z.literal(true),
+		expires_at: z.string().datetime({ offset: true }),
+	}).safeParse(response);
+	if (!proof.success || Date.parse(proof.data.expires_at) <= Date.now()) {
+		throw new Error("WRITE_LEASE_UNVERIFIED: active operation ownership was not confirmed. No Meta write was dispatched.");
+	}
+	if (Date.parse(proof.data.expires_at) - Date.now() <= STATUS_POST_MIN_LEASE_REMAINING_MS) {
+		throw new Error("WRITE_LEASE_NEAR_EXPIRY: too little lease time remains for a bounded status POST. No Meta write was dispatched.");
+	}
+}
+
+// A successful Meta change must not be reported as failed just because its
+// already-finished operation could not release its lock. No release is retried.
+async function releaseAccountOperationLease(env: MetaEnv, holder: string): Promise<string | undefined> {
+	try {
+		const response = await callWriteLock(env, { action: "release_owned", holder });
+		z.object({ active: z.literal(false), released: z.boolean() }).parse(response);
+		return undefined;
+	} catch (error) {
+		return `The operation completed but its account lease was not confirmed released; respect its expiry before another write. ${error instanceof Error ? error.message : "Unexpected release error."}`;
+	}
 }
 
 async function getAccountWriteLease(env: MetaEnv) {
@@ -399,6 +468,7 @@ async function callMetaGraphDirect(
 	method: "GET" | "POST",
 	path: string,
 	params: Record<string, string | number | boolean | object>,
+	signal?: AbortSignal,
 ): Promise<unknown> {
 	const { accessToken, apiVersion } = getMetaConfig(env);
 	const cleanPath = path.replace(/^\/+/, "");
@@ -407,7 +477,7 @@ async function callMetaGraphDirect(
 		Accept: "application/json",
 		Authorization: `Bearer ${accessToken}`,
 	});
-	const requestInit: RequestInit = { headers, method };
+	const requestInit: RequestInit = { headers, method, ...(signal ? { signal } : {}) };
 
 	if (method === "GET") {
 		for (const [key, value] of Object.entries(params)) {
@@ -474,6 +544,7 @@ const metaGateCallSchema = z.object({
 	method: z.enum(["GET", "POST"]),
 	params: z.record(z.string(), z.unknown()),
 	path: z.string().min(1).max(1_000),
+	write_lease_holder: z.string().min(1).max(500).optional(),
 }).strict();
 
 const metaGateResponseSchema = z.object({
@@ -481,6 +552,7 @@ const metaGateResponseSchema = z.object({
 	ok: z.boolean(),
 	payload: z.unknown().optional(),
 	retry_after_seconds: z.number().int().nonnegative().optional(),
+	write_dispatched: z.boolean().optional(),
 }).strict();
 
 async function callMetaGraph(
@@ -488,15 +560,22 @@ async function callMetaGraph(
 	method: "GET" | "POST",
 	path: string,
 	params: Record<string, string | number | boolean | object>,
+	options?: { write_lease_holder: string },
 ): Promise<unknown> {
 	const { stub } = getMetaGateStub(env);
 	const response = await stub.fetch("https://meta-api-gate.internal/call", {
-		body: JSON.stringify({ method, params, path }),
+		body: JSON.stringify({ method, params, path, ...options }),
 		headers: { "Content-Type": "application/json" },
 		method: "POST",
 	});
 	const envelope = metaGateResponseSchema.parse(await response.json());
-	if (!envelope.ok) throw new Error(envelope.error || "Meta API gate rejected the request.");
+	if (!envelope.ok) {
+		const message = envelope.error || "Meta API gate rejected the request.";
+		if (method === "POST" && envelope.write_dispatched === false) {
+			throw new MetaWriteNotDispatchedError(message);
+		}
+		throw new Error(message);
+	}
 	return envelope.payload;
 }
 
@@ -538,6 +617,7 @@ export class MetaApiGate {
 				method: parsed.method,
 				params: parsed.params as MetaGraphCall["params"],
 				path: parsed.path,
+				write_lease_holder: parsed.write_lease_holder,
 			};
 		} catch {
 			return Response.json({ error: "Invalid Meta API gate request.", ok: false }, { status: 400 });
@@ -551,18 +631,32 @@ export class MetaApiGate {
 					error: `category=RATE_LIMIT_COOLDOWN | wait ${retryAfterSeconds}s and retry from one chat`,
 					ok: false,
 					retry_after_seconds: retryAfterSeconds,
+					write_dispatched: call.method === "POST" ? false : undefined,
 				}, { status: 429 });
 			}
 
 			const attempts = call.method === "GET" ? 2 : 1;
 			for (let attempt = 1; attempt <= attempts; attempt++) {
 				await this.paceNextAttempt();
+				let dispatchStarted = false;
 				try {
+					// Fence only opted-in operation writes. Verify after queueing and
+					// pacing so an expired operation cannot dispatch a late POST.
+					// Legacy mutators retain their existing session-lease behavior.
+					if (call.write_lease_holder !== undefined) {
+						if (call.method !== "POST") throw new Error("Operation lease proof is only valid for POST requests.");
+						await assertAccountOperationLease(this.env, call.write_lease_holder);
+					}
+					const signal = call.write_lease_holder !== undefined
+						? AbortSignal.timeout(STATUS_POST_TIMEOUT_MS)
+						: undefined;
+					dispatchStarted = true;
 					const payload = await callMetaGraphDirect(
 						this.env,
 						call.method,
 						call.path,
 						call.params,
+						signal,
 					);
 					return Response.json({ ok: true, payload });
 				} catch (error) {
@@ -584,6 +678,7 @@ export class MetaApiGate {
 					return Response.json({
 						error: error instanceof Error ? error.message : "Unexpected Meta API error.",
 						ok: false,
+						write_dispatched: call.method === "POST" ? dispatchStarted : undefined,
 						retry_after_seconds: isMetaRateLimit(error)
 							? Math.ceil(Math.max(
 								error.retryAfterMs ?? META_GET_RETRY_DELAY_MS,
@@ -1628,31 +1723,85 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 				},
 			},
 			async ({ confirmation_phrase, expected_name, object_id, object_type, status }) => {
+				const env = this.env as MetaEnv;
+				let operationHolder: string | undefined;
+				let leaseAcquired = false;
+				let postAttempted = false;
 				try {
-					const env = this.env as MetaEnv;
 					assertWritesEnabled(env);
-					const before = await getOwnedObject(env, object_type, object_id);
-					assertExpectedName(before, expected_name);
 					assertConfirmation(
 						confirmation_phrase,
 						`SET ${object_type} ${object_id} ${status}`,
 					);
+					// Transport sessions can change between calls in one chat. Give
+					// this invocation an unshared owner; never reuse a user/token ID.
+					operationHolder = `operation:${crypto.randomUUID()}`;
 					await acquireAccountWriteLease(
 						env,
-						this.ctx.id.toString(),
+						operationHolder,
 						`SET ${object_type} ${object_id} ${status}`,
 					);
+					leaseAcquired = true;
+					const before = await getOwnedObject(env, object_type, object_id);
+					if (before.id !== object_id) throw new Error("Object ID mismatch before status update.");
+					assertExpectedName(before, expected_name);
+					if (before.status !== "ACTIVE" && before.status !== "PAUSED") {
+						throw new Error("Status update requires an object currently configured ACTIVE or PAUSED.");
+					}
+					if (before.status === status) {
+						const warning = await releaseAccountOperationLease(env, operationHolder);
+						return asToolResult({
+							before,
+							after: before,
+							no_op: true,
+							status_requested: status,
+							write_lease_release_warning: warning,
+						});
+					}
+					// Retain the lease after an uncertain POST path, including an
+					// unavailable gate response. Only structured proof of no dispatch
+					// permits early release. Never retry the mutation here.
+					postAttempted = true;
 					const result = writeResponseSchema.parse(
-						await callMetaGraph(env, "POST", object_id, { status }),
+						await callMetaGraph(env, "POST", object_id, { status }, {
+							write_lease_holder: operationHolder,
+						}),
 					);
+					if (
+						(result.success !== true && result.id !== object_id) ||
+						result.success === false ||
+						(result.id !== undefined && result.id !== object_id)
+					) throw new Error("Meta did not confirm the requested status mutation.");
 					const after = await getOwnedObject(env, object_type, object_id);
+					if (after.id !== object_id || after.status !== status) {
+						throw new Error("Status read-back did not confirm the requested object and configured status.");
+					}
+					assertExpectedName(after, expected_name);
+					const preservedFields = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+						.filter((key) => key !== "status" && key !== "effective_status" &&
+							canonicalJson(before[key]) !== canonicalJson(after[key]));
+					if (preservedFields.length) {
+						throw new Error(`Status read-back changed other fields: ${preservedFields.join(", ")}.`);
+					}
 					auditMutation("set_delivery_status", {
 						object_id,
 						object_type,
 						status,
 					});
-					return asToolResult({ before, result, after });
+					const warning = await releaseAccountOperationLease(env, operationHolder);
+					return asToolResult({ before, result, after, write_lease_release_warning: warning });
 				} catch (error) {
+					if (postAttempted && !(error instanceof MetaWriteNotDispatchedError)) {
+						return asToolError(new Error(
+							`WRITE_OUTCOME_UNCERTAIN: reconcile the object's current status before another write; this operation did not release its lease. ${error instanceof Error ? error.message : "Unexpected status error."}`,
+						));
+					}
+					if (leaseAcquired && operationHolder) {
+						const warning = await releaseAccountOperationLease(env, operationHolder);
+						if (warning) return asToolError(new Error(
+							`${error instanceof Error ? error.message : "Status preflight failed."} No Meta write was attempted. ${warning}`,
+						));
+					}
 					return asToolError(error);
 				}
 			},

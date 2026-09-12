@@ -37,12 +37,21 @@ Official SDK references: [SystemUser](https://github.com/facebook/facebook-pytho
 
 ## Concurrent ChatGPT sessions
 
-Connector version 2.3.4 retains two account-scoped Durable Objects:
+Connector version 2.3.5 retains two account-scoped Durable Objects:
 
 - `META_API_GATE` serializes all Meta Graph requests across chats, spaces attempts by at least 250 ms, applies one bounded retry only to a short rate-limited `GET`, and enters cooldown after a persistent or long limit. It never retries a `POST`.
 - `META_WRITE_LOCK` provides the exclusive write lease described below.
 
-The write lease behaves as follows:
+For `meta_set_delivery_status`, v2.3.5 uses an operation-scoped owner:
+
+- A random owner is generated on the server for each invocation, independent of the MCP transport session. The existing lock is acquired before the first object read; an active legacy or operation lease is respected.
+- The command verifies the account, object ID, exact name and current configured status. It accepts currently `ACTIVE` or `PAUSED` objects only. An already-matching status returns `no_op` and releases its own lease without POST.
+- For a real status mutation, the gate verifies that the operation still owns an active lease after waiting in the request queue and pacing interval, immediately before POST dispatch. Expiry, a different holder, or 60 seconds or less remaining prevents dispatch. The protected POST uses a 30-second local timeout; a timeout cannot prove that remote processing stopped. The internal owner is never sent to Meta or returned in tool output.
+- An acknowledged mutation plus verified read-back releases only its own lease. Other snapshot fields, including returned budgets, must remain unchanged; `effective_status` is reported but is not a setting and may change during review.
+- A pre-POST validation/read failure releases its lease. The gate also returns structured evidence when it rejects a POST before dispatch (for example, during cooldown or after expiry); only that evidence permits release after entering the POST path. An ambiguous response, unavailable read-back or changed fields retain the lease until its existing expiry; the caller must reconcile current state before another write. POST is never automatically repeated.
+- Release is owner-bound even for an expired stored row and cannot delete a successor's lease. If release cannot be confirmed, the tool returns a warning alongside the verified result. The public session-release tool cannot release another operation's lease.
+
+This is a bounded migration of the status tool only. Other mutators retain the previous session lease behavior:
 
 - Read-only tools remain available to every chat.
 - The first session that attempts a real write receives an exclusive 10-minute lease for the configured ad account.
@@ -51,7 +60,9 @@ The write lease behaves as follows:
 - The owning session may release it with `meta_release_write_lease`; otherwise it expires automatically.
 - Validate-only requests do not acquire the lease.
 
-The holder is the technical MCP session identifier (`this.ctx.id`), not the visible ChatGPT conversation. A client may use different MCP sessions for successive calls in the same chat, so an apparent single operator can receive `WRITE_LOCKED` until the earlier 10-minute lease expires. Respect the returned expiration; do not retry in a loop or replace the holder with a shared user/token identity, which would collapse protection between concurrent chats. Only the original technical session may release its lease.
+For those legacy mutators, the holder is the technical MCP session identifier (`this.ctx.id`), not the visible ChatGPT conversation. A client may use different MCP sessions for successive calls in the same chat, so an apparent single operator can receive `WRITE_LOCKED` until the earlier 10-minute lease expires. Respect the returned expiration; do not retry in a loop or replace the holder with a shared user/token identity, which would collapse protection between concurrent chats. Only the original technical session may release its lease. The operation-owner migration does not remove or shorten leases already stored in production.
+
+The status mutex covers one invocation, not a whole plan spanning separate tool calls. Different chats can interleave completed operations; keep one logical operator for a campaign workflow. Legacy mutators have not gained operation fencing or non-reentrant invocation locks. The connector also cannot provide atomic compare-and-set against direct edits in Meta, or prove the outcome of a network request whose response is lost. Do not describe these controls as a global transaction or a fix for Meta account restrictions.
 
 The lease coordinates real writes only; `META_API_GATE` separately throttles all Graph reads and writes. Neither mechanism cures Meta permission errors. Resume recurring reviews only after account access is restored; keep denied checks brief and do not create overlapping replacement monitors.
 
@@ -70,4 +81,4 @@ After deployment, verify:
 3. A validate-only request succeeds without acquiring a lease.
 4. When an independently authorized, necessary mutation is due, its confirmed write from one MCP session acquires the lease. Do not create an ad change solely to test the lock.
 5. If a second independently authorized write is attempted from another session while the lease is active, it receives `WRITE_LOCKED` and performs no Meta mutation. Do not introduce an otherwise unnecessary live write for this check; use the offline test suite for deliberate contention testing.
-6. The owning session reads back its necessary Meta change and releases the lease.
+6. For `meta_set_delivery_status`, the tool returns a verified configured status (or `no_op`) and releases its operation lease automatically. Check for `write_lease_release_warning`. For legacy mutators, the original owning session reads back its necessary Meta change and releases its lease explicitly.

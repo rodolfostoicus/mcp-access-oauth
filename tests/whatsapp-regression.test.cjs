@@ -7,6 +7,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
+const { webcrypto } = require("node:crypto");
 const test = require("node:test");
 const vm = require("node:vm");
 const ts = require("typescript");
@@ -69,10 +70,11 @@ function decodeParams(params) {
 
 async function harness(options = {}) {
   const registered = new Map();
-  const calls = [];
+  const calls = options.sharedRuntime?.calls ?? [];
+  const fetchSignals = options.sharedRuntime?.fetchSignals ?? [];
   const kvWrites = [];
   const kvReads = [];
-  const lockCalls = [];
+  const lockCalls = options.sharedRuntime?.lockCalls ?? [];
   const auditEvents = [];
   class MockServer {
     constructor(metadata) { this.metadata = metadata; }
@@ -97,6 +99,7 @@ async function harness(options = {}) {
     // Do not retain headers or the fake Authorization value in test logs.
     const call = { method: init.method, path: graphPath, params };
     calls.push(call);
+    fetchSignals.push(init.signal);
     const override = options.respond && await options.respond(call);
     if (override !== undefined) {
       const hasRawBody = Object.hasOwn(override, "rawBody");
@@ -157,8 +160,11 @@ async function harness(options = {}) {
     Headers,
     Request,
     Response,
+    AbortSignal,
     Error,
-    setTimeout,
+    crypto: webcrypto,
+    Date: options.clock?.Date ?? Date,
+    setTimeout: options.clock?.setTimeout ?? setTimeout,
     console: { log(value) { auditEvents.push(value); } },
   };
   vm.runInNewContext(compiled, context, { filename: sourcePath });
@@ -185,7 +191,7 @@ async function harness(options = {}) {
             const override = options.writeLockRespond && await options.writeLockRespond(call);
             const response = override ?? (call.payload.action === "status"
               ? { body: { active: false } }
-              : { body: { active: call.payload.action === "acquire", acquired: call.payload.action === "acquire", released: call.payload.action === "release", expires_at: "2099-01-01T00:00:00.000Z" } });
+              : { body: { active: ["acquire", "assert_owner"].includes(call.payload.action), acquired: call.payload.action === "acquire", holder_matches: call.payload.action === "assert_owner", released: ["release", "release_owned"].includes(call.payload.action), expires_at: "2099-01-01T00:00:00.000Z" } });
             return new Response(JSON.stringify(response.body ?? response), {
               status: response.httpStatus ?? 200,
               headers: { "Content-Type": "application/json" },
@@ -196,8 +202,31 @@ async function harness(options = {}) {
     },
     ...options.env,
   };
+  if (options.sharedRuntime) {
+    const runtime = options.sharedRuntime;
+    runtime.lock ??= new moduleObject.exports.MetaWriteLock(runtime.state);
+    agent.env.META_WRITE_LOCK = {
+      idFromName(name) { return `lock:${name}`; },
+      get(id) {
+        assert.equal(id, `lock:act_${ACCOUNT}`);
+        return {
+          async fetch(url, init) {
+            const call = { id, url: String(url), payload: JSON.parse(String(init.body)) };
+            lockCalls.push(call);
+            const override = options.writeLockRespond && await options.writeLockRespond(call);
+            if (override !== undefined) {
+              return Response.json(override.body ?? override, { status: override.httpStatus ?? 200 });
+            }
+            return runtime.lock.fetch(new Request(url, init));
+          },
+        };
+      },
+    };
+  }
   if (options.useGate) {
-    const gate = new moduleObject.exports.MetaApiGate({}, agent.env);
+    const gate = options.sharedRuntime
+      ? (options.sharedRuntime.gate ??= new moduleObject.exports.MetaApiGate({}, agent.env))
+      : new moduleObject.exports.MetaApiGate({}, agent.env);
     agent.env.META_API_GATE = {
       idFromName(name) { return name; },
       get(id) {
@@ -263,7 +292,7 @@ async function harness(options = {}) {
   }
   await agent.init();
   return {
-    calls, kvWrites, kvReads, lockCalls, auditEvents, metadata: agent.server.metadata,
+    calls, fetchSignals, kvWrites, kvReads, lockCalls, auditEvents, metadata: agent.server.metadata,
     MetaApiGate: moduleObject.exports.MetaApiGate,
     MetaWriteLock: moduleObject.exports.MetaWriteLock,
     async invoke(name, input = {}) {
@@ -772,8 +801,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.4");
-  assert.equal(h.metadata.version, "2.3.4");
+  assert.equal(result.connector_version, "2.3.5");
+  assert.equal(h.metadata.version, "2.3.5");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -799,8 +828,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.4");
-  assert.equal(h.metadata.version, "2.3.4");
+  assert.equal(result.connector_version, "2.3.5");
+  assert.equal(h.metadata.version, "2.3.5");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1498,7 +1527,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.4");
+  assert.equal(result.connector_version, "2.3.5");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1572,7 +1601,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.4");
+  assert.equal(result.connector_version, "2.3.5");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1778,7 +1807,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.4");
+    assert.equal(result.connector_version, "2.3.5");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -2080,3 +2109,407 @@ for (const include of [false, true]) {
     assert.equal(h.kvWrites.length, 0);
   });
 }
+
+// These status tests share the real lock, persisted storage, and API gate across
+// independently constructed MCP handlers. The old always-acquire stub cannot
+// detect either transport-session leaks or same-session reentrancy.
+function statusTestClock() {
+  let now = Date.parse("2026-09-12T12:00:00.000Z");
+  return {
+    Date: class extends Date {
+      constructor(...args) { super(...(args.length ? args : [now])); }
+      static now() { return now; }
+    },
+    advance(ms) { now += ms; },
+    setTimeout(callback, ms) {
+      now += ms;
+      queueMicrotask(callback);
+      return 0;
+    },
+  };
+}
+
+function sharedStatusRuntime() {
+  const values = new Map();
+  const storageWrites = [];
+  let queue = Promise.resolve();
+  return {
+    calls: [], fetchSignals: [], lockCalls: [], values, storageWrites,
+    state: {
+      blockConcurrencyWhile(callback) {
+        const result = queue.then(callback, callback);
+        queue = result.then(() => undefined, () => undefined);
+        return result;
+      },
+      storage: {
+        async get(key) { return structuredClone(values.get(key)); },
+        async put(key, value) {
+          storageWrites.push({ action: "put", key, value: structuredClone(value) });
+          values.set(key, structuredClone(value));
+        },
+        async delete(key) {
+          storageWrites.push({ action: "delete", key });
+          return values.delete(key);
+        },
+      },
+    },
+  };
+}
+
+function statusInput(status = "ACTIVE", overrides = {}) {
+  return {
+    confirmation_phrase: `SET CAMPAIGN ${CAMPAIGN} ${status}`,
+    expected_name: CAMPAIGN_NAME,
+    object_id: CAMPAIGN,
+    object_type: "CAMPAIGN",
+    status,
+    ...overrides,
+  };
+}
+
+function statusDeferred() {
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function statusPair(options = {}) {
+  const runtime = sharedStatusRuntime();
+  const clock = statusTestClock();
+  const state = { value: {
+    ...campaignFixture,
+    daily_budget: "2000",
+    bid_strategy: "LOWEST_COST_WITHOUT_CAP",
+    start_time: "2026-09-05T18:22:58-0200",
+  } };
+  const initial = structuredClone(state.value);
+  const setup = {
+    sharedRuntime: runtime, clock, useGate: true,
+    writeLockRespond: options.writeLockRespond,
+    async respond(call) {
+      const override = options.respond && await options.respond(call, state, runtime, clock);
+      if (override !== undefined) return override;
+      if (call.path === CAMPAIGN && call.method === "GET") return state.value;
+      if (call.path === CAMPAIGN && call.method === "POST") {
+        assert.deepEqual(Object.keys(call.params), ["status"], "delivery changes must not send budget or targeting fields");
+        state.value = { ...state.value, status: call.params.status, effective_status: call.params.status };
+        return { success: true };
+      }
+    },
+  };
+  const first = await harness({ ...setup, sessionId: "streamable-http:transport-a" });
+  const second = await harness({ ...setup, sessionId: options.sameSession ? "streamable-http:transport-a" : "streamable-http:transport-b" });
+  return { first, second, runtime, clock, state, initial };
+}
+
+async function directStatusLock(runtime, payload) {
+  const response = await runtime.lock.fetch(new Request("https://meta-write-lock.internal/lease", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  }));
+  return { status: response.status, body: await response.json() };
+}
+
+function assertStatusLeaseRetained(runtime, clock) {
+  const lease = runtime.values.get("lease");
+  assert.ok(lease, "uncertain writes must retain the account lease");
+  assert.match(lease.holder, /^operation:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  assert.ok(Date.parse(lease.expires_at) > clock.Date.now());
+  assert.equal(runtime.lockCalls.filter(c => c.payload.action === "release_owned").length, 0);
+}
+
+test("status mutex releases a verified operation so a different transport can write immediately", async () => {
+  const p = await statusPair();
+  const first = toolPayload(await p.first.invoke("meta_set_delivery_status", statusInput()));
+  assert.equal(first.after.status, "ACTIVE");
+  assert.equal(p.runtime.values.has("lease"), false);
+  const second = toolPayload(await p.second.invoke("meta_set_delivery_status", statusInput("PAUSED")));
+  assert.equal(second.after.status, "PAUSED");
+  assert.equal(p.runtime.values.has("lease"), false);
+  assert.deepEqual(p.state.value, p.initial, "both changes preserve the complete unrelated campaign configuration");
+  assert.deepEqual(p.runtime.calls.map(c => c.method), ["GET", "POST", "GET", "GET", "POST", "GET"]);
+  for (let i = 0; i < p.runtime.calls.length; i++) {
+    assert.equal(p.runtime.fetchSignals[i] instanceof AbortSignal, p.runtime.calls[i].method === "POST",
+      "only the fenced status POST has the bounded request lifetime");
+  }
+  const acquisitions = p.runtime.lockCalls.filter(c => c.payload.action === "acquire");
+  assert.equal(acquisitions.length, 2);
+  assert.notEqual(acquisitions[0].payload.holder, acquisitions[1].payload.holder);
+  for (const { payload } of acquisitions) assert.match(payload.holder, /^operation:[0-9a-f-]{36}$/i);
+  assert.deepEqual(p.runtime.lockCalls.map(c => c.payload.action), [
+    "acquire", "assert_owner", "release_owned", "acquire", "assert_owner", "release_owned",
+  ]);
+  assert.ok(p.clock.Date.now() - Date.parse("2026-09-12T12:00:00.000Z") < 600000);
+});
+
+for (const sameSession of [false, true]) test(`status mutex excludes overlapping handlers before first Graph read (same transport=${sameSession})`, async () => {
+  const entered = statusDeferred();
+  const finish = statusDeferred();
+  let reads = 0;
+  const p = await statusPair({ sameSession, async respond(call) {
+    if (call.path === CAMPAIGN && call.method === "GET" && ++reads === 1) {
+      entered.resolve();
+      await finish.promise;
+    }
+  } });
+  const first = p.first.invoke("meta_set_delivery_status", statusInput());
+  await entered.promise;
+  const second = await p.second.invoke("meta_set_delivery_status", statusInput());
+  assert.equal(second.isError, true);
+  assert.match(second.content[0].text, /WRITE_LOCKED/);
+  assert.deepEqual(p.runtime.calls.map(c => c.method), ["GET"], "competing operation cannot start an unprotected read");
+  finish.resolve();
+  const completed = toolPayload(await first);
+  assert.equal(completed.after.status, "ACTIVE");
+  assert.equal(postCalls(p.first).length, 1);
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("status mutex remains exclusive until readback completes", async () => {
+  const entered = statusDeferred();
+  const finish = statusDeferred();
+  let reads = 0;
+  const p = await statusPair({ async respond(call) {
+    if (call.path === CAMPAIGN && call.method === "GET" && ++reads === 2) {
+      entered.resolve();
+      await finish.promise;
+    }
+  } });
+  const first = p.first.invoke("meta_set_delivery_status", statusInput());
+  await entered.promise;
+  const second = await p.second.invoke("meta_set_delivery_status", statusInput("PAUSED"));
+  assert.equal(second.isError, true);
+  assert.match(second.content[0].text, /WRITE_LOCKED/);
+  assert.equal(postCalls(p.first).length, 1);
+  finish.resolve();
+  assert.equal(toolPayload(await first).after.status, "ACTIVE");
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("status mutex cannot replace a live legacy session lease, even from that transport", async () => {
+  const p = await statusPair();
+  const acquired = await directStatusLock(p.runtime, {
+    action: "acquire", holder: "streamable-http:transport-a", operation: "legacy package", ttl_ms: 600000,
+  });
+  assert.equal(acquired.status, 200);
+  const lease = structuredClone(p.runtime.values.get("lease"));
+  const result = await p.first.invoke("meta_set_delivery_status", statusInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_LOCKED/);
+  assert.deepEqual(p.runtime.values.get("lease"), lease);
+  assert.equal(p.runtime.calls.length, 0);
+});
+
+test("status mutex no-op uses the configured status, sends zero POSTs, and releases its lease", async () => {
+  const p = await statusPair();
+  p.state.value.effective_status = "PENDING_REVIEW";
+  const result = toolPayload(await p.first.invoke("meta_set_delivery_status", statusInput("PAUSED")));
+  assert.equal(result.no_op, true);
+  assert.equal(result.after.status, "PAUSED");
+  assert.equal(result.after.effective_status, "PENDING_REVIEW");
+  assert.equal(postCalls(p.first).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+  assert.deepEqual(p.runtime.lockCalls.map(c => c.payload.action), ["acquire", "release_owned"]);
+});
+
+test("status mutex checks the exact confirmation before acquiring a lease or calling Graph", async () => {
+  const p = await statusPair();
+  const result = await p.first.invoke("meta_set_delivery_status", statusInput("ACTIVE", { confirmation_phrase: "SET CAMPAIGN WRONG ACTIVE" }));
+  assert.equal(result.isError, true);
+  assert.equal(p.runtime.lockCalls.length, 0);
+  assert.equal(p.runtime.calls.length, 0);
+});
+
+for (const [label, alter] of [
+  ["wrong account", value => ({ ...value, account_id: "999999" })],
+  ["wrong ID", value => ({ ...value, id: "999999" })],
+  ["stale name", value => ({ ...value, name: "Externally renamed" })],
+  ["invalid object response", () => ({ id: CAMPAIGN })],
+  ["archived object", value => ({ ...value, status: "ARCHIVED" })],
+  ["read transport failure", () => { throw new Error("Offline GET network failure"); }],
+]) test(`status mutex releases on a pre-POST ${label}`, async () => {
+  const p = await statusPair({ respond(call, state) {
+    if (call.path === CAMPAIGN && call.method === "GET") return alter(state.value);
+  } });
+  const result = await p.first.invoke("meta_set_delivery_status", statusInput());
+  assert.equal(result.isError, true);
+  assert.equal(postCalls(p.first).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+  assert.deepEqual(p.runtime.lockCalls.map(c => c.payload.action), ["acquire", "release_owned"]);
+});
+
+for (const [label, response] of [
+  ["POST timeout", () => { throw new Error("Offline POST timeout"); }],
+  ["non-JSON POST", () => ({ rawBody: "malformed upstream body" })],
+  ["empty POST object", () => ({})],
+  ["explicit POST failure", () => ({ success: false })],
+  ["explicit failure with matching ID", () => ({ success: false, id: CAMPAIGN })],
+  ["wrong POST ID", () => ({ id: "999999" })],
+]) test(`status mutex retains its lease after ${label} without retrying`, async () => {
+  const p = await statusPair({ respond(call) {
+    if (call.path === CAMPAIGN && call.method === "POST") return response();
+  } });
+  const result = await p.first.invoke("meta_set_delivery_status", statusInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+  assert.equal(postCalls(p.first).length, 1);
+  assertStatusLeaseRetained(p.runtime, p.clock);
+});
+
+for (const [label, alter] of [
+  ["wrong account", value => ({ ...value, account_id: "999999" })],
+  ["wrong ID", value => ({ ...value, id: "999999" })],
+  ["renamed object", value => ({ ...value, name: "Externally renamed" })],
+  ["unchanged status", value => ({ ...value, status: "PAUSED" })],
+  ["changed budget", value => ({ ...value, daily_budget: "99999" })],
+  ["removed budget field", value => { const changed = { ...value }; delete changed.daily_budget; return changed; }],
+  ["missing status", value => { const changed = { ...value }; delete changed.status; return changed; }],
+  ["unavailable read", () => { throw new Error("Offline readback unavailable"); }],
+]) test(`status mutex retains its lease when readback has ${label}`, async () => {
+  let reads = 0;
+  const p = await statusPair({ respond(call, state) {
+    if (call.path === CAMPAIGN && call.method === "GET" && ++reads === 2) return alter(state.value);
+  } });
+  const result = await p.first.invoke("meta_set_delivery_status", statusInput());
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+  assert.equal(postCalls(p.first).length, 1);
+  assertStatusLeaseRetained(p.runtime, p.clock);
+});
+
+test("status mutex accepts a matching POST ID and verifies configured status independently of review", async () => {
+  const p = await statusPair({ respond(call, state) {
+    if (call.path === CAMPAIGN && call.method === "POST") {
+      state.value = { ...state.value, status: "ACTIVE", effective_status: "PENDING_REVIEW" };
+      return { id: CAMPAIGN };
+    }
+  } });
+  const result = toolPayload(await p.first.invoke("meta_set_delivery_status", statusInput()));
+  assert.equal(result.after.status, "ACTIVE");
+  assert.equal(result.after.effective_status, "PENDING_REVIEW");
+  assert.equal(p.runtime.values.has("lease"), false);
+});
+
+test("status mutex reports a release warning without hiding a verified successful mutation", async () => {
+  const p = await statusPair({ writeLockRespond(call) {
+    if (call.payload.action === "release_owned") return { httpStatus: 503, body: { code: "OFFLINE_LOCK_UNAVAILABLE" } };
+  } });
+  const raw = await p.first.invoke("meta_set_delivery_status", statusInput());
+  assert.notEqual(raw.isError, true);
+  const result = toolPayload(raw);
+  assert.equal(result.after.status, "ACTIVE");
+  assert.equal(typeof result.write_lease_release_warning, "string");
+  assert.ok(result.write_lease_release_warning.length > 0);
+  assert.equal(postCalls(p.first).length, 1);
+  assert.ok(p.runtime.values.has("lease"));
+});
+
+test("status mutex rejects a POST queued beyond lease expiry immediately before Graph dispatch", async () => {
+  const blockerEntered = statusDeferred();
+  const unblock = statusDeferred();
+  let blocker;
+  let reads = 0;
+  const p = await statusPair({ async respond(call, state, runtime) {
+    if (call.path === CAMPAIGN && call.method === "GET" && ++reads === 1) {
+      // Queue a legitimate independent read before the status handler enqueues
+      // its POST. It remains in flight until the operation's lease has expired.
+      blocker = runtime.gate.fetch(new Request("https://meta-api-gate.internal/call", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ method: "GET", path: `act_${ACCOUNT}`, params: {} }),
+      }));
+      return state.value;
+    }
+    if (call.path === `act_${ACCOUNT}`) {
+      blockerEntered.resolve();
+      await unblock.promise;
+    }
+  } });
+  const pending = p.first.invoke("meta_set_delivery_status", statusInput());
+  await blockerEntered.promise;
+  p.clock.advance(600001);
+  unblock.resolve();
+  const result = await pending;
+  assert.equal((await blocker).status, 200);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /WRITE_LEASE_EXPIRED/);
+  assert.doesNotMatch(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+  assert.equal(postCalls(p.first).length, 0, "an expired owner cannot reach Meta from the gate queue");
+  assert.equal(p.runtime.lockCalls.filter(c => c.payload.action === "assert_owner").length, 1);
+  assert.equal(p.runtime.lockCalls.filter(c => c.payload.action === "release_owned").length, 1);
+  assert.equal(p.runtime.values.has("lease"), false, "proven non-dispatch releases the operation's own expired lease");
+  assert.deepEqual(p.state.value, p.initial);
+});
+
+test("status mutex releases after a rate-limit cooldown begins between preflight and POST", async () => {
+  let cooldownRequest;
+  let reads = 0;
+  const p = await statusPair({ respond(call, state, runtime) {
+    if (call.path === CAMPAIGN && call.method === "GET" && ++reads === 1) {
+      cooldownRequest = runtime.gate.fetch(new Request("https://meta-api-gate.internal/call", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ method: "GET", path: `act_${ACCOUNT}`, params: {} }),
+      }));
+      return state.value;
+    }
+    if (call.path === `act_${ACCOUNT}`) return {
+      httpStatus: 429, headers: { "Retry-After": "60" },
+      body: { error: { code: 17, message: "Offline rate limit" } },
+    };
+  } });
+  const result = await p.first.invoke("meta_set_delivery_status", statusInput());
+  assert.equal((await cooldownRequest).status, 429);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /RATE_LIMIT_COOLDOWN/);
+  assert.doesNotMatch(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+  assert.equal(postCalls(p.first).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+  assert.deepEqual(p.state.value, p.initial);
+  assert.deepEqual(p.runtime.lockCalls.map(c => c.payload.action), ["acquire", "release_owned"]);
+});
+
+test("status mutex rejects a near-expiry lease before dispatch and releases it", async () => {
+  let reads = 0;
+  const p = await statusPair({ respond(call, state, runtime, clock) {
+    if (call.path === CAMPAIGN && call.method === "GET" && ++reads === 1) clock.advance(540001);
+  } });
+  const result = await p.first.invoke("meta_set_delivery_status", statusInput());
+  assert.equal(result.isError, true);
+  assert.doesNotMatch(result.content[0].text, /WRITE_OUTCOME_UNCERTAIN/);
+  assert.equal(postCalls(p.first).length, 0);
+  assert.equal(p.runtime.values.has("lease"), false);
+  assert.deepEqual(p.state.value, p.initial);
+  assert.deepEqual(p.runtime.lockCalls.map(c => c.payload.action), ["acquire", "assert_owner", "release_owned"]);
+});
+
+test("lease ownership checks are read-only and reject expired or mismatched owners", async () => {
+  const p = await statusPair();
+  await directStatusLock(p.runtime, { action: "acquire", holder: "operation:owner-a", operation: "offline A", ttl_ms: 600000 });
+  const storageWrites = p.runtime.storageWrites.length;
+  const liveLease = structuredClone(p.runtime.values.get("lease"));
+  const owner = await directStatusLock(p.runtime, { action: "assert_owner", holder: "operation:owner-a" });
+  assert.equal(owner.status, 200);
+  assert.equal(owner.body.active, true);
+  assert.equal(owner.body.holder_matches, true);
+  const other = await directStatusLock(p.runtime, { action: "assert_owner", holder: "operation:owner-b" });
+  assert.equal(other.status, 409);
+  p.clock.advance(600001);
+  const expired = await directStatusLock(p.runtime, { action: "assert_owner", holder: "operation:owner-a" });
+  assert.equal(expired.status, 409);
+  assert.equal(expired.body.code, "WRITE_LEASE_EXPIRED");
+  assert.deepEqual(p.runtime.values.get("lease"), liveLease);
+  assert.equal(p.runtime.storageWrites.length, storageWrites, "ownership checks cannot renew or remove leases");
+  assert.equal(p.runtime.calls.length, 0);
+});
+
+for (const successorExpired of [false, true]) test(`expired status owner cannot release a successor lease (successor expired=${successorExpired})`, async () => {
+  const p = await statusPair();
+  await directStatusLock(p.runtime, { action: "acquire", holder: "operation:owner-a", operation: "offline A", ttl_ms: 600000 });
+  p.clock.advance(600001);
+  await directStatusLock(p.runtime, { action: "acquire", holder: "operation:owner-b", operation: "offline B", ttl_ms: 600000 });
+  if (successorExpired) p.clock.advance(600001);
+  const successor = structuredClone(p.runtime.values.get("lease"));
+  const writes = p.runtime.storageWrites.length;
+  const stale = await directStatusLock(p.runtime, { action: "release_owned", holder: "operation:owner-a" });
+  assert.equal(stale.status, 409);
+  assert.deepEqual(p.runtime.values.get("lease"), successor);
+  assert.equal(p.runtime.storageWrites.length, writes);
+});
