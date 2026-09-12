@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.11";
+const CONNECTOR_VERSION = "2.3.12";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -2302,7 +2302,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 			{
 				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: false },
 				description:
-					"WRITE/PREVIEW. Apply the explicitly authorized BREVAR profile to one owned, unexpired BREVAR ad set: medical work-position profile PHYSICIANS_10, ages 25-50 with unknown ages disabled, both sexes, all Parana/Rio Grande do Sul/Santa Catarina, audience/geo and lookalike relaxation disabled, daily 06:00-23:00 America/Sao_Paulo (07:00-24:00 America/Noronha). Unlike geo restriction, this replaces city/radius coverage and removes exclusions of the three included states. Requires current detailed/lookalike diagnostics explicitly zero; does not write read-only diagnostics. Preserves other targeting settings, budgets at both levels, objective, optimization, destination, dates and configured status. Requires an existing lifetime budget, never converts or transfers budgets. With ABO it sets and verifies ad-set day_parting. With CBO it never writes child pacing; verified reports saved fields while delivery_schedule_verified separately requires parent campaign day_parting before activation. Meta validate_only is the default; real changes require exact current ad-set/campaign names and confirmation. Uses one operation lease, validation, concurrent-change checks and complete read-back. Never activates, creates, changes the campaign, or bypasses Instagram boosted-post restrictions.",
+					"WRITE/PREVIEW. Apply the explicitly authorized BREVAR profile to one owned, unexpired BREVAR ad set: medical work-position profile PHYSICIANS_10, ages 25-50 with unknown ages disabled, both sexes, all Parana/Rio Grande do Sul/Santa Catarina, audience/geo and lookalike relaxation disabled, daily 06:00-23:00 America/Sao_Paulo (07:00-24:00 America/Noronha). Unlike geo restriction, this replaces city/radius coverage and removes exclusions of the three included states. Requires current detailed/lookalike diagnostics explicitly zero; does not write read-only diagnostics. Preserves other targeting settings, budgets at both levels, objective, optimization, destination, dates and configured status. Requires an existing lifetime budget, never converts or transfers budgets. With ABO it sets and verifies ad-set day_parting. CBO changes require parent campaign day_parting before any POST and send child pacing_type=['day_parting'] as the calendar write parameter, while auditing pacing at its parent budget owner and preserving the actually returned child pacing field. Actual child calendar read-back remains mandatory. An unchanged child returns a separate delivery_schedule_verified diagnostic without a POST. Meta validate_only is the default; real changes require exact current ad-set/campaign names and confirmation. Uses one operation lease, validation, concurrent-change checks and complete read-back. Never activates, creates, changes the campaign, or bypasses Instagram boosted-post restrictions.",
 				inputSchema: {
 					adset_id: z.string().regex(META_ID_PATTERN),
 					expected_name: z.string().min(1).max(500),
@@ -2368,18 +2368,24 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const pacing = [...new Set([...currentPacing, "day_parting"])];
 					const parentPacing = z.array(z.string()).optional().parse(campaign.pacing_type) ?? [];
 					const deliveryScheduleVerified = !campaignLifetime || parentPacing.includes("day_parting");
-					// With CBO, pacing belongs to the parent campaign. Do not write a
-					// shadow ad-set field or pretend its omission proves day_parting.
-					const params: Record<string, string | number | boolean | object> = { targeting, adset_schedule: schedule,
+					// The observed CBO calendar update needs the child pacing write
+					// parameter as well as enabled parent pacing. CBO GET omits child
+					// pacing, so audit its actual prior representation rather than
+					// treating the write parameter as a persisted budget control.
+					const storedParams: Record<string, string | number | boolean | object> = { targeting, adset_schedule: schedule,
 						...(!campaignLifetime ? { pacing_type: pacing } : {}) };
-					if (name !== undefined) params.name = name;
-					const expected = { ...before, ...params };
+					if (name !== undefined) storedParams.name = name;
+					const params = { ...storedParams, pacing_type: campaignLifetime ? ["day_parting"] : pacing };
+					const expected = { ...before, ...storedParams };
 					if (brevarDifferences(expected, before).length === 0) {
 						const warning = await releaseAccountOperationLease(env, operationHolder);
 						return asToolResult({ mode: "no_change", before, after: before, campaign_before: campaign, campaign_after: campaign,
 							timezone_name: timezone, verified: true, delivery_schedule_verified: deliveryScheduleVerified,
 							schedule_note: deliveryScheduleVerified ? "Delivery schedule control is present at the budget-owning level." : "Child fields and windows are verified, but parent campaign day_parting is not confirmed. Configure and audit parent pacing before activation.",
 							required_confirmation: requiredConfirmation, write_lease_release_warning: warning });
+					}
+					if (campaignLifetime && !deliveryScheduleVerified) {
+						throw new Error("CBO calendar changes require confirmed parent campaign day_parting before validation or a real write. Prepare and audit parent pacing first; no Meta POST attempted.");
 					}
 					const validation = writeResponseSchema.parse(await callMetaGraph(env, "POST", adset_id, {
 						...params, execution_options: ["validate_only"],
