@@ -1,100 +1,98 @@
-# Google Ads Stoicus Secure — preparação de leitura
+# Google Ads Stoicus Secure — gestão da conta
 
-Estado: adaptador de leitura e servidor MCP preparados para um Worker Google separado. A implantação e a configuração de credenciais reais permanecem pendentes. Uma consulta manual no OAuth Playground retornou HTTP 200 e confirmou identidade, moeda e fuso da conta; isso não valida a implantação deste servidor nem acesso de escrita.
+Versão **0.2.0**. A responsável autorizou expressamente ampliar o conector existente para ler, criar, modificar e remover recursos. A conexão de leitura da versão anterior foi confirmada pela responsável em uma consulta MCP à conta Stoicus. A atualização implementa as operações de gestão; o consentimento OAuth de escrita precisa ser concedido à conexão que vai utilizá-las.
 
-Esta pasta é independente do código Meta. O Worker configurado na raiz continua sendo o Meta; publicar este módulo exige um host separado.
+O Worker `stoicus-google-ads-mcp`, a URL `/mcp` e o plugin existentes são mantidos. Esta pasta é independente do Worker Meta na raiz do repositório. As credenciais continuam nos secrets do Cloudflare.
 
-## Escopo autorizado
+## Ferramentas
 
-- Conector próprio para uma única conta Google Ads, com primeira etapa de leitura.
-- API habilitada no projeto Google Cloud, com acesso de Exploração informado na configuração.
-- A criação de chave de conta de serviço foi bloqueada por política organizacional. O caminho escolhido agora é OAuth de usuário, sem alterar essa política.
-- A conta de serviço existente recebeu acesso Padrão por escolha da responsável. O OAuth de usuário usa as permissões da pessoa que autorizou. Este adaptador só consulta.
-- Não reutilizar orçamento, datas, públicos ou IDs Meta. Campanhas Google e ativação exigem briefing e autorização próprios.
-
-## Implementado
-
-`read-only.mjs` fornece descritores de três ferramentas e um despachante interno:
-
-| Ferramenta | Escopo |
+| Ferramenta | Função |
 | --- | --- |
-| `google_ads_get_account` | Identidade, moeda e fuso da única conta configurada |
-| `google_ads_list_campaigns` | Até 1.000 campanhas não removidas e seus orçamentos |
-| `google_ads_get_performance` | Métricas por campanha em período explícito de até 93 dias |
+| `google_ads_get_account` | Conta, moeda, fuso e identidade conferida no Google |
+| `google_ads_list_campaigns` | Até 1.000 campanhas e orçamentos; indica inventário parcial |
+| `google_ads_get_performance` | Métricas por período explícito de até 93 dias |
+| `google_ads_query` | GAQL SELECT para todos os recursos consultáveis, incluindo paginação |
+| `google_ads_search_fields` | Metadados de campos para construir consultas válidas |
+| `google_ads_get_capabilities` | Catálogo de recursos, operações nativas e escopos da conexão |
+| `google_ads_create` | Criação de um recurso |
+| `google_ads_update` | Alteração de campos de um recurso por máscara explícita |
+| `google_ads_remove` | Remoção nativa de um recurso por nome completo |
+| `google_ads_mutate` | Lote transacional de criação, alteração e remoção |
+| `google_ads_get_operation` | Recibo persistente de uma operação pelo UUID |
 
-Os destinos HTTP são fixos: OAuth do Google e `GoogleAdsService.Search`. O POST de Search é consulta. Não há mutações, consulta livre, URL livre ou troca de conta pelo chamador. Resultados preservam moeda, fuso e micros monetários. Inventário parcial retorna `complete=false`.
+## Cobertura real
 
-Cada chamada valida novamente o operador no host e confere a identidade da conta na resposta Google. O escopo OAuth `adwords` permite acesso amplo; a restrição deste adaptador vem dos métodos de consulta e da conta fixa, não de um escopo OAuth exclusivo de leitura.
+O arquivo `resource-catalog.json` registra **78 tipos de recurso** e as operações CRUD efetivamente expostas pelos serviços da Google Ads API v25. Nomes, caminhos REST, padrões de nomes de recurso, máscaras e capacidades foram conferidos nos protos oficiais do repositório `googleapis/googleapis`, consultados em 13/09/2026. Cada entrada inclui o arquivo de origem.
 
-Erros expõem apenas códigos controlados, HTTP e identificadores seguros. Respostas OAuth, textos brutos, tokens e chaves não são retornados. `invalid_grant` retorna `reauthorization_required=true`: a autorização precisa ser refeita, sem troca automática para outra identidade. Não há retentativas automáticas. Cada requisição tem timeout de 15 segundos e limite de resposta de 2 MB.
+São 62 tipos compatíveis com `GoogleAdsService.Mutate` e 16 atendidos por seus serviços específicos. A cobertura inclui campanhas, grupos, anúncios, orçamentos, lances, critérios/segmentação, palavras-chave, ativos e associações, Performance Max, públicos, listas, conversões, etiquetas, experimentos, planejamento e configurações de conta. Serviços de acesso de usuários e faturamento também estão no catálogo, sujeitos às permissões e condições nativas do Google.
 
-## Configuração no servidor
+Não significa que todo tipo aceita toda ação: `ad` aceita atualização, enquanto a criação/remoção de um anúncio usa `ad_group_ad`; `asset` e `audience` não têm remoção nativa nesses serviços. Remoção pode ser irreversível e não apaga o histórico. Ações especializadas fora do CRUD — upload de conversões, aplicar recomendações, promover experimentos, reservar campanhas ou executar batch jobs — não são implementadas pelas ferramentas de mutação desta versão. O nível de acesso da API e o papel do usuário no Google continuam determinando quais operações são permitidas.
 
-Os valores são variáveis ou secrets do host Google, nunca argumentos de ferramentas, conteúdo do chat, arquivos versionados ou logs.
+## Operar
 
-| Nome | Uso |
+1. Consultar os objetos e `google_ads_get_capabilities` para identificar o recurso correto e suas operações. Consultar `google_ads_search_fields` quando necessário.
+2. Preparar dados REST em **camelCase**. Valores monetários em micros são inteiros exatos, preferencialmente strings. A conta de destino vem exclusivamente da configuração do servidor.
+3. Usar `validate_only=true` para prévia, ou `validate_only=false` para executar uma operação já autorizada. A execução faz sua própria validação Google antes da gravação quando o serviço a oferece. Não é necessário repetir um pedido de autorização já concedido para o mesmo trabalho.
+4. A gravação exige um `request_id` UUID estável. Reenviar o mesmo UUID e conteúdo retorna o recibo; mudar o conteúdo com o mesmo UUID é rejeitado. Um POST incerto não é reenviado automaticamente, mesmo com outro UUID e conteúdo idêntico.
+5. Conferir `mutation_accepted`, `readback_verified`, `readback_complete` e os detalhes de cada recurso. Consultar os campos restantes por GAQL quando a releitura não for completa.
+
+Criações de campanhas, grupos, anúncios e grupos de ativos assumem `PAUSED` quando o status é omitido; `ENABLED` explícito permite ativação. Alterações de orçamento e status não têm tetos de negócio fixos no conector. Usar os valores e o trabalho autorizados pela responsável, sem importar orçamentos ou parâmetros de campanhas Meta.
+
+`google_ads_mutate` aceita até 100 operações e 6 MB de conteúdo por chamada. Lotes combinados usam `partialFailure=false`, incluindo referências temporárias negativas. Tipos não suportados pelo endpoint unificado exigem lote de um único tipo; serviços com operação singular aceitam uma operação. Não há execução oculta de vários lotes nem mudanças parciais deliberadas.
+
+Quatro serviços não oferecem `validateOnly`: `batch_job`, `billing_setup`, `customer_user_access` e `customer_user_access_invitation`. Sua prévia é **somente local**, claramente identificada; nenhuma chamada de mutação é usada para simular. A execução real chama o método nativo uma vez.
+
+## Evidência e recuperação
+
+Um Durable Object SQLite próprio por conta serializa as gravações e registra UUID, hash canônico, estágio e recibo. Tokens, secrets e o conteúdo completo dos anúncios não são armazenados nesse registro. `GOOGLE_ADS_OPERATIONS` é um binding interno, sem rota pública direta.
+
+A resposta `mutation_accepted=true` significa que o Google devolveu uma confirmação consistente para as operações e os recursos esperados. O reconhecimento é persistido antes da releitura. Falha na consulta posterior não repete a gravação. A releitura automática é limitada aos dez primeiros recursos; campos aninhados de criação que não foram conferidos aparecem em `unverified_fields`, sem afirmar verificação completa. Campos limpos/default omitidos pelo protobuf também não são declarados verificados sem evidência.
+
+`COMPLETE` indica fim do processamento, não garante sozinho `readback_verified=true`. `COMMITTED` preserva o reconhecimento Google mesmo se a releitura não terminar. `UNKNOWN` ou `DISPATCHED` sem conclusão não autorizam repetição automática: consultar o recibo e os recursos atuais. A mesma proposta incerta permanece bloqueada. Recibos são históricos e não representam o estado atual dos anúncios.
+
+O bloqueio de uma execução em andamento tem janela de três minutos, superior aos timeouts limitados das etapas. Após interrupção antes de qualquer envio, uma operação `VALIDATING` pode continuar com o mesmo UUID. Após envio, o recibo persistente impede sua repetição. Operações diferentes podem voltar a ser processadas após a janela; o conector não cancela operações Google que já foram enviadas. Alterações feitas fora do conector não ficam sob seu controle de concorrência.
+
+As consultas personalizadas retornam a página Google sem cortar linhas e informam `next_page_token`. Reutilizar a consulta original para a próxima página. Cada chamada HTTP tem timeout de 15 segundos e resposta limitada a 2 MB; uma resposta maior falha explicitamente, devendo-se selecionar menos campos/linhas. Os três atalhos antigos conservam seus limites originais.
+
+## OAuth e configuração
+
+O escopo Google `https://www.googleapis.com/auth/adwords` já dá acesso conforme o papel da pessoa no Google Ads. A restrição anterior era do servidor MCP. A versão nova separa `google_ads.read` e `google_ads.write` nos tokens próprios do conector. Tokens antigos de leitura **não recebem escrita automaticamente**. As ferramentas de escrita retornam desafio OAuth de escopo insuficiente; a tela de consentimento mostra **Autorizar gestão completa** quando escrita é solicitada.
+
+O login Google continua com `openid email`, PKCE S256, state/cookie, e-mail verificado e lista de operadores autorizados. Google Ads usa o refresh token guardado no servidor. O ChatGPT recebe apenas o token próprio do conector. A correção da versão 0.1.1 para origem do formulário de consentimento permanece preservada.
+
+| Configuração | Uso |
 | --- | --- |
-| `PUBLIC_ORIGIN` | Origem HTTPS exata do Worker Google, sem barra final nem caminho |
-| `STOICUS_ALLOWED_EMAILS` | E-mails Google autorizados, separados por vírgula; lista vazia bloqueia acesso |
-| `GOOGLE_ADS_CUSTOMER_ID` | ID confirmado de dez dígitos; aceita também a máscara `123-456-7890` |
-| `GOOGLE_ADS_LOGIN_CUSTOMER_ID` | Opcional, somente com conta gerente confirmada |
-| `GOOGLE_ADS_API_VERSION` | Versão fixada em `v25` |
-| `GOOGLE_ADS_AUTH_MODE` | `user_oauth` para o fluxo atual; `service_account` para o fluxo anterior |
-| `GOOGLE_ADS_CLIENT_ID` | Identificador do cliente OAuth próprio, modo `user_oauth` |
-| `GOOGLE_ADS_CLIENT_SECRET` | Secret do cliente OAuth, modo `user_oauth` |
-| `GOOGLE_ADS_REFRESH_TOKEN` | Secret obtido com acesso offline e escopo `adwords`, modo `user_oauth` |
-| `GOOGLE_ADS_SERVICE_ACCOUNT_JSON` | Secret exigido somente no modo `service_account` |
+| `PUBLIC_ORIGIN` | Origem HTTPS exata do Worker, sem barra final ou `/mcp` |
+| `STOICUS_ALLOWED_EMAILS` | Operadores permitidos; lista vazia bloqueia acesso |
+| `GOOGLE_ADS_CUSTOMER_ID` | Única conta de destino |
+| `GOOGLE_ADS_LOGIN_CUSTOMER_ID` | Opcional, conta gerente confirmada |
+| `GOOGLE_ADS_AUTH_MODE` | `user_oauth` |
+| `GOOGLE_ADS_API_VERSION` | `v25` |
+| `GOOGLE_ADS_CLIENT_ID` | Cliente OAuth próprio |
+| `GOOGLE_ADS_CLIENT_SECRET` | Secret do cliente OAuth |
+| `GOOGLE_ADS_REFRESH_TOKEN` | Secret da autorização Google com escopo `adwords` |
+| `OAUTH_KV` | Concessões MCP e sessões temporárias de login |
+| `GOOGLE_ADS_OPERATIONS` | Durable Object SQLite para gravações e recibos |
 
-O Worker desta pasta exige `user_oauth`. No adaptador isolado, omitir o modo mantém `service_account` por compatibilidade com o código anterior. Não há fallback. Configuração incompleta é rejeitada antes da rede. No modo OAuth, o servidor envia a concessão `refresh_token` para `https://oauth2.googleapis.com/token`; nenhuma chave de conta de serviço é necessária. O modo antigo assina JWT RS256 sem impersonação e permanece disponível apenas onde autorizado.
+Não é preciso alterar a política que bloqueia chaves de conta de serviço nem substituir secrets válidos. O transporte isolado antigo de conta de serviço permanece compatível, mas o Worker exige `user_oauth`. Não há fallback automático de identidade nem encaminhamento de credenciais para destinos arbitrários. Erros expõem códigos, posições de campos, HTTP e request ID controlados; nunca textos brutos Google ou tokens.
 
-O token de acesso fica em memória. Chamadas concorrentes compartilham uma renovação por instância; renovação próxima ao vencimento ocorre antes da consulta. HTTP 401 invalida o cache, sem repetir automaticamente a operação. Atualizar secrets exige reconstruir a instância, pois a configuração é copiada na criação. Limites compartilhados entre várias instâncias dependem do host.
+`/health` mostra `version=0.2.0`, `mode=management`, presença de configuração e `write_infrastructure_ready`. Não testa Google: `google_connection_tested=false` permanece literal. A leitura da conta não comprova permissão nativa de escrita.
 
-## Transporte e login
+Para operação contínua, concluir a publicação OAuth aplicável: um app externo em Testando com escopo `adwords` recebe refresh token limitado a sete dias. A publicação OAuth é independente da implantação Worker e da autorização MCP. Desde 09/09/2026, os níveis de acesso Google Ads são controlados pelo projeto Google Cloud; este adaptador não envia developer token.
 
-`worker.mjs` publica Streamable HTTP em `/mcp`, com SDK MCP e `@cloudflare/workers-oauth-provider` fixados no lockfile. Usa sessões MCP sem estado; o adaptador é criado por requisição, aproveitando cache de token apenas nas consultas daquela requisição. O token MCP é diferente do token Google e tem audiência restrita à origem e ao caminho configurados.
+## Validação e implantação
 
-O login Google solicita somente `openid email` para identificar o operador; as leituras Ads usam o refresh token guardado no servidor. O fluxo exige PKCE S256, correspondência entre state e cookie HttpOnly/Secure, e confirmação de e-mail verificado presente na lista de operadores. O consentimento mostra o cliente e o destino antes de emitir a autorização MCP. A lista de operadores e o escopo efetivo são conferidos novamente em cada requisição protegida e renovação MCP.
+Executar `npm ci` e `npm test` nesta pasta. Os testes usam Google e credenciais fictícios, com o Worker empacotado, SDK MCP, biblioteca OAuth e Durable Object SQLite reais no Miniflare. Cobrem leitura anterior, escopos, consentimento, consulta paginada, catálogo, CRUD, ativação, atomicidade, campos exatos, duplicação, concorrência e falhas incertas. Não fazem alterações em uma conta Google real.
 
-O servidor aceita callbacks ChatGPT reconhecidos, oferece CIMD com proteção SSRF da Cloudflare e DCR como alternativa. Tokens reduzidos a escopos insuficientes não herdam a permissão antiga. Erros, redirects e respostas são protegidos contra cache e envio de Referer; nenhum token Google é entregue ao cliente MCP. A KV própria armazena concessões MCP e sessões temporárias de login de dez minutos.
-
-Sem as variáveis obrigatórias, o servidor responde `503` e não expõe ferramentas. `/health` mostra versão e presença de configuração; nunca testa Google nem comprova validade das credenciais. O bundle não inclui código ou bindings do Meta.
-
-## Autorização temporária e uso contínuo
-
-O teste usa cliente próprio no OAuth Playground, com URI de redirecionamento exatamente `https://developers.google.com/oauthplayground`. Credenciais próprias evitam a revogação de 24 horas específica das credenciais padrão do Playground.
-
-Um app externo com status OAuth **Testando** e escopo `adwords` recebe refresh tokens com validade de sete dias. Para operação contínua, concluir a configuração de publicação aplicável, com apresentação e política de privacidade que descrevam o conector. Páginas institucionais sobre cursos não demonstram sozinhas como o aplicativo usa dados Google. Publicação OAuth não equivale a implantação MCP, nem torna tokens irrevogáveis.
-
-Se uma credencial aparecer em captura, chat ou log, revogar o acesso do aplicativo na Conta do Google e refazer a autorização. O novo refresh token deve ser salvo pelo painel seguro de secrets, com o client ID e secret correspondentes.
-
-Desde 09/09/2026, a documentação informa que níveis de acesso são controlados pelo projeto Google Cloud e que developer tokens foram descontinuados. Este adaptador não envia esse cabeçalho. Confirmar o nível no projeto do cliente OAuth usado.
-
-## Pendências para conectar
-
-1. Criar o Worker Google a partir desta pasta conforme [DEPLOY.md](./DEPLOY.md).
-2. Salvar as credenciais pelo painel de secrets e configurar origem, conta e operadores.
-3. Adicionar a origem do Worker com caminho `/callback` ao cliente OAuth Google já criado; preservar o redirect do Playground.
-4. Conectar `/mcp` no ChatGPT, autorizar pelo Google e conferir a conta retornada na primeira consulta real do servidor.
-5. Resolver a publicação OAuth para uso contínuo. Conversões, GA4, segmentação e entrega exigem validações adicionais. Não ativar anúncios durante esta validação.
-
-## Validação local
-
-```sh
-cd google-ads
-npm ci
-npm test
-```
-
-Validação desta revisão: 28 testes passaram e o bundle foi gerado pelo Wrangler. Os testes usam chave efêmera, credenciais fictícias e Google simulado. Além do adaptador, executam o Worker empacotado no Miniflare com a biblioteca OAuth e o SDK reais: descoberta, registro, state/cookie, login, consentimento, troca de código, audiência, escopos, catálogo e chamada MCP. Não comprovam implantação nem substituem o teste real com a conta da Stoicus.
+Seguir [DEPLOY.md](./DEPLOY.md). A revisão permanece no PR 41; implantação automática do Worker Google pela branch `ads-google`, raiz `google-ads`, comando `npm run deploy` com `--keep-vars`. Nenhuma alteração em anúncios é necessária para instalar esta versão.
 
 ## Fontes
 
-- [OAuth para uma única conta](https://developers.google.com/google-ads/api/docs/oauth/single-user-authentication)
-- [Renovação de tokens no servidor](https://developers.google.com/identity/protocols/oauth2/web-server#offline)
-- [Validade de refresh tokens](https://developers.google.com/identity/protocols/oauth2#expiration)
-- [OAuth Playground](https://developers.google.com/oauthplayground/)
-- [Gerenciar acesso de aplicativos](https://support.google.com/accounts/answer/13533235?hl=pt-BR)
-- [Mudança para projetos Google Cloud](https://developers.google.com/google-ads/api/docs/api-policy/developer-token)
-- [Conta de serviço no Google Ads](https://developers.google.com/google-ads/api/docs/oauth/service-accounts)
-
-Fontes internas: Guia Mestre Meta v2, Automação Meta v1 e Guia de Continuidade v3. Reutilizar controles e aprendizados; parâmetros históricos permanecem específicos das campanhas Meta.
+- [Mutação de recursos](https://developers.google.com/google-ads/api/docs/mutating/overview)
+- [Exemplos REST, máscaras, lotes e remoção](https://developers.google.com/google-ads/api/rest/examples)
+- [MutateOperation v25](https://developers.google.com/google-ads/api/reference/rpc/v25/MutateOperation)
+- [Protocolos oficiais v25](https://github.com/googleapis/googleapis/tree/master/google/ads/googleads/v25)
+- [OAuth para uma conta](https://developers.google.com/google-ads/api/docs/oauth/single-user-authentication)
+- [Validade dos refresh tokens](https://developers.google.com/identity/protocols/oauth2#expiration)
+- [Durable Objects e armazenamento SQLite](https://developers.cloudflare.com/durable-objects/best-practices/access-durable-objects-storage/)
+- [Autenticação MCP](https://developers.openai.com/plugins/build/auth)

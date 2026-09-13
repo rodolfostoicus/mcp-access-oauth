@@ -1,6 +1,8 @@
 // Browser login is independent of the server-side Google Ads refresh grant.
 // Only opaque, short-lived session handles are stored in cookies.
 export const READ_SCOPE = 'google_ads.read';
+export const WRITE_SCOPE = 'google_ads.write';
+export const SCOPES = [READ_SCOPE, WRITE_SCOPE];
 const COOKIE = '__Host-stoicus-google-login';
 const TTL = 600;
 const GOOGLE_TOKEN = 'https://oauth2.googleapis.com/token';
@@ -76,16 +78,17 @@ export function createAuthHandler({ origin, fetchImpl = (...args) => globalThis.
     async fetch(request, env) {
       const url = new URL(request.url);
       if (url.pathname === '/' && request.method === 'GET') {
-        return page('Google Ads Stoicus Secure', '<p>Conector privado da Stoicus para consultar a conta Google Ads, campanhas e resultados.</p><p>O acesso exige uma conta Google autorizada pela Stoicus e consentimento para cada nova conexão.</p><p>Esta versão permite consultas. Não cria nem altera anúncios.</p>');
+        return page('Google Ads Stoicus Secure', '<p>Conector privado da Stoicus para consultar, criar, modificar e remover recursos da conta Google Ads.</p><p>O acesso exige uma conta Google autorizada pela Stoicus. Cada conexão recebe as permissões exibidas no consentimento.</p>');
       }
       if (url.pathname === '/authorize' && request.method === 'GET') {
         let authRequest;
         try { authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request); } catch { reject('INVALID_AUTHORIZATION_REQUEST'); }
         if (!trustedRedirect(authRequest.redirectUri) || authRequest.responseType !== 'code' ||
             authRequest.codeChallengeMethod !== 'S256' || !authRequest.codeChallenge) reject('UNSUPPORTED_OAUTH_CLIENT');
-        if (!Array.isArray(authRequest.scope) || authRequest.scope.some(s => s !== READ_SCOPE)) reject('UNSUPPORTED_SCOPE');
-        // Missing scope means the single baseline permission displayed at consent.
+        if (!Array.isArray(authRequest.scope) || authRequest.scope.some(s => !SCOPES.includes(s))) reject('UNSUPPORTED_SCOPE');
+        // Never upgrade an omitted/legacy scope to write without consent.
         if (authRequest.scope.length === 0) authRequest.scope = [READ_SCOPE];
+        if (authRequest.scope.includes(WRITE_SCOPE) && !authRequest.scope.includes(READ_SCOPE)) authRequest.scope.push(READ_SCOPE);
         const client = await env.OAUTH_PROVIDER.lookupClient(authRequest.clientId);
         if (!client) reject('UNKNOWN_OAUTH_CLIENT');
         const verifier = random();
@@ -123,7 +126,9 @@ export function createAuthHandler({ origin, fetchImpl = (...args) => globalThis.
         const { key, saved } = await session(env, request, 'consent');
         if (!allowedEmail(env, saved.email)) reject('OPERATOR_NOT_ALLOWED', 403);
         if (request.method === 'GET') {
-          return page('Autorizar conexão', `<p>Conta: <strong>${escape(saved.email)}</strong></p><p>Permitir que <strong>${escape(saved.clientName)}</strong> consulte os dados Google Ads da Stoicus: identificação da conta, campanhas, orçamentos e resultados.</p><p>Destino da autorização: <code>${escape(saved.authRequest.redirectUri)}</code></p><form method="post" action="/consent"><input type="hidden" name="csrf" value="${escape(saved.csrf)}"><button name="decision" value="allow">Autorizar leitura</button> <button name="decision" value="deny">Cancelar</button></form>`);
+          const write = saved.authRequest.scope.includes(WRITE_SCOPE);
+          const permission = write ? 'consulte, crie, modifique e remova recursos Google Ads da Stoicus, incluindo anúncios, campanhas, orçamentos, públicos e configurações da conta. Alterações podem ativar anúncios, gerar despesas ou remover recursos' : 'consulte os dados Google Ads da Stoicus: identificação da conta, campanhas, orçamentos e resultados';
+          return page('Autorizar conexão', `<p>Conta: <strong>${escape(saved.email)}</strong></p><p>Permitir que <strong>${escape(saved.clientName)}</strong> ${permission}.</p><p>Destino da autorização: <code>${escape(saved.authRequest.redirectUri)}</code></p><form method="post" action="/consent"><input type="hidden" name="csrf" value="${escape(saved.csrf)}"><button name="decision" value="allow">${write ? 'Autorizar gestão completa' : 'Autorizar leitura'}</button> <button name="decision" value="deny">Cancelar</button></form>`);
         }
         if (request.headers.get('Origin') !== origin) reject('CONSENT_ORIGIN_MISMATCH', 403);
         if (!request.headers.get('Content-Type')?.startsWith('application/x-www-form-urlencoded')) reject('INVALID_CONSENT');
@@ -132,8 +137,8 @@ export function createAuthHandler({ origin, fetchImpl = (...args) => globalThis.
         await env.OAUTH_KV.delete(key);
         if (form.get('decision') !== 'allow') return page('Conexão cancelada', '<p>Você pode fechar esta janela.</p>');
         const completed = await env.OAUTH_PROVIDER.completeAuthorization({ request: saved.authRequest,
-          userId: saved.userId, metadata: { clientName: saved.clientName }, scope: [READ_SCOPE],
-          props: { userId: saved.userId, email: saved.email, scopes: [READ_SCOPE] } });
+          userId: saved.userId, metadata: { clientName: saved.clientName }, scope: saved.authRequest.scope,
+          props: { userId: saved.userId, email: saved.email, scopes: saved.authRequest.scope } });
         return new Response(null, { status: 302, headers: { Location: completed.redirectTo, 'Set-Cookie': cookie('',0) } });
       }
       return new Response('Not found', { status: 404 });

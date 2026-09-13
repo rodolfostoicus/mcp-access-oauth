@@ -1,5 +1,5 @@
 // Internal Google Ads adapter. Mount only behind authenticated MCP transport.
-// No Meta imports, arbitrary URLs, arbitrary GAQL, mutate endpoints, or logging.
+// Fixed Google transport; only server code can choose API paths. No logging.
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const API_ORIGIN = 'https://googleads.googleapis.com';
 const SCOPE = 'https://www.googleapis.com/auth/adwords';
@@ -9,7 +9,7 @@ const ID = /^\d{10}$/;
 const OAUTH_ERRORS = new Set(['invalid_grant', 'invalid_client', 'invalid_request', 'unauthorized_client', 'unsupported_grant_type', 'invalid_scope']);
 const encoder = new TextEncoder();
 
-class SafeError extends Error {
+export class SafeError extends Error {
   constructor(code, details = {}) { super(code); this.code = code; this.details = details; }
 }
 function fail(code) { throw new SafeError(code); }
@@ -31,7 +31,7 @@ function day(value) {
 function validateArgs(args, required) {
   if (!record(args) || Object.keys(args).some(k => !required.includes(k)) || required.some(k => !(k in args))) fail('INVALID_ARGUMENTS');
 }
-function config(env) {
+export function config(env) {
   const id = customerId(env.GOOGLE_ADS_CUSTOMER_ID);
   const login = env.GOOGLE_ADS_LOGIN_CUSTOMER_ID ? customerId(env.GOOGLE_ADS_LOGIN_CUSTOMER_ID) : null;
   // Version pinned to the current major release; upgrades require review.
@@ -79,8 +79,7 @@ export function listGoogleAdsTools() {
  * Create one adapter per authenticated transport/session. Never expose env to tools.
  * fetchImpl/now are dependency injection for offline tests, not tool arguments.
  */
-export function createGoogleAdsReadOnly({ env, authorize, fetchImpl = (...args) => globalThis.fetch(...args), now = Date.now }) {
-  if (typeof authorize !== 'function') fail('AUTHENTICATED_TRANSPORT_REQUIRED');
+export function createGoogleAdsClient({ env, fetchImpl = (...args) => globalThis.fetch(...args), now = Date.now }) {
   // Snapshot configuration so an instance cannot reuse a cached token for new credentials.
   const settings = Object.freeze({ ...env });
   let cachedToken = null;
@@ -113,8 +112,13 @@ export function createGoogleAdsReadOnly({ env, authorize, fetchImpl = (...args) 
       if (!response.ok) {
         // Do not return raw Google error messages, headers, body, assertions or keys.
         const codes = [];
+        const fieldPaths = [];
         for (const detail of (Array.isArray(data?.error?.details) ? data.error.details : [])) {
           for (const error of (Array.isArray(detail?.errors) ? detail.errors : [])) {
+            const elements = error?.location?.fieldPathElements;
+            if (Array.isArray(elements) && elements.length <= 30 && elements.every(x=>typeof x.fieldName==='string' && /^[A-Za-z][A-Za-z0-9_]{0,100}$/.test(x.fieldName) && (x.index===undefined || Number.isSafeInteger(x.index)))) {
+              fieldPaths.push(elements.map(x=>x.fieldName+(x.index===undefined?'':`[${x.index}]`)).join('.'));
+            }
             for (const code of Object.values(record(error?.errorCode) ? error.errorCode : {})) {
               if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,99}$/.test(code)) codes.push(code);
             }
@@ -125,6 +129,7 @@ export function createGoogleAdsReadOnly({ env, authorize, fetchImpl = (...args) 
         throw new SafeError(stage + '_FAILED', {
           http_status: response.status,
           codes: [...new Set(codes)].slice(0, 10),
+          ...(fieldPaths.length ? { field_paths: [...new Set(fieldPaths)].slice(0,10) } : {}),
           ...(oauthError ? { oauth_error: oauthError, ...(oauthError === 'invalid_grant' ? { reauthorization_required: true } : {}) } : {}),
           ...(requestId && /^[a-zA-Z0-9_-]{1,100}$/.test(requestId) ? { request_id: requestId } : {}),
         });
@@ -201,6 +206,20 @@ export function createGoogleAdsReadOnly({ env, authorize, fetchImpl = (...args) 
     return a;
   }
 
+  async function api(path, body, fields = false) {
+    const c = config(settings);
+    const token = await accessToken(c);
+    const headers = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
+    if (c.login) headers['login-customer-id'] = c.login;
+    const target = fields ? '/googleAdsFields:search' : `/customers/${c.id}${path}`;
+    return requestJSON(`${API_ORIGIN}/v25${target}`, { method: 'POST', headers, body: JSON.stringify(body) }, 'GOOGLE_ADS');
+  }
+  return Object.freeze({ config: () => config(settings), search, getAccount, api });
+}
+
+export function createGoogleAdsReadOnly({ env, authorize, fetchImpl, now }) {
+  if (typeof authorize !== 'function') fail('AUTHENTICATED_TRANSPORT_REQUIRED');
+  const { config: getConfig, search, getAccount } = createGoogleAdsClient({ env, fetchImpl, now });
   return Object.freeze({
     listTools: listGoogleAdsTools,
     async callTool(name, args = {}) {
@@ -214,7 +233,7 @@ export function createGoogleAdsReadOnly({ env, authorize, fetchImpl = (...args) 
           const interval = (day(args.end_date) - day(args.start_date)) / 86400000;
           if (interval < 0 || interval > 92) fail('DATE_RANGE_MUST_BE_1_TO_93_DAYS');
         }
-        const c = config(settings);
+        const c = getConfig();
         if (!ID.test(c.id)) fail('INVALID_CUSTOMER_ID');
         const account = await getAccount(c);
         const common = { mode: 'read_only', customer_id: c.id, currency: account.currencyCode, time_zone: account.timeZone, read_access_verified: true, write_access_verified: false };

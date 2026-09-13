@@ -1,6 +1,22 @@
 # Implantação do Google Ads Stoicus Secure
 
-Destino: novo Cloudflare Worker **stoicus-google-ads-mcp**. O repositório contém também o Worker Meta na raiz. A raiz de construção do Google é obrigatoriamente **google-ads**.
+Destino: Cloudflare Worker existente **stoicus-google-ads-mcp**. O repositório contém também o Worker Meta na raiz. A raiz de construção do Google é obrigatoriamente **google-ads**.
+
+## Atualização 0.2.0 — gestão completa de recursos
+
+Esta atualização foi autorizada pela responsável para habilitar leitura, criação, alteração e remoção no plugin existente. Preservar Worker, URL, plugin, cliente OAuth e secrets atuais. Não criar outro conector.
+
+1. Publicar o commit testado em `ads-google` e na branch de revisão do PR 41. A integração GitHub/Cloudflare usa `google-ads` como raiz, `npm test` como build e `npm run deploy` como deploy.
+2. A migração `google-ads-operations-v1` cria automaticamente a classe SQLite `GoogleAdsOperations` e o binding `GOOGLE_ADS_OPERATIONS`. Preservar `OAUTH_KV` e as variáveis existentes.
+3. Conferir o check **Workers Builds: stoicus-google-ads-mcp** e a versão 0.2.0 em `/health`. `write_infrastructure_ready` deve ser `true`; o health não comprova permissão de escrita no Google Ads.
+4. No plugin existente, usar **Atualizar** para carregar as 11 ferramentas. Conceder o novo escopo `google_ads.write` pelo fluxo OAuth e escolher **Autorizar gestão completa**. Uma conexão antiga de leitura pode continuar consultando; uma tentativa de usar ferramenta de escrita gera desafio de escopo insuficiente.
+5. Na conversa com o plugin selecionado, executar `google_ads_get_capabilities` e conferir os escopos `google_ads.read` e `google_ads.write`. Essa conferência não modifica anúncios. A primeira tarefa real de gestão deve usar os objetos e parâmetros autorizados e conferir o retorno Google.
+
+O novo escopo precisa do consentimento OAuth do operador; alterar o código não amplia silenciosamente concessões antigas. A permissão de escrita Google continua limitada ao papel da pessoa, ao nível de acesso da API e aos métodos suportados pelo Google. O catálogo em `resource-catalog.json` descreve 78 tipos e suas ações nativas; não representa todas as funções da interface web Google Ads.
+
+Os testes de gravação desta atualização usam um Google simulado. A publicação habilita ferramentas; não executa criação, remoção, ativação nem alteração de orçamento na conta real.
+
+## Instalação inicial (histórico)
 
 ## 1. Criar o Worker pelo GitHub
 
@@ -42,11 +58,11 @@ Salvar e implantar as alterações no painel. Os próximos deploys usam `--keep-
 
 Na Google Auth Platform, abrir Clientes e selecionar o cliente web já utilizado. Em URIs de redirecionamento autorizados, adicionar a URL pública do Worker seguida de `/callback`. Exemplo fictício: `https://stoicus-google-ads-mcp.sua-conta.workers.dev/callback`.
 
-Preservar o URI `https://developers.google.com/oauthplayground`. O login do conector usa `openid email`; a consulta Ads continua usando o refresh token com escopo `adwords`. Enquanto o app for externo em Testando, o operador também deve constar nos usuários de teste.
+Preservar o URI `https://developers.google.com/oauthplayground`. O login do conector usa `openid email`; o acesso Ads continua usando o refresh token com escopo `adwords`. Enquanto o app for externo em Testando, o operador também deve constar nos usuários de teste.
 
 ## 4. Conectar e conferir
 
-Usar a URL do Worker seguida de `/mcp` na configuração de um conector MCP com OAuth no ChatGPT. O Google fará o login; o conector verificará o e-mail autorizado e exibirá o consentimento de leitura.
+Usar a URL do Worker seguida de `/mcp` na configuração de um conector MCP com OAuth no ChatGPT. O Google fará o login; o conector verificará o e-mail autorizado e exibirá o consentimento dos escopos solicitados: leitura ou gestão completa.
 
 Conferir a resposta real de `google_ads_get_account`: conta, nome, BRL e fuso `America/Sao_Paulo`. Validar inventário de campanhas em seguida. Nenhuma dessas consultas ativa anúncios.
 

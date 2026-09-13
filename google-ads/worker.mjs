@@ -3,9 +3,11 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { createGoogleAdsReadOnly, listGoogleAdsTools } from './read-only.mjs';
-import { createAuthHandler, allowedEmail, trustedRedirect, READ_SCOPE, AuthFailure, page } from './auth.mjs';
+import { createAuthHandler, allowedEmail, trustedRedirect, READ_SCOPE, WRITE_SCOPE, SCOPES, AuthFailure, page } from './auth.mjs';
+import { createManagement, listManagementTools, outputSchema, MAX_MUTATION_BYTES } from './management.mjs';
+export { GoogleAdsOperations } from './operations.mjs';
 
-const VERSION = '0.1.1';
+const VERSION = '0.2.0';
 const required = ['PUBLIC_ORIGIN', 'STOICUS_ALLOWED_EMAILS', 'GOOGLE_ADS_CUSTOMER_ID',
   'GOOGLE_ADS_CLIENT_ID', 'GOOGLE_ADS_CLIENT_SECRET', 'GOOGLE_ADS_REFRESH_TOKEN'];
 function secure(response, referrerPolicy = 'no-referrer', formAction = "'self'") {
@@ -33,7 +35,8 @@ async function boundedRequest(request) {
     const part = await reader.read();
     if (part.done) break;
     length += part.value.byteLength;
-    if (length > 65536) { await reader.cancel(); throw new AuthFailure('REQUEST_TOO_LARGE', 413); }
+    const limit = new URL(request.url).pathname === '/mcp' ? MAX_MUTATION_BYTES + 65536 : 65536;
+    if (length > limit) { await reader.cancel(); throw new AuthFailure('REQUEST_TOO_LARGE', 413); }
     chunks.push(part.value);
   }
   return new Request(request.url, { method: request.method, headers: request.headers, body: new Blob(chunks), redirect: request.redirect });
@@ -47,12 +50,17 @@ const apiHandler = {
     if (new URL(request.url).pathname !== '/mcp') return new Response('Not found', { status: 404 });
     if (request.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: { Allow: 'POST' } });
     const adapter = createGoogleAdsReadOnly({ env, authorize });
+    const authorizeScope = scope => authorize() && props.scopes.includes(scope);
+    const management = createManagement({ env, authorize: authorizeScope, operator: props });
     const server = new Server({ name: 'stoicus-google-ads', version: VERSION }, { capabilities: { tools: {} } });
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: listGoogleAdsTools().map(tool => ({
-      ...tool, _meta: { securitySchemes: [{ type: 'oauth2', scopes: [READ_SCOPE] }] },
-    })) }));
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [...listGoogleAdsTools().map(tool => ({
+      ...tool, outputSchema, _meta: { securitySchemes: [{ type: 'oauth2', scopes: [READ_SCOPE] }] },
+    })), ...listManagementTools()] }));
     server.setRequestHandler(CallToolRequestSchema, async message => {
-      const result = await adapter.callTool(message.params.name, message.params.arguments ?? {});
+      const managed = listManagementTools().some(t=>t.name===message.params.name);
+      const result = await (managed ? management : adapter).callTool(message.params.name, message.params.arguments ?? {});
+      if (result.error === 'WRITE_SCOPE_REQUIRED') return {content:[{type:'text',text:JSON.stringify(result)}],structuredContent:result,isError:true,
+        _meta:{'mcp/www_authenticate':[`Bearer resource_metadata="${env.PUBLIC_ORIGIN}/.well-known/oauth-protected-resource/mcp", error="insufficient_scope", scope="${READ_SCOPE} ${WRITE_SCOPE}"`]}};
       return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result, isError: Boolean(result.error) };
     });
     const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
@@ -68,7 +76,8 @@ export default {
       const url = new URL(input.url);
       const origin = configuredOrigin(env);
       if (url.pathname === '/health' && input.method === 'GET') return secure(Response.json({
-        service: 'stoicus-google-ads', version: VERSION, mode: 'read_only',
+        service: 'stoicus-google-ads', version: VERSION, mode: 'management',
+        write_infrastructure_ready: Boolean(env.GOOGLE_ADS_OPERATIONS),
         status: origin ? 'configured' : 'setup_required', google_connection_tested: false,
       }));
       if (!origin) return secure(page('Configuração pendente', '<p>O conector Google Ads está instalado e aguarda configuração pelo administrador.</p>', 503));
@@ -79,7 +88,7 @@ export default {
       const provider = new OAuthProvider({
         apiRoute: '/mcp', apiHandler, defaultHandler: createAuthHandler({ origin }),
         authorizeEndpoint: '/authorize', tokenEndpoint: '/oauth/token', clientRegistrationEndpoint: '/oauth/register',
-        scopesSupported: [READ_SCOPE], accessTokenTTL: 3600, refreshTokenTTL: 2592000,
+        scopesSupported: SCOPES, accessTokenTTL: 3600, refreshTokenTTL: 2592000,
         allowImplicitFlow: false, allowPlainPKCE: false, allowTokenExchangeGrant: false,
         clientIdMetadataDocumentEnabled: true,
         clientRegistrationCallback: ({ clientMetadata }) => {
@@ -91,10 +100,10 @@ export default {
         tokenExchangeCallback: ({ props, requestedScope }) => {
           if (!props || !allowedEmail(env, props.email)) throw new OAuthError('access_denied', { description: 'Operator not allowed.' });
           return { accessTokenProps: { userId: props.userId, email: props.email,
-            scopes: requestedScope.filter(s => s === READ_SCOPE) } };
+            scopes: requestedScope.filter(s => SCOPES.includes(s) && props.scopes?.includes(s)) } };
         },
         resourceMetadata: { resource: origin + '/mcp', authorization_servers: [origin],
-          scopes_supported: [READ_SCOPE], resource_name: 'Google Ads Stoicus Secure', bearer_methods_supported: ['header'] },
+          scopes_supported: SCOPES, resource_name: 'Google Ads Stoicus Secure', bearer_methods_supported: ['header'] },
       });
       // Fetch serializes Origin as null on a native form POST with no-referrer.
       // The consent form needs its real Origin for CSRF checks. same-origin keeps
