@@ -9,15 +9,17 @@ No painel Cloudflare, abrir Workers & Pages, criar uma aplicação Worker e cone
 | Campo | Valor |
 | --- | --- |
 | Nome do Worker | `stoicus-google-ads-mcp` |
-| Branch de implantação inicial | `codex/google-ads-readonly-foundation` |
+| Production branch | `ads-google` |
 | Root directory | `google-ads` |
 | Build command | `npm test` |
 | Deploy command | `npm run deploy` |
 | Caminhos observados, se configurados | `google-ads/**` |
 
+Se a tela de criação não mostrar a branch, configurar `Path=google-ads` e concluir o cadastro. A tentativa inicial pode falhar porque o Cloudflare seleciona `main`, onde o código Google ainda não foi integrado. No novo Worker, abrir **Settings → Builds → Branch control**, selecionar **ads-google** e salvar. Um novo commit nessa branch inicia o build correto. Manter Builds for non-production branches desmarcado.
+
 Os comandos usam o lockfile desta pasta. O Wrangler cria a KV própria `OAUTH_KV` por provisionamento automático; não usar o ID da KV Meta. O Worker pode ser publicado inicialmente sem credenciais: retorna configuração pendente, sem acesso aos dados Google.
 
-A branch permanece de preparação até a validação real. Quando houver integração ao main autorizada, mudar somente a branch do Worker Google. A configuração do Worker Meta permanece independente.
+A branch `ads-google` é usada para implantação. A revisão continua no PR 41, cuja branch é `codex/google-ads-readonly-foundation`; manter as duas no mesmo commit revisado ao publicar atualizações. Quando houver integração ao main autorizada, mudar somente a branch do Worker Google. A configuração do Worker Meta permanece independente.
 
 ## 2. Configurar variáveis e secrets
 
