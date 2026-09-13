@@ -79,7 +79,7 @@ export function listGoogleAdsTools() {
  * Create one adapter per authenticated transport/session. Never expose env to tools.
  * fetchImpl/now are dependency injection for offline tests, not tool arguments.
  */
-export function createGoogleAdsReadOnly({ env, authorize, fetchImpl = fetch, now = Date.now }) {
+export function createGoogleAdsReadOnly({ env, authorize, fetchImpl = (...args) => globalThis.fetch(...args), now = Date.now }) {
   if (typeof authorize !== 'function') fail('AUTHENTICATED_TRANSPORT_REQUIRED');
   // Snapshot configuration so an instance cannot reuse a cached token for new credentials.
   const settings = Object.freeze({ ...env });
@@ -90,7 +90,11 @@ export function createGoogleAdsReadOnly({ env, authorize, fetchImpl = fetch, now
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15000);
     try {
-      const response = await fetchImpl(url, { ...options, redirect: 'error', signal: controller.signal });
+      const response = await fetchImpl(url, { ...options, redirect: 'manual', signal: controller.signal });
+      if (response.status >= 300 && response.status < 400) {
+        await response.body?.cancel();
+        fail('UPSTREAM_REDIRECT_REJECTED');
+      }
       const reader = response.body?.getReader();
       if (!reader) fail('EMPTY_UPSTREAM_RESPONSE');
       let bytes = 0;

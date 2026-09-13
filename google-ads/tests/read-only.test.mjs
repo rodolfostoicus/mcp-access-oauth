@@ -77,7 +77,7 @@ test('service account JWT has correct signature, scope, audience and no imperson
   assert.equal(calls[1].url, 'https://googleads.googleapis.com/v25/customers/1234567890/googleAds:search');
   assert.equal(calls[1].init.headers.Authorization, 'Bearer fixture-access-token');
   assert.equal(calls[1].init.headers['developer-token'], undefined);
-  assert.ok(calls.every(c => c.init.redirect === 'error' && c.init.signal instanceof AbortSignal));
+  assert.ok(calls.every(c => c.init.redirect === 'manual' && c.init.signal instanceof AbortSignal));
   assert.ok(!JSON.stringify(result).includes('fixture-access-token'));
 });
 test('account identity and timezone are verified before listing campaigns', async () => {
@@ -166,7 +166,7 @@ test('user OAuth refresh needs no service account and sends secrets only to Goog
     assert.ok(!JSON.stringify(result).includes(secret));
     assert.ok(!JSON.stringify(calls.slice(1)).includes(secret));
   }
-  assert.ok(calls.every(c => c.init.redirect === 'error'));
+  assert.ok(calls.every(c => c.init.redirect === 'manual'));
 });
 
 test('incomplete OAuth credentials and unsupported modes fail before any network request', async () => {
@@ -240,4 +240,14 @@ test('user OAuth still enforces operator authorization, fixed account and read-o
   allowed = false;
   assert.equal((await client.callTool('google_ads_get_account')).error, 'UNAUTHORIZED');
   assert.equal(calls.length, 2);
+});
+
+test('upstream redirects never forward OAuth credentials to another destination', async () => {
+  const { client, calls } = fixture({ env: oauthEnv, fetchImpl: async () => new Response(null,
+    { status: 302, headers: { Location: 'https://untrusted.example/token' } }) });
+  const result = await client.callTool('google_ads_get_account');
+  assert.equal(result.error, 'UPSTREAM_REDIRECT_REJECTED');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://oauth2.googleapis.com/token');
+  assert.equal(calls[0].init.redirect, 'manual');
 });

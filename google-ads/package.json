@@ -1,0 +1,19 @@
+{
+  "name": "stoicus-google-ads-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "deploy": "wrangler deploy --keep-vars",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "0.10.3",
+    "@modelcontextprotocol/sdk": "1.30.0"
+  },
+  "devDependencies": {
+    "wrangler": "4.131.1"
+  }
+}

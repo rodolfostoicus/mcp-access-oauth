@@ -1,6 +1,6 @@
 # Google Ads Stoicus Secure — preparação de leitura
 
-Estado: adaptador interno testável, ainda sem transporte MCP Google implantado. Uma consulta manual no OAuth Playground retornou HTTP 200 e confirmou identidade, moeda e fuso da conta. Isso não valida a implantação deste adaptador nem acesso de escrita.
+Estado: adaptador de leitura e servidor MCP preparados para um Worker Google separado. A implantação e a configuração de credenciais reais permanecem pendentes. Uma consulta manual no OAuth Playground retornou HTTP 200 e confirmou identidade, moeda e fuso da conta; isso não valida a implantação deste servidor nem acesso de escrita.
 
 Esta pasta é independente do código Meta. O Worker configurado na raiz continua sendo o Meta; publicar este módulo exige um host separado.
 
@@ -34,6 +34,8 @@ Os valores são variáveis ou secrets do host Google, nunca argumentos de ferram
 
 | Nome | Uso |
 | --- | --- |
+| `PUBLIC_ORIGIN` | Origem HTTPS exata do Worker Google, sem barra final nem caminho |
+| `STOICUS_ALLOWED_EMAILS` | E-mails Google autorizados, separados por vírgula; lista vazia bloqueia acesso |
 | `GOOGLE_ADS_CUSTOMER_ID` | ID confirmado de dez dígitos; aceita também a máscara `123-456-7890` |
 | `GOOGLE_ADS_LOGIN_CUSTOMER_ID` | Opcional, somente com conta gerente confirmada |
 | `GOOGLE_ADS_API_VERSION` | Versão fixada em `v25` |
@@ -43,9 +45,19 @@ Os valores são variáveis ou secrets do host Google, nunca argumentos de ferram
 | `GOOGLE_ADS_REFRESH_TOKEN` | Secret obtido com acesso offline e escopo `adwords`, modo `user_oauth` |
 | `GOOGLE_ADS_SERVICE_ACCOUNT_JSON` | Secret exigido somente no modo `service_account` |
 
-O modo é explícito; se omitido, mantém `service_account` por compatibilidade. Não há fallback. Configuração incompleta é rejeitada antes da rede. No modo OAuth, o servidor envia a concessão `refresh_token` para `https://oauth2.googleapis.com/token`; nenhuma chave de conta de serviço é necessária. O modo antigo assina JWT RS256 sem impersonação e permanece disponível apenas onde autorizado.
+O Worker desta pasta exige `user_oauth`. No adaptador isolado, omitir o modo mantém `service_account` por compatibilidade com o código anterior. Não há fallback. Configuração incompleta é rejeitada antes da rede. No modo OAuth, o servidor envia a concessão `refresh_token` para `https://oauth2.googleapis.com/token`; nenhuma chave de conta de serviço é necessária. O modo antigo assina JWT RS256 sem impersonação e permanece disponível apenas onde autorizado.
 
 O token de acesso fica em memória. Chamadas concorrentes compartilham uma renovação por instância; renovação próxima ao vencimento ocorre antes da consulta. HTTP 401 invalida o cache, sem repetir automaticamente a operação. Atualizar secrets exige reconstruir a instância, pois a configuração é copiada na criação. Limites compartilhados entre várias instâncias dependem do host.
+
+## Transporte e login
+
+`worker.mjs` publica Streamable HTTP em `/mcp`, com SDK MCP e `@cloudflare/workers-oauth-provider` fixados no lockfile. Usa sessões MCP sem estado; o adaptador é criado por requisição, aproveitando cache de token apenas nas consultas daquela requisição. O token MCP é diferente do token Google e tem audiência restrita à origem e ao caminho configurados.
+
+O login Google solicita somente `openid email` para identificar o operador; as leituras Ads usam o refresh token guardado no servidor. O fluxo exige PKCE S256, correspondência entre state e cookie HttpOnly/Secure, e confirmação de e-mail verificado presente na lista de operadores. O consentimento mostra o cliente e o destino antes de emitir a autorização MCP. A lista de operadores e o escopo efetivo são conferidos novamente em cada requisição protegida e renovação MCP.
+
+O servidor aceita callbacks ChatGPT reconhecidos, oferece CIMD com proteção SSRF da Cloudflare e DCR como alternativa. Tokens reduzidos a escopos insuficientes não herdam a permissão antiga. Erros, redirects e respostas são protegidos contra cache e envio de Referer; nenhum token Google é entregue ao cliente MCP. A KV própria armazena concessões MCP e sessões temporárias de login de dez minutos.
+
+Sem as variáveis obrigatórias, o servidor responde `503` e não expõe ferramentas. `/health` mostra versão e presença de configuração; nunca testa Google nem comprova validade das credenciais. O bundle não inclui código ou bindings do Meta.
 
 ## Autorização temporária e uso contínuo
 
@@ -59,19 +71,21 @@ Desde 09/09/2026, a documentação informa que níveis de acesso são controlado
 
 ## Pendências para conectar
 
-1. Concluir a autorização atual e configurar os secrets do host Google pelo canal seguro.
-2. Implementar transporte MCP autenticado separado, restrito aos operadores Stoicus. `authorize()` deve validar a sessão no servidor; este módulo não implementa um servidor HTTP nem a verificação da sessão.
-3. Registrar os descritores e despachar chamadas pelo SDK MCP; converter erros em `isError=true`. Preservar OAuth, KV, chaves e bindings do Meta.
-4. Testar autenticação ponta a ponta, acesso negado, isolamento e consultas reais; publicar a versão revisada e conectar no ChatGPT.
-5. Resolver a publicação OAuth para uso contínuo. Conversões, GA4, segmentação e entrega exigem validações adicionais.
+1. Criar o Worker Google a partir desta pasta conforme [DEPLOY.md](./DEPLOY.md).
+2. Salvar as credenciais pelo painel de secrets e configurar origem, conta e operadores.
+3. Adicionar a origem do Worker com caminho `/callback` ao cliente OAuth Google já criado; preservar o redirect do Playground.
+4. Conectar `/mcp` no ChatGPT, autorizar pelo Google e conferir a conta retornada na primeira consulta real do servidor.
+5. Resolver a publicação OAuth para uso contínuo. Conversões, GA4, segmentação e entrega exigem validações adicionais. Não ativar anúncios durante esta validação.
 
 ## Validação local
 
 ```sh
-node --test google-ads/tests/*.test.mjs
+cd google-ads
+npm ci
+npm test
 ```
 
-Os testes usam chave efêmera, credenciais fictícias e rede simulada. Verificam JWT, concessão OAuth, renovação e revogação, autorização por chamada, conta fixa, ausência de escrita, micros, datas, ocultação de segredos e limites. Não comprovam implantação nem substituem o teste real do servidor.
+Validação desta revisão: 28 testes passaram e o bundle foi gerado pelo Wrangler. Os testes usam chave efêmera, credenciais fictícias e Google simulado. Além do adaptador, executam o Worker empacotado no Miniflare com a biblioteca OAuth e o SDK reais: descoberta, registro, state/cookie, login, consentimento, troca de código, audiência, escopos, catálogo e chamada MCP. Não comprovam implantação nem substituem o teste real com a conta da Stoicus.
 
 ## Fontes
 
