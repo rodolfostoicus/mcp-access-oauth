@@ -56,6 +56,16 @@ Conferir a resposta real de `google_ads_get_account`: conta, nome, BRL e fuso `A
 
 O refresh token do app externo em Testando expira em sete dias. Concluir a configuração de publicação e as informações públicas do aplicativo antes de depender de execução contínua. O token MCP tem duração de uma hora, com concessão renovável por trinta dias; são credenciais diferentes. Remover um e-mail da lista de operadores bloqueia suas próximas requisições e renovações MCP.
 
+## Correção 0.1.1 — origem no consentimento OAuth
+
+A versão 0.1.0 enviava `Referrer-Policy: no-referrer` também na página de consentimento. Pelo [padrão Fetch, seção 3.2](https://fetch.spec.whatwg.org/#origin-header), essa política faz o envio nativo do formulário apresentar `Origin: null`, causando `Origin not allowed`. A versão 0.1.1 usa `Referrer-Policy: same-origin` exclusivamente na resposta GET de `/consent`, preservando a origem do formulário e omitindo referências para destinos externos. Todas as demais respostas continuam com `no-referrer`.
+
+Permanecem as mesmas verificações de origem, cliente, PKCE, state/cookie, sessão, e-mail autorizado e consentimento POST com origem exata e CSRF. `Origin: null` continua bloqueado. Os testes de integração verificam as políticas da página e dos redirecionamentos e negam consentimento com origem opaca ou externa, inclusive com cookie e CSRF válidos.
+
+A política `form-action` da mesma página inclui os dois caminhos de callback ChatGPT aceitos pelo conector, permitindo o redirecionamento final após o formulário em navegadores que aplicam CSP também a esse salto. Não são liberadas outras origens. As outras páginas mantêm `form-action 'self'`.
+
+Após implantar, conferir `version=0.1.1` em `/health` e iniciar novamente a conexão OAuth pelo ChatGPT. Não reutilizar uma URL de callback de uma tentativa anterior. A consulta real de conta continua necessária para validar as credenciais Google Ads.
+
 ## Fontes oficiais
 
 - [Workers com monorepositórios](https://developers.cloudflare.com/workers/ci-cd/builds/advanced-setups/)

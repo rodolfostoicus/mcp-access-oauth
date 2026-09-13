@@ -68,7 +68,14 @@ test('server denies unauthenticated access and publishes canonical OAuth discove
   assert.equal(auth.client_id_metadata_document_supported, true);
   assert.equal(googleCalls.length, before);
   assert.equal((await mf.dispatchFetch('https://other.example/mcp', jsonPost({}))).status, 403);
-  assert.equal((await send('/mcp', { ...jsonPost({}), headers: { ...jsonPost({}).headers, Origin: 'https://untrusted.example' } })).status, 403);
+  for (const browserOrigin of ['null', 'https://accounts.google.com', 'https://untrusted.example']) {
+    for (const path of ['/mcp', '/oauth/token', '/oauth/register', '/authorize', '/callback']) {
+      const response = await send(path, { ...jsonPost({}),
+        headers: { ...jsonPost({}).headers, Origin: browserOrigin } });
+      assert.equal(response.status, 403, `${path}: ${browserOrigin}`);
+    }
+    assert.equal((await send('/mcp', { headers: { Origin: browserOrigin } })).status, 403);
+  }
 });
 test('registration and authorization require trusted callback and S256 PKCE', async () => {
   const response = await send('/oauth/register', jsonPost({ client_name: 'Untrusted', redirect_uris: ['https://untrusted.example/callback'] }));
@@ -86,6 +93,7 @@ test('login binds callback to the browser; tokens never appear in consent HTML',
   assert.equal(googleCalls.length, before);
   const loggedIn = await login(flow);
   assert.equal(loggedIn.status, 302, await loggedIn.clone().text());
+  assert.equal(loggedIn.headers.get('referrer-policy'), 'no-referrer');
   assert.equal(loggedIn.headers.get('location'), origin + '/consent');
   consentCookie = cookie(loggedIn);
   const exchange = new URLSearchParams(googleCalls[before].body);
@@ -99,16 +107,30 @@ test('login binds callback to the browser; tokens never appear in consent HTML',
   assert.ok(!html.includes('<script>fixture'));
   assert.ok(!html.includes('fixture-google-access'));
   assert.ok(!html.includes(settings.GOOGLE_ADS_CLIENT_SECRET));
-  assert.equal(page.headers.get('referrer-policy'), 'no-referrer');
+  // Native browser form POSTs under no-referrer send Origin: null (Fetch §3.2).
+  // Keep a same-origin form submission identifiable without external referrers.
+  assert.equal(page.headers.get('referrer-policy'), 'same-origin');
+  assert.equal(page.headers.get('access-control-allow-origin'), null);
+  assert.match(page.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+  const formAction = page.headers.get('content-security-policy').split(';').map(x => x.trim()).find(x => x.startsWith('form-action '));
+  assert.equal(formAction, "form-action 'self' https://chatgpt.com/connector_platform_oauth_redirect https://chatgpt.com/connector/oauth/");
   csrf = html.match(/name="csrf" value="([^"]+)"/)[1];
   assert.equal((await login(flow)).status, 400);
 });
 test('consent requires same-origin POST and CSRF, then returns issuer and downstream state', async () => {
   const values = { csrf, decision: 'allow' };
+  for (const browserOrigin of ['null', 'https://accounts.google.com', 'https://untrusted.example', 'https://chatgpt.com']) {
+    const denied = await send('/consent', { ...form(values),
+      headers: { ...form(values).headers, Cookie: consentCookie, Origin: browserOrigin } });
+    assert.equal(denied.status, 403);
+    assert.equal(denied.headers.get('location'), null);
+  }
   assert.equal((await send('/consent', { ...form(values), headers: { ...form(values).headers, Cookie: consentCookie } })).status, 403);
   assert.equal((await send('/consent', { ...form({ csrf: 'wrong', decision: 'allow' }), headers: { ...form(values).headers, Cookie: consentCookie, Origin: origin } })).status, 403);
   const approved = await send('/consent', { ...form(values), headers: { ...form(values).headers, Cookie: consentCookie, Origin: origin } });
   assert.equal(approved.status, 302, await approved.clone().text());
+  assert.equal(approved.headers.get('referrer-policy'), 'no-referrer');
+  assert.match(approved.headers.get('content-security-policy'), /form-action 'self';/);
   const location = new URL(approved.headers.get('location'));
   assert.equal(location.origin + location.pathname, callback);
   assert.equal(location.searchParams.get('state'), 'fixture-downstream-state');

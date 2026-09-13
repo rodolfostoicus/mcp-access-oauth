@@ -5,15 +5,15 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { createGoogleAdsReadOnly, listGoogleAdsTools } from './read-only.mjs';
 import { createAuthHandler, allowedEmail, trustedRedirect, READ_SCOPE, AuthFailure, page } from './auth.mjs';
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 const required = ['PUBLIC_ORIGIN', 'STOICUS_ALLOWED_EMAILS', 'GOOGLE_ADS_CUSTOMER_ID',
   'GOOGLE_ADS_CLIENT_ID', 'GOOGLE_ADS_CLIENT_SECRET', 'GOOGLE_ADS_REFRESH_TOKEN'];
-function secure(response) {
+function secure(response, referrerPolicy = 'no-referrer', formAction = "'self'") {
   const result = new Response(response.body, response);
   result.headers.set('Cache-Control', 'no-store');
-  result.headers.set('Referrer-Policy', 'no-referrer');
+  result.headers.set('Referrer-Policy', referrerPolicy);
   result.headers.set('X-Content-Type-Options', 'nosniff');
-  result.headers.set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+  result.headers.set('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`);
   return result;
 }
 function configuredOrigin(env) {
@@ -96,7 +96,16 @@ export default {
         resourceMetadata: { resource: origin + '/mcp', authorization_servers: [origin],
           scopes_supported: [READ_SCOPE], resource_name: 'Google Ads Stoicus Secure', bearer_methods_supported: ['header'] },
       });
-      return secure(await provider.fetch(request, env, ctx));
+      // Fetch serializes Origin as null on a native form POST with no-referrer.
+      // The consent form needs its real Origin for CSRF checks. same-origin keeps
+      // that Origin while suppressing referrers to external destinations.
+      const consentPage = url.pathname === '/consent' && request.method === 'GET';
+      // Browsers can apply form-action to the final OAuth redirect too. Only the
+      // ChatGPT callback paths accepted by trustedRedirect are added on this page.
+      const formAction = consentPage
+        ? "'self' https://chatgpt.com/connector_platform_oauth_redirect https://chatgpt.com/connector/oauth/"
+        : "'self'";
+      return secure(await provider.fetch(request, env, ctx), consentPage ? 'same-origin' : 'no-referrer', formAction);
     } catch (error) {
       return secure(Response.json({ error: error instanceof AuthFailure ? error.code : 'CONNECTOR_REQUEST_FAILED' },
         { status: error instanceof AuthFailure ? error.status : 500 }));
