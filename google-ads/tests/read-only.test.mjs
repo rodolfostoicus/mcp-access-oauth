@@ -7,6 +7,11 @@ const keys = await crypto.subtle.generateKey({ name: 'RSASSA-PKCS1-v1_5', modulu
 const pem = '-----BEGIN PRIVATE KEY-----\n' + Buffer.from(await crypto.subtle.exportKey('pkcs8', keys.privateKey)).toString('base64') + '\n-----END PRIVATE KEY-----';
 const service = { type: 'service_account', client_email: 'fixture@fixture-project.iam.gserviceaccount.com', private_key: pem, token_uri: 'https://oauth2.googleapis.com/token' };
 const env = { GOOGLE_ADS_CUSTOMER_ID: '123-456-7890', GOOGLE_ADS_SERVICE_ACCOUNT_JSON: JSON.stringify(service) };
+const oauthEnv = {
+  GOOGLE_ADS_CUSTOMER_ID: '123-456-7890', GOOGLE_ADS_AUTH_MODE: 'user_oauth',
+  GOOGLE_ADS_CLIENT_ID: 'fixture-client.apps.googleusercontent.com',
+  GOOGLE_ADS_CLIENT_SECRET: 'fixture-secret&=+%', GOOGLE_ADS_REFRESH_TOKEN: 'fixture-refresh/&=+%',
+};
 const account = { id: '1234567890', currencyCode: 'BRL', timeZone: 'America/Sao_Paulo' };
 const json = (x, status = 200, headers = {}) => new Response(JSON.stringify(x), { status, headers });
 const decode = x => JSON.parse(Buffer.from(x, 'base64url'));
@@ -139,6 +144,99 @@ test('reauthorization runs on every call, even when the Google token is cached',
   let allowed = true;
   const { client, calls } = fixture({ authorize: async () => allowed });
   assert.equal((await client.callTool('google_ads_get_account')).read_access_verified, true);
+  allowed = false;
+  assert.equal((await client.callTool('google_ads_get_account')).error, 'UNAUTHORIZED');
+  assert.equal(calls.length, 2);
+});
+
+test('user OAuth refresh needs no service account and sends secrets only to Google token endpoint', async () => {
+  const { client, calls } = fixture({ env: oauthEnv });
+  const result = await client.callTool('google_ads_list_campaigns');
+  assert.equal(result.read_access_verified, true);
+  assert.equal(result.write_access_verified, false);
+  assert.equal(calls[0].url, 'https://oauth2.googleapis.com/token');
+  assert.equal(calls[0].init.method, 'POST');
+  assert.equal(calls[0].init.headers['Content-Type'], 'application/x-www-form-urlencoded');
+  assert.deepEqual(Object.fromEntries(new URLSearchParams(calls[0].init.body)), {
+    grant_type: 'refresh_token', client_id: oauthEnv.GOOGLE_ADS_CLIENT_ID,
+    client_secret: oauthEnv.GOOGLE_ADS_CLIENT_SECRET, refresh_token: oauthEnv.GOOGLE_ADS_REFRESH_TOKEN,
+  });
+  assert.ok(calls.slice(1).every(c => c.url === 'https://googleads.googleapis.com/v25/customers/1234567890/googleAds:search'));
+  for (const secret of [oauthEnv.GOOGLE_ADS_CLIENT_SECRET, oauthEnv.GOOGLE_ADS_REFRESH_TOKEN]) {
+    assert.ok(!JSON.stringify(result).includes(secret));
+    assert.ok(!JSON.stringify(calls.slice(1)).includes(secret));
+  }
+  assert.ok(calls.every(c => c.init.redirect === 'error'));
+});
+
+test('incomplete OAuth credentials and unsupported modes fail before any network request', async () => {
+  for (const change of [
+    { GOOGLE_ADS_AUTH_MODE: 'automatic' }, { GOOGLE_ADS_AUTH_MODE: '' },
+    { GOOGLE_ADS_CLIENT_ID: 'https://invalid.example/' },
+    { GOOGLE_ADS_CLIENT_SECRET: undefined }, { GOOGLE_ADS_REFRESH_TOKEN: undefined },
+    { GOOGLE_ADS_REFRESH_TOKEN: 'has\nnewline' }, { GOOGLE_ADS_CLIENT_SECRET: ' leading-space' },
+  ]) {
+    const { client, calls } = fixture({ env: { ...env, ...oauthEnv, ...change } });
+    assert.ok((await client.callTool('google_ads_get_account')).error);
+    assert.equal(calls.length, 0);
+  }
+});
+
+test('OAuth rejection is redacted and never falls back to another configured identity', async () => {
+  for (const oauthError of ['invalid_grant', 'invalid_client', oauthEnv.GOOGLE_ADS_REFRESH_TOKEN]) {
+    const { client, calls } = fixture({ env: { ...env, ...oauthEnv }, fetchImpl: async () =>
+      json({ error: oauthError, error_description: JSON.stringify(oauthEnv) }, 400) });
+    const result = await client.callTool('google_ads_get_account');
+    assert.equal(result.error, 'OAUTH_FAILED');
+    assert.equal(result.http_status, 400);
+    assert.equal(result.reauthorization_required, oauthError === 'invalid_grant' ? true : undefined);
+    assert.equal(result.oauth_error, oauthError.startsWith('invalid_') ? oauthError : undefined);
+    assert.ok(!JSON.stringify(result).includes('fixture-'));
+    assert.equal(calls.length, 1);
+    assert.equal(new URLSearchParams(calls[0].init.body).get('grant_type'), 'refresh_token');
+  }
+});
+
+test('OAuth cache consolidates refreshes, refreshes near expiry, and keeps the original credential snapshot', async () => {
+  let clock = 1800000000000;
+  const mutableEnv = { ...oauthEnv };
+  const { client, calls } = fixture({ env: mutableEnv, now: () => clock });
+  const results = await Promise.all([client.callTool('google_ads_get_account'), client.callTool('google_ads_get_account')]);
+  assert.ok(results.every(r => r.read_access_verified));
+  assert.equal(calls.filter(c => c.url.endsWith('/token')).length, 1);
+  mutableEnv.GOOGLE_ADS_REFRESH_TOKEN = 'replacement-fixture';
+  clock += 3541000;
+  assert.equal((await client.callTool('google_ads_get_account')).read_access_verified, true);
+  const refreshes = calls.filter(c => c.url.endsWith('/token'));
+  assert.equal(refreshes.length, 2);
+  assert.equal(new URLSearchParams(refreshes[1].init.body).get('refresh_token'), oauthEnv.GOOGLE_ADS_REFRESH_TOKEN);
+});
+
+test('Google 401 drops cached OAuth access; the next call reports revoked refresh without retries', async () => {
+  let revoked = false;
+  let rejectAccess = false;
+  const { client, calls } = fixture({ env: oauthEnv, fetchImpl: async url => {
+    if (url.endsWith('/token')) return revoked ? json({ error: 'invalid_grant' }, 400)
+      : json({ access_token: 'fixture-access-token', expires_in: 3600, token_type: 'Bearer' });
+    return rejectAccess ? json({ error: { message: 'fixture-private-details' } }, 401)
+      : json({ results: [{ customer: account }] });
+  } });
+  assert.equal((await client.callTool('google_ads_get_account')).read_access_verified, true);
+  rejectAccess = true;
+  revoked = true;
+  assert.equal((await client.callTool('google_ads_get_account')).http_status, 401);
+  assert.equal(calls.length, 3);
+  assert.equal((await client.callTool('google_ads_get_account')).reauthorization_required, true);
+  assert.equal(calls.length, 4);
+});
+
+test('user OAuth still enforces operator authorization, fixed account and read-only operations', async () => {
+  let allowed = true;
+  const { client, calls } = fixture({ env: oauthEnv, authorize: async () => allowed });
+  assert.equal((await client.callTool('google_ads_get_account', { customer_id: '9999999999' })).error, 'INVALID_ARGUMENTS');
+  assert.equal((await client.callTool('google_ads_activate_campaign')).error, 'UNSUPPORTED_READ_ONLY_TOOL');
+  assert.equal(calls.length, 0);
+  assert.equal((await client.callTool('google_ads_get_account')).customer_id, '1234567890');
   allowed = false;
   assert.equal((await client.callTool('google_ads_get_account')).error, 'UNAUTHORIZED');
   assert.equal(calls.length, 2);

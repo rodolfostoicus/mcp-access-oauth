@@ -1,14 +1,16 @@
 # Google Ads Stoicus Secure — preparação de leitura
 
-Estado: adaptador interno testável, ainda sem transporte MCP implantado e sem acesso real à conta Google Ads. Esta pasta é independente do código e da implantação do Meta. Não executar o deploy do Worker Meta para publicar este módulo.
+Estado: adaptador interno testável, ainda sem transporte MCP Google implantado. Uma consulta manual no OAuth Playground retornou HTTP 200 e confirmou identidade, moeda e fuso da conta. Isso não valida a implantação deste adaptador nem acesso de escrita.
 
-## Decisões desta conversa
+Esta pasta é independente do código Meta. O Worker configurado na raiz continua sendo o Meta; publicar este módulo exige um host separado.
 
-- A responsável escolheu conector próprio (opção 2) e confirmou que já existe conta Google Ads.
-- ID da conta Google Ads e acesso administrativo ainda não foram confirmados. Não reutilizar IDs Meta.
-- A preparação técnica está autorizada; nenhuma campanha Google, orçamento, data, público ou ativação foi aprovada.
-- Primeiro validar leitura da conta; depois implementar criação pausada com pré-validação, idempotência durável, serialização por conta, auditoria e conferência pós-gravação.
-- Sul significa SC, PR e RS. Não transportar IDs de localização, faixas etárias, cargos ou modelos de orçamento do Meta para o Google. Resolver suporte e IDs do Google quando houver briefing.
+## Escopo autorizado
+
+- Conector próprio para uma única conta Google Ads, com primeira etapa de leitura.
+- API habilitada no projeto Google Cloud, com acesso de Exploração informado na configuração.
+- A criação de chave de conta de serviço foi bloqueada por política organizacional. O caminho escolhido agora é OAuth de usuário, sem alterar essa política.
+- A conta de serviço existente recebeu acesso Padrão por escolha da responsável. O OAuth de usuário usa as permissões da pessoa que autorizou. Este adaptador só consulta.
+- Não reutilizar orçamento, datas, públicos ou IDs Meta. Campanhas Google e ativação exigem briefing e autorização próprios.
 
 ## Implementado
 
@@ -17,41 +19,51 @@ Estado: adaptador interno testável, ainda sem transporte MCP implantado e sem a
 | Ferramenta | Escopo |
 | --- | --- |
 | `google_ads_get_account` | Identidade, moeda e fuso da única conta configurada |
-| `google_ads_list_campaigns` | Inventário limitado a 1.000 campanhas não removidas e orçamentos |
+| `google_ads_list_campaigns` | Até 1.000 campanhas não removidas e seus orçamentos |
 | `google_ads_get_performance` | Métricas por campanha em período explícito de até 93 dias |
 
-Há apenas dois destinos HTTP: OAuth do Google e `GoogleAdsService.Search`, ambos fixos. O POST de Search é consulta. Não existe método de mutação, consulta livre, URL livre ou override do ID pelo chamador. Resultados preservam moeda, fuso e micros monetários. Inventário parcial retorna `complete=false`; não serve como auditoria completa. Consultas são sequenciais dentro de cada operação; renovação de token concorrente é consolidada dentro de uma instância. Coordenação de múltiplas instâncias/limites de conta ainda depende do host.
+Os destinos HTTP são fixos: OAuth do Google e `GoogleAdsService.Search`. O POST de Search é consulta. Não há mutações, consulta livre, URL livre ou troca de conta pelo chamador. Resultados preservam moeda, fuso e micros monetários. Inventário parcial retorna `complete=false`.
 
-Erros retornam código controlado, HTTP e códigos estruturados do Google quando disponíveis. Textos brutos, respostas OAuth, assertions, tokens e chave privada não são expostos. Não há retentativa automática. Há timeout de 15 segundos por requisição e limite de 2 MB por resposta.
+Cada chamada valida novamente o operador no host e confere a identidade da conta na resposta Google. O escopo OAuth `adwords` permite acesso amplo; a restrição deste adaptador vem dos métodos de consulta e da conta fixa, não de um escopo OAuth exclusivo de leitura.
 
-## Autenticação prevista
+Erros expõem apenas códigos controlados, HTTP e identificadores seguros. Respostas OAuth, textos brutos, tokens e chaves não são retornados. `invalid_grant` retorna `reauthorization_required=true`: a autorização precisa ser refeita, sem troca automática para outra identidade. Não há retentativas automáticas. Cada requisição tem timeout de 15 segundos e limite de resposta de 2 MB.
 
-Para a única empresa, conta de serviço dedicada com acesso **somente leitura** na conta Google Ads durante esta etapa. Google Ads usa o mesmo escopo OAuth para leitura e escrita; o papel atribuído na conta e a ausência de mutações no adaptador fazem a restrição efetiva. Leitura bem-sucedida nunca comprova autorização de escrita.
+## Configuração no servidor
 
-Configuração interna, nunca argumentos das ferramentas:
+Os valores são variáveis ou secrets do host Google, nunca argumentos de ferramentas, conteúdo do chat, arquivos versionados ou logs.
 
-| Nome | Armazenamento |
+| Nome | Uso |
 | --- | --- |
-| `GOOGLE_ADS_CUSTOMER_ID` | Variável: ID de dez dígitos, fornecido/confirmado pela responsável |
-| `GOOGLE_ADS_LOGIN_CUSTOMER_ID` | Opcional; somente se houver conta gerente confirmada |
+| `GOOGLE_ADS_CUSTOMER_ID` | ID confirmado de dez dígitos; aceita também a máscara `123-456-7890` |
+| `GOOGLE_ADS_LOGIN_CUSTOMER_ID` | Opcional, somente com conta gerente confirmada |
 | `GOOGLE_ADS_API_VERSION` | Versão fixada em `v25` |
-| `GOOGLE_ADS_SERVICE_ACCOUNT_JSON` | Secret do Worker Google; nunca chat, arquivo versionado ou logs |
+| `GOOGLE_ADS_AUTH_MODE` | `user_oauth` para o fluxo atual; `service_account` para o fluxo anterior |
+| `GOOGLE_ADS_CLIENT_ID` | Identificador do cliente OAuth próprio, modo `user_oauth` |
+| `GOOGLE_ADS_CLIENT_SECRET` | Secret do cliente OAuth, modo `user_oauth` |
+| `GOOGLE_ADS_REFRESH_TOKEN` | Secret obtido com acesso offline e escopo `adwords`, modo `user_oauth` |
+| `GOOGLE_ADS_SERVICE_ACCOUNT_JSON` | Secret exigido somente no modo `service_account` |
 
-A chave da conta de serviço é assinada no servidor usando Web Crypto RS256, sem impersonação. O JWT é trocado no endpoint OAuth oficial, com cache apenas em memória. Criar a chave/configurar o secret será feito pelo fluxo seguro da plataforma; nenhum valor real está incluído nesta pasta.
+O modo é explícito; se omitido, mantém `service_account` por compatibilidade. Não há fallback. Configuração incompleta é rejeitada antes da rede. No modo OAuth, o servidor envia a concessão `refresh_token` para `https://oauth2.googleapis.com/token`; nenhuma chave de conta de serviço é necessária. O modo antigo assina JWT RS256 sem impersonação e permanece disponível apenas onde autorizado.
 
-Desde 09/09/2026 o Google informa que os níveis de acesso passaram ao projeto Google Cloud e que o cabeçalho de developer token é opcional/ignorado. Habilitar a Google Ads API e obter nível permitido para conta de produção no projeto correto. Não criar MCC ou developer token por pressuposto. Revalidar esta orientação no momento da conexão, pois algumas páginas de exemplos ainda contêm instruções anteriores.
+O token de acesso fica em memória. Chamadas concorrentes compartilham uma renovação por instância; renovação próxima ao vencimento ocorre antes da consulta. HTTP 401 invalida o cache, sem repetir automaticamente a operação. Atualizar secrets exige reconstruir a instância, pois a configuração é copiada na criação. Limites compartilhados entre várias instâncias dependem do host.
+
+## Autorização temporária e uso contínuo
+
+O teste usa cliente próprio no OAuth Playground, com URI de redirecionamento exatamente `https://developers.google.com/oauthplayground`. Credenciais próprias evitam a revogação de 24 horas específica das credenciais padrão do Playground.
+
+Um app externo com status OAuth **Testando** e escopo `adwords` recebe refresh tokens com validade de sete dias. Para operação contínua, concluir a configuração de publicação aplicável, com apresentação e política de privacidade que descrevam o conector. Páginas institucionais sobre cursos não demonstram sozinhas como o aplicativo usa dados Google. Publicação OAuth não equivale a implantação MCP, nem torna tokens irrevogáveis.
+
+Se uma credencial aparecer em captura, chat ou log, revogar o acesso do aplicativo na Conta do Google e refazer a autorização. O novo refresh token deve ser salvo pelo painel seguro de secrets, com o client ID e secret correspondentes.
+
+Desde 09/09/2026, a documentação informa que níveis de acesso são controlados pelo projeto Google Cloud e que developer tokens foram descontinuados. Este adaptador não envia esse cabeçalho. Confirmar o nível no projeto do cliente OAuth usado.
 
 ## Pendências para conectar
 
-1. Confirmar ID cliente Google Ads e quem possui acesso administrativo.
-2. Identificar/criar o projeto Google Cloud da Stoicus, habilitar a API e confirmar acesso a produção.
-3. Criar identidade de serviço dedicada e conceder leitura somente à conta confirmada. Guardar credencial pelo canal de secrets.
-4. Implementar e testar transporte MCP autenticado em Worker separado, com política restrita aos operadores Stoicus. `authorize()` é contrato obrigatório do adaptador; ele deve verificar a sessão atual no servidor e nunca confiar em identidade fornecida pelo chamador. Este módulo NÃO implementa essa verificação nem é um servidor HTTP.
-5. Registrar os descritores e despachar chamadas pelo SDK MCP no host, convertendo erros do adaptador em `isError=true`. Não compartilhar transporte, KV OAuth, chaves ou bindings do Meta por conveniência.
-6. Realizar teste de autenticação ponta a ponta, acesso negado e isolamento; publicar somente a versão revisada e conectar no ChatGPT. Nenhuma URL Google MCP existe nesta etapa.
-7. Ler a conta real e conferir nome, ID, moeda, fuso, acesso e inventário. Medição de conversões/GA4, segmentação, anúncios e cobrança exigirão consultas adicionais; não inferir essas validações das três ferramentas iniciais.
-
-Próxima informação necessária da responsável: ID do cliente Google Ads, no formato `123-456-7890` (exemplo fictício). O ID identifica a conta e não concede acesso por si só.
+1. Concluir a autorização atual e configurar os secrets do host Google pelo canal seguro.
+2. Implementar transporte MCP autenticado separado, restrito aos operadores Stoicus. `authorize()` deve validar a sessão no servidor; este módulo não implementa um servidor HTTP nem a verificação da sessão.
+3. Registrar os descritores e despachar chamadas pelo SDK MCP; converter erros em `isError=true`. Preservar OAuth, KV, chaves e bindings do Meta.
+4. Testar autenticação ponta a ponta, acesso negado, isolamento e consultas reais; publicar a versão revisada e conectar no ChatGPT.
+5. Resolver a publicação OAuth para uso contínuo. Conversões, GA4, segmentação e entrega exigem validações adicionais.
 
 ## Validação local
 
@@ -59,14 +71,16 @@ Próxima informação necessária da responsável: ID do cliente Google Ads, no 
 node --test google-ads/tests/*.test.mjs
 ```
 
-Os testes usam chave efêmera gerada em memória e rede simulada. Confirmam assinatura JWT, controle de conta, acesso negado, ausência de escrita, preservação de micros, datas, ocultação de segredos, cache, limites e ausência de retries. Não comprovam autorização Google, compatibilidade real das consultas nem conexão MCP.
+Os testes usam chave efêmera, credenciais fictícias e rede simulada. Verificam JWT, concessão OAuth, renovação e revogação, autorização por chamada, conta fixa, ausência de escrita, micros, datas, ocultação de segredos e limites. Não comprovam implantação nem substituem o teste real do servidor.
 
 ## Fontes
 
-- [Mudança de developer tokens para projetos Google Cloud](https://developers.google.com/google-ads/api/docs/api-policy/developer-token)
+- [OAuth para uma única conta](https://developers.google.com/google-ads/api/docs/oauth/single-user-authentication)
+- [Renovação de tokens no servidor](https://developers.google.com/identity/protocols/oauth2/web-server#offline)
+- [Validade de refresh tokens](https://developers.google.com/identity/protocols/oauth2#expiration)
+- [OAuth Playground](https://developers.google.com/oauthplayground/)
+- [Gerenciar acesso de aplicativos](https://support.google.com/accounts/answer/13533235?hl=pt-BR)
+- [Mudança para projetos Google Cloud](https://developers.google.com/google-ads/api/docs/api-policy/developer-token)
 - [Conta de serviço no Google Ads](https://developers.google.com/google-ads/api/docs/oauth/service-accounts)
-- [Modelo de acesso](https://developers.google.com/google-ads/api/docs/oauth/access-model)
-- [OAuth de serviço e assinatura JWT](https://developers.google.com/identity/protocols/oauth2/service-account)
-- [Versões da API](https://developers.google.com/google-ads/api/docs/release-notes)
 
-Fontes internas consultadas: Guia Mestre Meta v2, Automação Meta v1 e Guia de Continuidade v3. Reutilizar controles e aprendizados; parâmetros históricos permanecem específicos das campanhas Meta.
+Fontes internas: Guia Mestre Meta v2, Automação Meta v1 e Guia de Continuidade v3. Reutilizar controles e aprendizados; parâmetros históricos permanecem específicos das campanhas Meta.

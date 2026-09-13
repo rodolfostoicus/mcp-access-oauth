@@ -6,6 +6,7 @@ const SCOPE = 'https://www.googleapis.com/auth/adwords';
 const MAX_ROWS = 1000;
 const MAX_BYTES = 2_000_000;
 const ID = /^\d{10}$/;
+const OAUTH_ERRORS = new Set(['invalid_grant', 'invalid_client', 'invalid_request', 'unauthorized_client', 'unsupported_grant_type', 'invalid_scope']);
 const encoder = new TextEncoder();
 
 class SafeError extends Error {
@@ -35,13 +36,24 @@ function config(env) {
   const login = env.GOOGLE_ADS_LOGIN_CUSTOMER_ID ? customerId(env.GOOGLE_ADS_LOGIN_CUSTOMER_ID) : null;
   // Version pinned to the current major release; upgrades require review.
   if (env.GOOGLE_ADS_API_VERSION && env.GOOGLE_ADS_API_VERSION !== 'v25') fail('UNSUPPORTED_API_VERSION');
+  const authMode = env.GOOGLE_ADS_AUTH_MODE ?? 'service_account';
+  if (authMode === 'user_oauth') {
+    const clientId = env.GOOGLE_ADS_CLIENT_ID;
+    const clientSecret = env.GOOGLE_ADS_CLIENT_SECRET;
+    const refreshToken = env.GOOGLE_ADS_REFRESH_TOKEN;
+    if (typeof clientId !== 'string' || !/^[a-zA-Z0-9_-]{1,256}\.apps\.googleusercontent\.com$/.test(clientId) ||
+        typeof clientSecret !== 'string' || !/^[\x21-\x7e]{1,4096}$/.test(clientSecret) ||
+        typeof refreshToken !== 'string' || !/^[\x21-\x7e]{1,8192}$/.test(refreshToken)) fail('INVALID_USER_OAUTH_CONFIGURATION');
+    return { id, login, authMode, clientId, clientSecret, refreshToken };
+  }
+  if (authMode !== 'service_account') fail('UNSUPPORTED_AUTH_MODE');
   let account;
   try { account = JSON.parse(env.GOOGLE_ADS_SERVICE_ACCOUNT_JSON); } catch { fail('SERVICE_ACCOUNT_NOT_CONFIGURED'); }
   if (!record(account) || account.type !== 'service_account' ||
       typeof account.client_email !== 'string' || !/^[a-z0-9._-]+@[a-z0-9.-]+\.iam\.gserviceaccount\.com$/.test(account.client_email) ||
       typeof account.private_key !== 'string' || !account.private_key.startsWith('-----BEGIN PRIVATE KEY-----') ||
       (account.token_uri !== undefined && account.token_uri !== TOKEN_URL)) fail('INVALID_SERVICE_ACCOUNT_CONFIGURATION');
-  return { id, login, account };
+  return { id, login, authMode, account };
 }
 
 const schemas = {
@@ -105,9 +117,11 @@ export function createGoogleAdsReadOnly({ env, authorize, fetchImpl = fetch, now
           }
         }
         const requestId = response.headers.get('request-id');
+        const oauthError = stage === 'OAUTH' && OAUTH_ERRORS.has(data?.error) ? data.error : null;
         throw new SafeError(stage + '_FAILED', {
           http_status: response.status,
           codes: [...new Set(codes)].slice(0, 10),
+          ...(oauthError ? { oauth_error: oauthError, ...(oauthError === 'invalid_grant' ? { reauthorization_required: true } : {}) } : {}),
           ...(requestId && /^[a-zA-Z0-9_-]{1,100}$/.test(requestId) ? { request_id: requestId } : {}),
         });
       }
@@ -123,21 +137,28 @@ export function createGoogleAdsReadOnly({ env, authorize, fetchImpl = fetch, now
     if (cachedToken && cachedToken.expires > now() + 60000) return cachedToken.value;
     if (refreshInFlight) return refreshInFlight;
     refreshInFlight = (async () => {
-      let key;
-      try {
-        const raw = c.account.private_key.replace('-----BEGIN PRIVATE KEY-----', '').replace('-----END PRIVATE KEY-----', '').replace(/\s/g, '');
-        const bytes = Uint8Array.from(atob(raw), x => x.charCodeAt(0));
-        key = await crypto.subtle.importKey('pkcs8', bytes, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
-      } catch { fail('INVALID_SERVICE_ACCOUNT_KEY'); }
-      const issued = Math.floor(now() / 1000);
-      const input = encodedJSON({ alg: 'RS256', typ: 'JWT' }) + '.' + encodedJSON({
-        iss: c.account.client_email, scope: SCOPE, aud: TOKEN_URL, iat: issued, exp: issued + 3600,
-      });
-      const signature = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, encoder.encode(input));
-      const assertion = input + '.' + base64url(new Uint8Array(signature));
+      let body;
+      if (c.authMode === 'user_oauth') {
+        body = new URLSearchParams({ grant_type: 'refresh_token', client_id: c.clientId,
+          client_secret: c.clientSecret, refresh_token: c.refreshToken });
+      } else {
+        let key;
+        try {
+          const raw = c.account.private_key.replace('-----BEGIN PRIVATE KEY-----', '').replace('-----END PRIVATE KEY-----', '').replace(/\s/g, '');
+          const bytes = Uint8Array.from(atob(raw), x => x.charCodeAt(0));
+          key = await crypto.subtle.importKey('pkcs8', bytes, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+        } catch { fail('INVALID_SERVICE_ACCOUNT_KEY'); }
+        const issued = Math.floor(now() / 1000);
+        const input = encodedJSON({ alg: 'RS256', typ: 'JWT' }) + '.' + encodedJSON({
+          iss: c.account.client_email, scope: SCOPE, aud: TOKEN_URL, iat: issued, exp: issued + 3600,
+        });
+        const signature = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, encoder.encode(input));
+        const assertion = input + '.' + base64url(new Uint8Array(signature));
+        body = new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion });
+      }
       const result = await requestJSON(TOKEN_URL, {
         method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion }).toString(),
+        body: body.toString(),
       }, 'OAUTH');
       if (typeof result.access_token !== 'string' || !/^[\x21-\x7e]{1,8192}$/.test(result.access_token) ||
           result.token_type?.toLowerCase() !== 'bearer' || !Number.isFinite(result.expires_in) ||
