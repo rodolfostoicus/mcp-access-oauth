@@ -1,0 +1,1443 @@
+{
+  "account_budget_proposal": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operation",
+    "operationKey": "accountBudgetProposalOperation",
+    "partialFailure": false,
+    "path": "/accountBudgetProposals:mutate",
+    "resourcePattern": "customers/{customer_id}/accountBudgetProposals/{account_budget_proposal_id}",
+    "responseContentType": false,
+    "resultField": "result",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/account_budget_proposal_service.proto",
+    "unified": false,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "account_link": {
+    "actions": [
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operation",
+    "operationKey": "accountLinkOperation",
+    "partialFailure": true,
+    "path": "/accountLinks:mutate",
+    "resourcePattern": "customers/{customer_id}/accountLinks/{account_link_id}",
+    "responseContentType": false,
+    "resultField": "result",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/account_link_service.proto",
+    "unified": false,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "ad": {
+    "actions": [
+      "update"
+    ],
+    "operationExtraFields": [
+      "policyValidationParameter"
+    ],
+    "operationField": "operations",
+    "operationKey": "adOperation",
+    "partialFailure": true,
+    "path": "/ads:mutate",
+    "resourcePattern": "customers/{customer_id}/ads/{ad_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/ad_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "ad_group": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "adGroupOperation",
+    "partialFailure": true,
+    "path": "/adGroups:mutate",
+    "resourcePattern": "customers/{customer_id}/adGroups/{ad_group_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/ad_group_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "ad_group_ad": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [
+      "policyValidationParameter"
+    ],
+    "operationField": "operations",
+    "operationKey": "adGroupAdOperation",
+    "partialFailure": true,
+    "path": "/adGroupAds:mutate",
+    "resourcePattern": "customers/{customer_id}/adGroupAds/{ad_group_id}~{ad_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/ad_group_ad_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "ad_group_ad_label": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "adGroupAdLabelOperation",
+    "partialFailure": true,
+    "path": "/adGroupAdLabels:mutate",
+    "resourcePattern": "customers/{customer_id}/adGroupAdLabels/{ad_group_id}~{ad_id}~{label_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/ad_group_ad_label_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "ad_group_asset": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "adGroupAssetOperation",
+    "partialFailure": true,
+    "path": "/adGroupAssets:mutate",
+    "resourcePattern": "customers/{customer_id}/adGroupAssets/{ad_group_id}~{asset_id}~{field_type}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/ad_group_asset_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "ad_group_asset_set": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "adGroupAssetSetOperation",
+    "partialFailure": true,
+    "path": "/adGroupAssetSets:mutate",
+    "resourcePattern": "customers/{customer_id}/adGroupAssetSets/{ad_group_id}~{asset_set_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/ad_group_asset_set_service.proto",
+    "unified": false,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "ad_group_bid_modifier": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "adGroupBidModifierOperation",
+    "partialFailure": true,
+    "path": "/adGroupBidModifiers:mutate",
+    "resourcePattern": "customers/{customer_id}/adGroupBidModifiers/{ad_group_id}~{criterion_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/ad_group_bid_modifier_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "ad_group_criterion": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [
+      "exemptPolicyViolationKeys"
+    ],
+    "operationField": "operations",
+    "operationKey": "adGroupCriterionOperation",
+    "partialFailure": true,
+    "path": "/adGroupCriteria:mutate",
+    "resourcePattern": "customers/{customer_id}/adGroupCriteria/{ad_group_id}~{criterion_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/ad_group_criterion_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "ad_group_criterion_customizer": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "adGroupCriterionCustomizerOperation",
+    "partialFailure": true,
+    "path": "/AdGroupCriterionCustomizers:mutate",
+    "resourcePattern": "customers/{customer_id}/adGroupCriterionCustomizers/{ad_group_id}~{criterion_id}~{customizer_attribute_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/ad_group_criterion_customizer_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "ad_group_criterion_label": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "adGroupCriterionLabelOperation",
+    "partialFailure": true,
+    "path": "/adGroupCriterionLabels:mutate",
+    "resourcePattern": "customers/{customer_id}/adGroupCriterionLabels/{ad_group_id}~{criterion_id}~{label_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/ad_group_criterion_label_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "ad_group_customizer": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "adGroupCustomizerOperation",
+    "partialFailure": true,
+    "path": "/adGroupCustomizers:mutate",
+    "resourcePattern": "customers/{customer_id}/adGroupCustomizers/{ad_group_id}~{customizer_attribute_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/ad_group_customizer_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "ad_group_label": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "adGroupLabelOperation",
+    "partialFailure": true,
+    "path": "/adGroupLabels:mutate",
+    "resourcePattern": "customers/{customer_id}/adGroupLabels/{ad_group_id}~{label_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/ad_group_label_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "ad_parameter": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "adParameterOperation",
+    "partialFailure": true,
+    "path": "/adParameters:mutate",
+    "resourcePattern": "customers/{customer_id}/adParameters/{ad_group_id}~{criterion_id}~{parameter_index}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/ad_parameter_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "asset": {
+    "actions": [
+      "create",
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "assetOperation",
+    "partialFailure": true,
+    "path": "/assets:mutate",
+    "resourcePattern": "customers/{customer_id}/assets/{asset_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/asset_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "asset_group": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "assetGroupOperation",
+    "partialFailure": false,
+    "path": "/assetGroups:mutate",
+    "resourcePattern": "customers/{customer_id}/assetGroups/{asset_group_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/asset_group_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "asset_group_asset": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "assetGroupAssetOperation",
+    "partialFailure": true,
+    "path": "/assetGroupAssets:mutate",
+    "resourcePattern": "customers/{customer_id}/assetGroupAssets/{asset_group_id}~{asset_id}~{field_type}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/asset_group_asset_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "asset_group_listing_group_filter": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "assetGroupListingGroupFilterOperation",
+    "partialFailure": false,
+    "path": "/assetGroupListingGroupFilters:mutate",
+    "resourcePattern": "customers/{customer_id}/assetGroupListingGroupFilters/{asset_group_id}~{listing_group_filter_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/asset_group_listing_group_filter_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "asset_group_signal": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [
+      "exemptPolicyViolationKeys"
+    ],
+    "operationField": "operations",
+    "operationKey": "assetGroupSignalOperation",
+    "partialFailure": true,
+    "path": "/assetGroupSignals:mutate",
+    "resourcePattern": "customers/{customer_id}/assetGroupSignals/{asset_group_id}~{criterion_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/asset_group_signal_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "asset_set": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "assetSetOperation",
+    "partialFailure": true,
+    "path": "/assetSets:mutate",
+    "resourcePattern": "customers/{customer_id}/assetSets/{asset_set_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/asset_set_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "asset_set_asset": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "assetSetAssetOperation",
+    "partialFailure": true,
+    "path": "/assetSetAssets:mutate",
+    "resourcePattern": "customers/{customer_id}/assetSetAssets/{asset_set_id}~{asset_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/asset_set_asset_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "audience": {
+    "actions": [
+      "create",
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "audienceOperation",
+    "partialFailure": true,
+    "path": "/audiences:mutate",
+    "resourcePattern": "customers/{customer_id}/audiences/{audience_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/audience_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "batch_job": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operation",
+    "operationKey": "batchJobOperation",
+    "partialFailure": false,
+    "path": "/batchJobs:mutate",
+    "resourcePattern": "customers/{customer_id}/batchJobs/{batch_job_id}",
+    "responseContentType": false,
+    "resultField": "result",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/batch_job_service.proto",
+    "unified": false,
+    "updateMask": false,
+    "validateOnly": false
+  },
+  "bidding_data_exclusion": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "biddingDataExclusionOperation",
+    "partialFailure": true,
+    "path": "/biddingDataExclusions:mutate",
+    "resourcePattern": "customers/{customer_id}/biddingDataExclusions/{seasonality_event_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/bidding_data_exclusion_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "bidding_seasonality_adjustment": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "biddingSeasonalityAdjustmentOperation",
+    "partialFailure": true,
+    "path": "/biddingSeasonalityAdjustments:mutate",
+    "resourcePattern": "customers/{customer_id}/biddingSeasonalityAdjustments/{seasonality_event_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/bidding_seasonality_adjustment_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "bidding_strategy": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "biddingStrategyOperation",
+    "partialFailure": true,
+    "path": "/biddingStrategies:mutate",
+    "resourcePattern": "customers/{customer_id}/biddingStrategies/{bidding_strategy_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/bidding_strategy_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "billing_setup": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operation",
+    "operationKey": "billingSetupOperation",
+    "partialFailure": false,
+    "path": "/billingSetups:mutate",
+    "resourcePattern": "customers/{customer_id}/billingSetups/{billing_setup_id}",
+    "responseContentType": false,
+    "resultField": "result",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/billing_setup_service.proto",
+    "unified": false,
+    "updateMask": false,
+    "validateOnly": false
+  },
+  "campaign": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "campaignOperation",
+    "partialFailure": true,
+    "path": "/campaigns:mutate",
+    "resourcePattern": "customers/{customer_id}/campaigns/{campaign_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/campaign_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "campaign_asset": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "campaignAssetOperation",
+    "partialFailure": true,
+    "path": "/campaignAssets:mutate",
+    "resourcePattern": "customers/{customer_id}/campaignAssets/{campaign_id}~{asset_id}~{field_type}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/campaign_asset_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "campaign_asset_set": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "campaignAssetSetOperation",
+    "partialFailure": true,
+    "path": "/campaignAssetSets:mutate",
+    "resourcePattern": "customers/{customer_id}/campaignAssetSets/{campaign_id}~{asset_set_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/campaign_asset_set_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "campaign_bid_modifier": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "campaignBidModifierOperation",
+    "partialFailure": true,
+    "path": "/campaignBidModifiers:mutate",
+    "resourcePattern": "customers/{customer_id}/campaignBidModifiers/{campaign_id}~{criterion_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/campaign_bid_modifier_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "campaign_budget": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "campaignBudgetOperation",
+    "partialFailure": true,
+    "path": "/campaignBudgets:mutate",
+    "resourcePattern": "customers/{customer_id}/campaignBudgets/{campaign_budget_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/campaign_budget_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "campaign_conversion_goal": {
+    "actions": [
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "campaignConversionGoalOperation",
+    "partialFailure": false,
+    "path": "/campaignConversionGoals:mutate",
+    "resourcePattern": "customers/{customer_id}/campaignConversionGoals/{campaign_id}~{category}~{source}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/campaign_conversion_goal_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "campaign_criterion": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "campaignCriterionOperation",
+    "partialFailure": true,
+    "path": "/campaignCriteria:mutate",
+    "resourcePattern": "customers/{customer_id}/campaignCriteria/{campaign_id}~{criterion_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/campaign_criterion_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "campaign_customizer": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "campaignCustomizerOperation",
+    "partialFailure": true,
+    "path": "/campaignCustomizers:mutate",
+    "resourcePattern": "customers/{customer_id}/campaignCustomizers/{campaign_id}~{customizer_attribute_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/campaign_customizer_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "campaign_draft": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "campaignDraftOperation",
+    "partialFailure": true,
+    "path": "/campaignDrafts:mutate",
+    "resourcePattern": "customers/{customer_id}/campaignDrafts/{base_campaign_id}~{draft_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/campaign_draft_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "campaign_goal_config": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "campaignGoalConfigOperation",
+    "partialFailure": true,
+    "path": "/CampaignGoalConfigs:mutate",
+    "resourcePattern": "customers/{customer_id}/campaignGoalConfigs/{campaign_id}~{unified_goal_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/campaign_goal_config_service.proto",
+    "unified": false,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "campaign_group": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "campaignGroupOperation",
+    "partialFailure": true,
+    "path": "/campaignGroups:mutate",
+    "resourcePattern": "customers/{customer_id}/campaignGroups/{campaign_group_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/campaign_group_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "campaign_label": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "campaignLabelOperation",
+    "partialFailure": true,
+    "path": "/campaignLabels:mutate",
+    "resourcePattern": "customers/{customer_id}/campaignLabels/{campaign_id}~{label_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/campaign_label_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "campaign_shared_set": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "campaignSharedSetOperation",
+    "partialFailure": true,
+    "path": "/campaignSharedSets:mutate",
+    "resourcePattern": "customers/{customer_id}/campaignSharedSets/{campaign_id}~{shared_set_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/campaign_shared_set_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "conversion_action": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "conversionActionOperation",
+    "partialFailure": true,
+    "path": "/conversionActions:mutate",
+    "resourcePattern": "customers/{customer_id}/conversionActions/{conversion_action_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/conversion_action_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "conversion_custom_variable": {
+    "actions": [
+      "create",
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "conversionCustomVariableOperation",
+    "partialFailure": true,
+    "path": "/conversionCustomVariables:mutate",
+    "resourcePattern": "customers/{customer_id}/conversionCustomVariables/{conversion_custom_variable_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/conversion_custom_variable_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "conversion_goal_campaign_config": {
+    "actions": [
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "conversionGoalCampaignConfigOperation",
+    "partialFailure": false,
+    "path": "/conversionGoalCampaignConfigs:mutate",
+    "resourcePattern": "customers/{customer_id}/conversionGoalCampaignConfigs/{campaign_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/conversion_goal_campaign_config_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "conversion_value_rule": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "conversionValueRuleOperation",
+    "partialFailure": true,
+    "path": "/conversionValueRules:mutate",
+    "resourcePattern": "customers/{customer_id}/conversionValueRules/{conversion_value_rule_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/conversion_value_rule_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "conversion_value_rule_set": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "conversionValueRuleSetOperation",
+    "partialFailure": true,
+    "path": "/conversionValueRuleSets:mutate",
+    "resourcePattern": "customers/{customer_id}/conversionValueRuleSets/{conversion_value_rule_set_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/conversion_value_rule_set_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "custom_audience": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "customAudienceOperation",
+    "partialFailure": false,
+    "path": "/customAudiences:mutate",
+    "resourcePattern": "customers/{customer_id}/customAudiences/{custom_audience_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/custom_audience_service.proto",
+    "unified": false,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "custom_conversion_goal": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "customConversionGoalOperation",
+    "partialFailure": false,
+    "path": "/customConversionGoals:mutate",
+    "resourcePattern": "customers/{customer_id}/customConversionGoals/{goal_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/custom_conversion_goal_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "custom_interest": {
+    "actions": [
+      "create",
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "customInterestOperation",
+    "partialFailure": false,
+    "path": "/customInterests:mutate",
+    "resourcePattern": "customers/{customer_id}/customInterests/{custom_interest_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/custom_interest_service.proto",
+    "unified": false,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "customer": {
+    "actions": [
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operation",
+    "operationKey": "customerOperation",
+    "partialFailure": false,
+    "path": ":mutate",
+    "resourcePattern": "customers/{customer_id}",
+    "responseContentType": true,
+    "resultField": "result",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/customer_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "customer_asset": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "customerAssetOperation",
+    "partialFailure": true,
+    "path": "/customerAssets:mutate",
+    "resourcePattern": "customers/{customer_id}/customerAssets/{asset_id}~{field_type}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/customer_asset_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "customer_asset_set": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "customerAssetSetOperation",
+    "partialFailure": true,
+    "path": "/customerAssetSets:mutate",
+    "resourcePattern": "customers/{customer_id}/customerAssetSets/{asset_set_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/customer_asset_set_service.proto",
+    "unified": false,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "customer_client_link": {
+    "actions": [
+      "create",
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operation",
+    "operationKey": "customerClientLinkOperation",
+    "partialFailure": false,
+    "path": "/customerClientLinks:mutate",
+    "resourcePattern": "customers/{customer_id}/customerClientLinks/{client_customer_id}~{manager_link_id}",
+    "responseContentType": false,
+    "resultField": "result",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/customer_client_link_service.proto",
+    "unified": false,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "customer_conversion_goal": {
+    "actions": [
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "customerConversionGoalOperation",
+    "partialFailure": false,
+    "path": "/customerConversionGoals:mutate",
+    "resourcePattern": "customers/{customer_id}/customerConversionGoals/{category}~{source}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/customer_conversion_goal_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "customer_customizer": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "customerCustomizerOperation",
+    "partialFailure": true,
+    "path": "/CustomerCustomizers:mutate",
+    "resourcePattern": "customers/{customer_id}/customerCustomizers/{customizer_attribute_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/customer_customizer_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "customer_label": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "customerLabelOperation",
+    "partialFailure": true,
+    "path": "/customerLabels:mutate",
+    "resourcePattern": "customers/{customer_id}/customerLabels/{label_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/customer_label_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "customer_manager_link": {
+    "actions": [
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "customerManagerLinkOperation",
+    "partialFailure": false,
+    "path": "/customerManagerLinks:mutate",
+    "resourcePattern": "customers/{customer_id}/customerManagerLinks/{manager_customer_id}~{manager_link_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/customer_manager_link_service.proto",
+    "unified": false,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "customer_negative_criterion": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "customerNegativeCriterionOperation",
+    "partialFailure": true,
+    "path": "/customerNegativeCriteria:mutate",
+    "resourcePattern": "customers/{customer_id}/customerNegativeCriteria/{criterion_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/customer_negative_criterion_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "customer_sk_ad_network_conversion_value_schema": {
+    "actions": [
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operation",
+    "operationKey": "customerSkAdNetworkConversionValueSchemaOperation",
+    "partialFailure": false,
+    "path": "/customerSkAdNetworkConversionValueSchemas:mutate",
+    "resourcePattern": "customers/{customer_id}/customerSkAdNetworkConversionValueSchemas/{account_link_id}",
+    "responseContentType": false,
+    "resultField": "result",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/customer_sk_ad_network_conversion_value_schema_service.proto",
+    "unified": false,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "customer_user_access": {
+    "actions": [
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operation",
+    "operationKey": "customerUserAccessOperation",
+    "partialFailure": false,
+    "path": "/customerUserAccesses:mutate",
+    "resourcePattern": "customers/{customer_id}/customerUserAccesses/{user_id}",
+    "responseContentType": false,
+    "resultField": "result",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/customer_user_access_service.proto",
+    "unified": false,
+    "updateMask": true,
+    "validateOnly": false
+  },
+  "customer_user_access_invitation": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operation",
+    "operationKey": "customerUserAccessInvitationOperation",
+    "partialFailure": false,
+    "path": "/customerUserAccessInvitations:mutate",
+    "resourcePattern": "customers/{customer_id}/customerUserAccessInvitations/{invitation_id}",
+    "responseContentType": false,
+    "resultField": "result",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/customer_user_access_invitation_service.proto",
+    "unified": false,
+    "updateMask": false,
+    "validateOnly": false
+  },
+  "customizer_attribute": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "customizerAttributeOperation",
+    "partialFailure": true,
+    "path": "/customizerAttributes:mutate",
+    "resourcePattern": "customers/{customer_id}/customizerAttributes/{customizer_attribute_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/customizer_attribute_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "experiment": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "experimentOperation",
+    "partialFailure": true,
+    "path": "/experiments:mutate",
+    "resourcePattern": "customers/{customer_id}/experiments/{trial_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/experiment_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "experiment_arm": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "experimentArmOperation",
+    "partialFailure": true,
+    "path": "/experimentArms:mutate",
+    "resourcePattern": "customers/{customer_id}/experimentArms/{trial_id}~{trial_arm_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/experiment_arm_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "goal": {
+    "actions": [
+      "create",
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "goalOperation",
+    "partialFailure": true,
+    "path": "/Goals:mutate",
+    "resourcePattern": "customers/{customer_id}/goals/{unified_goal_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/goal_service.proto",
+    "unified": false,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "keyword_plan": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "keywordPlanOperation",
+    "partialFailure": true,
+    "path": "/keywordPlans:mutate",
+    "resourcePattern": "customers/{customer_id}/keywordPlans/{keyword_plan_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/keyword_plan_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "keyword_plan_ad_group": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "keywordPlanAdGroupOperation",
+    "partialFailure": true,
+    "path": "/keywordPlanAdGroups:mutate",
+    "resourcePattern": "customers/{customer_id}/keywordPlanAdGroups/{keyword_plan_ad_group_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/keyword_plan_ad_group_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "keyword_plan_ad_group_keyword": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "keywordPlanAdGroupKeywordOperation",
+    "partialFailure": true,
+    "path": "/keywordPlanAdGroupKeywords:mutate",
+    "resourcePattern": "customers/{customer_id}/keywordPlanAdGroupKeywords/{keyword_plan_ad_group_keyword_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/keyword_plan_ad_group_keyword_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "keyword_plan_campaign": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "keywordPlanCampaignOperation",
+    "partialFailure": true,
+    "path": "/keywordPlanCampaigns:mutate",
+    "resourcePattern": "customers/{customer_id}/keywordPlanCampaigns/{keyword_plan_campaign_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/keyword_plan_campaign_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "keyword_plan_campaign_keyword": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "keywordPlanCampaignKeywordOperation",
+    "partialFailure": true,
+    "path": "/keywordPlanCampaignKeywords:mutate",
+    "resourcePattern": "customers/{customer_id}/keywordPlanCampaignKeywords/{keyword_plan_campaign_keyword_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/keyword_plan_campaign_keyword_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "label": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "labelOperation",
+    "partialFailure": true,
+    "path": "/labels:mutate",
+    "resourcePattern": "customers/{customer_id}/labels/{label_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/label_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "recommendation_subscription": {
+    "actions": [
+      "create",
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "recommendationSubscriptionOperation",
+    "partialFailure": true,
+    "path": "/recommendationSubscriptions:mutateRecommendationSubscription",
+    "resourcePattern": "customers/{customer_id}/recommendationSubscriptions/{recommendation_type}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/recommendation_subscription_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "remarketing_action": {
+    "actions": [
+      "create",
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "remarketingActionOperation",
+    "partialFailure": true,
+    "path": "/remarketingActions:mutate",
+    "resourcePattern": "customers/{customer_id}/remarketingActions/{remarketing_action_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/remarketing_action_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "shared_criterion": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "sharedCriterionOperation",
+    "partialFailure": true,
+    "path": "/sharedCriteria:mutate",
+    "resourcePattern": "customers/{customer_id}/sharedCriteria/{shared_set_id}~{criterion_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/shared_criterion_service.proto",
+    "unified": true,
+    "updateMask": false,
+    "validateOnly": true
+  },
+  "shared_set": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "sharedSetOperation",
+    "partialFailure": true,
+    "path": "/sharedSets:mutate",
+    "resourcePattern": "customers/{customer_id}/sharedSets/{shared_set_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/shared_set_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "smart_campaign_setting": {
+    "actions": [
+      "update"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "smartCampaignSettingOperation",
+    "partialFailure": true,
+    "path": "/smartCampaignSettings:mutate",
+    "resourcePattern": "customers/{customer_id}/smartCampaignSettings/{campaign_id}",
+    "responseContentType": true,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/smart_campaign_setting_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "user_list": {
+    "actions": [
+      "create",
+      "update",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "userListOperation",
+    "partialFailure": true,
+    "path": "/userLists:mutate",
+    "resourcePattern": "customers/{customer_id}/userLists/{user_list_id}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/user_list_service.proto",
+    "unified": true,
+    "updateMask": true,
+    "validateOnly": true
+  },
+  "user_list_customer_type": {
+    "actions": [
+      "create",
+      "remove"
+    ],
+    "operationExtraFields": [],
+    "operationField": "operations",
+    "operationKey": "userListCustomerTypeOperation",
+    "partialFailure": true,
+    "path": "/userListCustomerTypes:mutate",
+    "resourcePattern": "customers/{customer_id}/userListCustomerTypes/{user_list_id}~{semantic_label}",
+    "responseContentType": false,
+    "resultField": "results",
+    "source": "https://github.com/googleapis/googleapis/blob/master/google/ads/googleads/v25/services/user_list_customer_type_service.proto",
+    "unified": false,
+    "updateMask": false,
+    "validateOnly": true
+  }
+}
