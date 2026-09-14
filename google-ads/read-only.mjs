@@ -113,6 +113,8 @@ export function createGoogleAdsClient({ env, fetchImpl = (...args) => globalThis
         // Do not return raw Google error messages, headers, body, assertions or keys.
         const codes = [];
         const fieldPaths = [];
+        const policyFindings = [];
+        let policyFindingsTruncated = false;
         for (const detail of (Array.isArray(data?.error?.details) ? data.error.details : [])) {
           for (const error of (Array.isArray(detail?.errors) ? detail.errors : [])) {
             const elements = error?.location?.fieldPathElements;
@@ -122,6 +124,18 @@ export function createGoogleAdsClient({ env, fetchImpl = (...args) => globalThis
             for (const code of Object.values(record(error?.errorCode) ? error.errorCode : {})) {
               if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,99}$/.test(code)) codes.push(code);
             }
+            // Expose bounded policy identifiers only, never Google messages,
+            // evidence text, destination URLs, headers or exemption requests.
+            if (stage === 'GOOGLE_ADS' && error?.errorCode?.policyFindingError === 'POLICY_FINDING') {
+              const entries = error?.details?.policyFindingDetails?.policyTopicEntries;
+              for (const entry of (Array.isArray(entries) ? entries : [])) {
+                if (typeof entry?.topic !== 'string' || !/^[A-Z][A-Z0-9_]{0,99}$/.test(entry.topic)) continue;
+                if (policyFindings.length >= 20) { policyFindingsTruncated = true; break; }
+                const finding = { topic: entry.topic };
+                if (['UNKNOWN', 'PROHIBITED', 'LIMITED', 'FULLY_LIMITED', 'DESCRIPTIVE', 'BROADENING'].includes(entry.type)) finding.type = entry.type;
+                policyFindings.push(finding);
+              }
+            }
           }
         }
         const requestId = response.headers.get('request-id');
@@ -130,6 +144,8 @@ export function createGoogleAdsClient({ env, fetchImpl = (...args) => globalThis
           http_status: response.status,
           codes: [...new Set(codes)].slice(0, 10),
           ...(fieldPaths.length ? { field_paths: [...new Set(fieldPaths)].slice(0,10) } : {}),
+          ...(policyFindings.length ? { policy_findings: policyFindings } : {}),
+          ...(policyFindingsTruncated ? { policy_findings_truncated: true } : {}),
           ...(oauthError ? { oauth_error: oauthError, ...(oauthError === 'invalid_grant' ? { reauthorization_required: true } : {}) } : {}),
           ...(requestId && /^[a-zA-Z0-9_-]{1,100}$/.test(requestId) ? { request_id: requestId } : {}),
         });

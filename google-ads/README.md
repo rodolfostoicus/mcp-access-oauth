@@ -1,6 +1,6 @@
 # Google Ads Stoicus Secure — gestão da conta
 
-Versão **0.2.0**. A responsável autorizou expressamente ampliar o conector existente para ler, criar, modificar e remover recursos. A conexão de leitura da versão anterior foi confirmada pela responsável em uma consulta MCP à conta Stoicus. A atualização implementa as operações de gestão; o consentimento OAuth de escrita precisa ser concedido à conexão que vai utilizá-las.
+Versão **0.2.1**. A responsável autorizou expressamente ampliar o conector existente para ler, criar, modificar e remover recursos. A conexão de leitura da versão anterior foi confirmada pela responsável em uma consulta MCP à conta Stoicus. A atualização implementa as operações de gestão; o consentimento OAuth de escrita precisa ser concedido à conexão que vai utilizá-las.
 
 O Worker `stoicus-google-ads-mcp`, a URL `/mcp` e o plugin existentes são mantidos. Esta pasta é independente do Worker Meta na raiz do repositório. As credenciais continuam nos secrets do Cloudflare.
 
@@ -42,6 +42,10 @@ Criações de campanhas, grupos, anúncios e grupos de ativos assumem `PAUSED` q
 
 Quatro serviços não oferecem `validateOnly`: `batch_job`, `billing_setup`, `customer_user_access` e `customer_user_access_invitation`. Sua prévia é **somente local**, claramente identificada; nenhuma chamada de mutação é usada para simular. A execução real chama o método nativo uma vez.
 
+## Diagnóstico de políticas — 0.2.1
+
+Erros `POLICY_FINDING` também retornam `policy_findings` com até 20 identificadores de política e tipos reconhecidos. O diagnóstico omite mensagens brutas, evidências, URLs e credenciais. Não solicita exceções, não altera a validação Google e não repete gravações; serve para orientar a correção do anúncio ou destino.
+
 ## Evidência e recuperação
 
 Um Durable Object SQLite próprio por conta serializa as gravações e registra UUID, hash canônico, estágio e recibo. Tokens, secrets e o conteúdo completo dos anúncios não são armazenados nesse registro. `GOOGLE_ADS_OPERATIONS` é um binding interno, sem rota pública direta.
@@ -76,7 +80,7 @@ O login Google continua com `openid email`, PKCE S256, state/cookie, e-mail veri
 
 Não é preciso alterar a política que bloqueia chaves de conta de serviço nem substituir secrets válidos. O transporte isolado antigo de conta de serviço permanece compatível, mas o Worker exige `user_oauth`. Não há fallback automático de identidade nem encaminhamento de credenciais para destinos arbitrários. Erros expõem códigos, posições de campos, HTTP e request ID controlados; nunca textos brutos Google ou tokens.
 
-`/health` mostra `version=0.2.0`, `mode=management`, presença de configuração e `write_infrastructure_ready`. Não testa Google: `google_connection_tested=false` permanece literal. A leitura da conta não comprova permissão nativa de escrita.
+`/health` mostra `version=0.2.1`, `mode=management`, presença de configuração e `write_infrastructure_ready`. Não testa Google: `google_connection_tested=false` permanece literal. A leitura da conta não comprova permissão nativa de escrita.
 
 Para operação contínua, concluir a publicação OAuth aplicável: um app externo em Testando com escopo `adwords` recebe refresh token limitado a sete dias. A publicação OAuth é independente da implantação Worker e da autorização MCP. Desde 09/09/2026, os níveis de acesso Google Ads são controlados pelo projeto Google Cloud; este adaptador não envia developer token.
 

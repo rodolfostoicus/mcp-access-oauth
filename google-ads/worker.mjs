@@ -7,7 +7,7 @@ import { createAuthHandler, allowedEmail, trustedRedirect, READ_SCOPE, WRITE_SCO
 import { createManagement, listManagementTools, outputSchema, MAX_MUTATION_BYTES } from './management.mjs';
 export { GoogleAdsOperations } from './operations.mjs';
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 const required = ['PUBLIC_ORIGIN', 'STOICUS_ALLOWED_EMAILS', 'GOOGLE_ADS_CUSTOMER_ID',
   'GOOGLE_ADS_CLIENT_ID', 'GOOGLE_ADS_CLIENT_SECRET', 'GOOGLE_ADS_REFRESH_TOKEN'];
 function secure(response, referrerPolicy = 'no-referrer', formAction = "'self'") {

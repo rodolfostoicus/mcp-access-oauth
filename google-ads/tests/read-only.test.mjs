@@ -123,6 +123,31 @@ test('network failures cannot leak request credentials', async () => {
   assert.ok(!JSON.stringify(result).includes('PRIVATE KEY'));
   assert.equal(calls.length, 1);
 });
+test('policy findings reveal only bounded identifiers and never private evidence', async () => {
+  const privateText = 'fixture-access-token https://private.invalid/?secret=value';
+  const { client, calls } = fixture({ fetchImpl: async url => url.endsWith('/token')
+    ? json({ access_token: 'fixture-access-token', expires_in: 3600, token_type: 'Bearer' })
+    : json({ error: { message: privateText, details: [{ errors: [{
+      errorCode: { policyFindingError: 'POLICY_FINDING' },
+      details: { policyFindingDetails: { policyTopicEntries: [
+        { topic: 'DESTINATION_NOT_WORKING', type: 'PROHIBITED', evidences: [{ text: privateText }] },
+        { topic: privateText, type: 'PROHIBITED' },
+        { topic: 'HEALTH_IN_PERSONALIZED_ADS', type: privateText },
+        ...Array.from({ length: 30 }, (_, i) => ({ topic: `POLICY_${i}`, type: 'LIMITED' })),
+      ] } },
+    }] }] } }, 400) });
+  const result = await client.callTool('google_ads_get_account');
+  assert.equal(result.error, 'GOOGLE_ADS_FAILED');
+  assert.deepEqual(result.codes, ['POLICY_FINDING']);
+  assert.deepEqual(result.policy_findings[0], { topic: 'DESTINATION_NOT_WORKING', type: 'PROHIBITED' });
+  assert.deepEqual(result.policy_findings[1], { topic: 'HEALTH_IN_PERSONALIZED_ADS' });
+  assert.equal(result.policy_findings.length, 20);
+  assert.equal(result.policy_findings_truncated, true);
+  assert.ok(!JSON.stringify(result).includes('fixture-access-token'));
+  assert.ok(!JSON.stringify(result).includes('private.invalid'));
+  assert.ok(!JSON.stringify(result).includes('evidences'));
+  assert.equal(calls.length, 2);
+});
 test('token refresh is coalesced across simultaneous reads in one adapter', async () => {
   const { client, calls } = fixture();
   const results = await Promise.all([client.callTool('google_ads_get_account'), client.callTool('google_ads_get_account')]);
