@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.17";
+const CONNECTOR_VERSION = "2.3.18";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -226,6 +226,7 @@ type MetaGraphCall = {
 	params: Record<string, string | number | boolean | object>;
 	path: string;
 	write_lease_holder?: string;
+	page_id_for_token?: string;
 };
 
 class MetaGraphError extends Error {
@@ -310,10 +311,14 @@ const leadFormQuestionSchema = z
 	.object({
 		key: z.string().min(1).max(100).optional(),
 		label: z.string().min(1).max(500).optional(),
-		options: z.array(z.string().min(1).max(500)).min(2).max(20).optional(),
+		options: z.array(z.string().min(1).max(500)).min(2).max(50).optional(),
 		type: z.enum(["CITY", "CUSTOM", "EMAIL", "FULL_NAME", "PHONE", "STATE"]),
 	})
-	.strict();
+	.strict().superRefine((question, ctx) => {
+		if (question.type === "CUSTOM" && (!question.key || !question.label)) {
+			ctx.addIssue({ code: "custom", message: "CUSTOM questions require key and label; omit options for short text." });
+		}
+	});
 
 function getMetaConfig(env: MetaEnv) {
 	const accessToken = env.META_ACCESS_TOKEN?.trim();
@@ -593,6 +598,7 @@ const metaGateCallSchema = z.object({
 	params: z.record(z.string(), z.unknown()),
 	path: z.string().min(1).max(1_000),
 	write_lease_holder: z.string().min(1).max(500).optional(),
+	page_id_for_token: z.string().regex(META_ID_PATTERN).optional(),
 }).strict();
 
 const metaGateResponseSchema = z.object({
@@ -608,7 +614,7 @@ async function callMetaGraph(
 	method: "GET" | "POST",
 	path: string,
 	params: Record<string, string | number | boolean | object>,
-	options?: { write_lease_holder: string },
+	options?: { write_lease_holder?: string; page_id_for_token?: string },
 ): Promise<unknown> {
 	const { stub } = getMetaGateStub(env);
 	const response = await stub.fetch("https://meta-api-gate.internal/call", {
@@ -666,6 +672,7 @@ export class MetaApiGate {
 				params: parsed.params as MetaGraphCall["params"],
 				path: parsed.path,
 				write_lease_holder: parsed.write_lease_holder,
+				page_id_for_token: parsed.page_id_for_token,
 			};
 		} catch {
 			return Response.json({ error: "Invalid Meta API gate request.", ok: false }, { status: 400 });
@@ -687,7 +694,43 @@ export class MetaApiGate {
 			for (let attempt = 1; attempt <= attempts; attempt++) {
 				await this.paceNextAttempt();
 				let dispatchStarted = false;
+				let pageToken = "";
 				try {
+					let requestEnv = this.env;
+					if (call.page_id_for_token) {
+						const pageId = call.page_id_for_token;
+						const permitted = call.path === `${pageId}/leadgen_forms`
+							|| (call.method === "GET" && /^\d+(?:\/(?:leads|test_leads))?$/.test(call.path))
+							|| (call.method === "POST" && /^\d+\/test_leads$/.test(call.path));
+						if (!permitted) throw new Error("Page token is restricted to lead-form and lead-test endpoints.");
+						// Resolve inside this account gate. The token is never returned,
+						// cached in KV, logged, or accepted from a tool caller.
+						let cursor: string | undefined;
+						for (let pageIndex = 0; pageIndex < 5; pageIndex++) {
+							const result = graphListSchema.parse(await callMetaGraphDirect(this.env, "GET", "me/accounts", {
+								fields: "id,name,tasks,access_token", limit: 100, ...(cursor ? { after: cursor } : {}),
+							}));
+							const selected = result.data.find((item) => String(item.id || "") === pageId);
+							if (selected) {
+								const tasks = Array.isArray(selected.tasks) ? selected.tasks.map(String) : [];
+								if (!tasks.includes("ADVERTISE") || !tasks.includes("MANAGE_LEADS")) {
+									throw new Error(`Page ${pageId} requires ADVERTISE and MANAGE_LEADS access.`);
+								}
+								if (typeof selected.access_token !== "string" || !selected.access_token.trim()) {
+									throw new Error(`Page ${pageId} has no Page Access Token available to this connection.`);
+								}
+								pageToken = selected.access_token;
+								break;
+							}
+							if (!result.paging?.next) break;
+							cursor = result.paging.cursors?.after;
+							if (!cursor) throw new Error("Page-token inventory pagination was incomplete.");
+							await this.paceNextAttempt();
+						}
+						if (!pageToken) throw new Error(`Page ${pageId} is not accessible to the configured token.`);
+						requestEnv = { ...this.env, META_ACCESS_TOKEN: pageToken };
+						await this.paceNextAttempt();
+					}
 					// Fence only opted-in operation writes. Verify after queueing and
 					// pacing so an expired operation cannot dispatch a late POST.
 					// Legacy mutators retain their existing session-lease behavior.
@@ -700,7 +743,7 @@ export class MetaApiGate {
 						: undefined;
 					dispatchStarted = true;
 					const payload = await callMetaGraphDirect(
-						this.env,
+						requestEnv,
 						call.method,
 						call.path,
 						call.params,
@@ -724,7 +767,8 @@ export class MetaApiGate {
 						this.cooldownUntil = Date.now() + Math.max(retryDelay, META_RATE_LIMIT_COOLDOWN_MS);
 					}
 					return Response.json({
-						error: error instanceof Error ? error.message : "Unexpected Meta API error.",
+						error: (error instanceof Error ? error.message : "Unexpected Meta API error.")
+							.split(pageToken || "__unused_page_secret__").join("[redacted]"),
 						ok: false,
 						write_dispatched: call.method === "POST" ? dispatchStarted : undefined,
 						retry_after_seconds: isMetaRateLimit(error)
@@ -756,6 +800,84 @@ async function assertAccessiblePage(env: MetaEnv, pageId: string) {
 		throw new Error(`Page ${pageId} requires ADVERTISE and MANAGE_LEADS access.`);
 	}
 	return page;
+}
+
+async function getOwnedLeadForm(env: MetaEnv, pageId: string, formId: string, fields = "id,name,status,page,page_id") {
+	const form = z.object({ id: z.string(), name: z.string(), status: z.string().optional() })
+		.passthrough().parse(await callMetaGraph(env, "GET", formId, { fields }, { page_id_for_token: pageId }));
+	const formPage = String(form.page_id || (form.page && typeof form.page === "object" && "id" in form.page ? form.page.id : ""));
+	if (form.id !== formId || formPage !== pageId) throw new Error(`Lead form ${formId} does not belong to Page ${pageId}.`);
+	if (form.status === "ARCHIVED" || form.status === "DELETED") throw new Error(`Lead form ${formId} is not usable.`);
+	return form;
+}
+
+const leadFormThankYouSchema = z.object({
+	title: z.string().min(1).max(60),
+	body: z.string().min(1).max(500),
+	button_text: z.string().min(1).max(60),
+	button_type: z.literal("VIEW_WEBSITE"),
+	website_url: z.string().url().max(2_000),
+}).strict();
+
+const leadFormDisclaimerSchema = z.object({
+	title: z.string().min(1).max(200),
+	body: z.object({ text: z.string().min(1).max(2_000) }).strict(),
+	checkboxes: z.array(z.object({
+		key: z.string().min(1).max(100),
+		text: z.string().min(1).max(500),
+		is_required: z.boolean().default(true),
+		is_checked_by_default: z.literal(false).default(false),
+	}).strict()).min(1).max(5),
+}).strict();
+
+const PENDING_FLIGHT_SUFFIX = " | INÍCIO PENDENTE";
+
+async function assertNoPendingFlight(env: MetaEnv, type: OwnedObjectType, object: z.infer<typeof objectSchema>) {
+	if (type === "ADSET" && String(object.name).endsWith(PENDING_FLIGHT_SUFFIX)) {
+		throw new Error("Activation blocked: the lead ad-set flight is pending.");
+	}
+	if (type === "AD") {
+		const parent = await getOwnedObject(env, "ADSET", String(object.adset_id));
+		if (String(parent.name).endsWith(PENDING_FLIGHT_SUFFIX)) throw new Error("Activation blocked: the parent lead ad-set flight is pending.");
+	}
+	if (type === "CAMPAIGN" && object.objective === "OUTCOME_LEADS") {
+		let cursor: string | undefined;
+		for (let page = 0; page < 10; page++) {
+			const children = graphListSchema.parse(await callMetaGraph(env, "GET", `${object.id}/adsets`, {
+				fields: "id,name,account_id,campaign_id,status", limit: 100, ...(cursor ? { after: cursor } : {}),
+			}));
+			if (children.data.some((child) => String(child.name).endsWith(PENDING_FLIGHT_SUFFIX))) {
+				throw new Error("Activation blocked: a child lead ad-set flight is pending.");
+			}
+			if (!children.paging?.next) return;
+			cursor = children.paging.cursors?.after;
+			if (!cursor) throw new Error("Activation blocked: the campaign child-flight pagination was incomplete.");
+		}
+		throw new Error("Activation blocked: the campaign child-flight check was incomplete.");
+	}
+}
+
+async function assertLeadsRetrievalPermission(env: MetaEnv) {
+	const scopes = graphListSchema.parse(await callMetaGraph(env, "GET", "me/permissions", { fields: "permission,status" })).data;
+	if (!scopes.some((scope) => scope.permission === "leads_retrieval" && scope.status === "granted")) {
+		throw new Error("Lead retrieval/testing requires leads_retrieval permission; no lead request was dispatched.");
+	}
+}
+
+async function getLeadPageIdentity(env: MetaEnv, pageId: string) {
+	const accessible = await assertAccessiblePage(env, pageId);
+	const page = z.object({ id: z.string(), name: z.string() }).passthrough().parse(await callMetaGraph(env, "GET", pageId, {
+		fields: "id,name,username,website,instagram_business_account{id,username},connected_instagram_account{id,username}",
+	}, { page_id_for_token: pageId }));
+	if (page.id !== pageId) throw new Error("Page identity mismatch.");
+	const { accountId } = getMetaConfig(env);
+	const actors = graphListSchema.parse(await callMetaGraph(env, "GET", `${accountId}/instagram_accounts`, { fields: "id,username,name", limit: 100 }));
+	if (actors.paging?.next) throw new Error("Instagram actor inventory is incomplete; inspect bounded pagination before use.");
+	const linked = [page.instagram_business_account, page.connected_instagram_account]
+		.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object").map((item) => ({ id: String(item.id), username: String(item.username || "") }));
+	const matched = linked.filter((item) => actors.data.some((actor) => String(actor.id) === item.id && String(actor.username || "").toLowerCase() === item.username.toLowerCase()));
+	return { page, page_tasks: accessible.tasks, account_instagram_actors: actors.data, verified_instagram_accounts: matched,
+		identity_verified: matched.length > 0 };
 }
 
 async function getOwnedObject(
@@ -998,7 +1120,7 @@ function brevarDifferences(expected: Record<string, unknown>, actual: Record<str
 	return adsetAgeDifferences(normalizedExpected, normalizedActual);
 }
 
-function assertExpectedName(snapshot: z.infer<typeof objectSchema>, expectedName: string) {
+function assertExpectedName(snapshot: { id?: string; name: string }, expectedName: string) {
 	if (snapshot.name !== expectedName) {
 		throw new Error(
 			`Name mismatch. Expected exactly "${snapshot.name}" for object ${snapshot.id}.`,
@@ -2276,6 +2398,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					if (before.status !== "ACTIVE" && before.status !== "PAUSED") {
 						throw new Error("Status update requires an object currently configured ACTIVE or PAUSED.");
 					}
+					if (status === "ACTIVE") await assertNoPendingFlight(env, object_type, before);
 					if (before.status === status) {
 						const warning = await releaseAccountOperationLease(env, operationHolder);
 						return asToolResult({
@@ -2330,6 +2453,91 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							`${error instanceof Error ? error.message : "Status preflight failed."} No Meta write was attempted. ${warning}`,
 						));
 					}
+					return asToolError(error);
+				}
+			},
+		);
+
+		this.server.registerTool(
+			"meta_configure_lead_adset_flight",
+			{
+				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: false },
+				description: "WRITE/PREVIEW. Finalize one owned PAUSED pending BREVAR lead ad set: preserve its lifetime R$300 cap, set exactly 15 days and 06-23 Brasilia schedule, and remove only the pending-flight suffix. Never changes budgets or activates delivery.",
+				inputSchema: {
+					adset_id: z.string().regex(META_ID_PATTERN),
+					confirmation_phrase: z.string().max(1_000).optional(),
+					expected_name: z.string().min(1).max(500),
+					start_time: z.string().max(100),
+					validate_only: z.boolean().default(true),
+				},
+			},
+			async ({ adset_id, confirmation_phrase, expected_name, start_time, validate_only }) => {
+				let holder = "";
+				let leaseAcquired = false;
+				let dispatched = false;
+				const env = this.env as MetaEnv;
+				try {
+					assertWritesEnabled(env);
+					if (!expected_name.endsWith(PENDING_FLIGHT_SUFFIX) || !expected_name.includes("BREVAR") || !expected_name.includes("2027")) {
+						throw new Error("Only pending BREVAR 2027 lead ad sets can finalize a flight.");
+					}
+					if (!/(Z|[+-]\d{2}:?\d{2})$/.test(start_time) || !Number.isFinite(Date.parse(start_time)) || Date.parse(start_time) < Date.now()) {
+						throw new Error("Flight start must be a future timestamp with an explicit timezone offset.");
+					}
+					const end_time = new Date(Date.parse(start_time) + 15 * 24 * 60 * 60 * 1_000).toISOString();
+					const { accountId } = getMetaConfig(env);
+					const account = objectSchema.parse(await callMetaGraph(env, "GET", accountId, { fields: "id,account_id,name,account_status,currency,timezone_name" }));
+					if (account.currency !== "BRL" || !["America/Noronha", "America/Sao_Paulo"].includes(String(account.timezone_name))) {
+						throw new Error("This fixed R$300 flight requires BRL and a supported Brazilian account timezone.");
+					}
+					const before = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
+					assertExpectedName(before, expected_name);
+					const campaign = await getOwnedObject(env, "CAMPAIGN", String(before.campaign_id), "is_adset_budget_sharing_enabled");
+					if (before.status !== "PAUSED" || before.destination_type !== "ON_AD" || before.optimization_goal !== "LEAD_GENERATION"
+						|| Number(before.daily_budget || 0) !== 0 || Number(before.lifetime_budget) !== 30_000 || campaign.status !== "PAUSED"
+						|| campaign.objective !== "OUTCOME_LEADS" || campaign.is_adset_budget_sharing_enabled !== false || Number(campaign.daily_budget || 0) || Number(campaign.lifetime_budget || 0)) {
+						throw new Error("Flight requires the unchanged PAUSED ABO lead hierarchy and existing lifetime R$300 cap.");
+					}
+					const schedule = [{ days: [0, 1, 2, 3, 4, 5, 6], start_minute: account.timezone_name === "America/Noronha" ? 420 : 360,
+						end_minute: account.timezone_name === "America/Noronha" ? 1440 : 1380, timezone_type: "ADVERTISER" }];
+					const params: Record<string, string | number | boolean | object> = {
+						adset_schedule: schedule, name: expected_name.slice(0, -PENDING_FLIGHT_SUFFIX.length),
+						pacing_type: ["day_parting"], start_time, end_time,
+					};
+					const phrase = `FINALIZE LEAD FLIGHT ${adset_id} START ${start_time} 15D BRL 300.00`;
+					if (!validate_only) assertConfirmation(confirmation_phrase || "", phrase);
+					holder = `operation:${crypto.randomUUID()}`;
+					await acquireAccountWriteLease(env, holder, phrase);
+					leaseAcquired = true;
+					const validation = writeResponseSchema.parse(await callMetaGraph(env, "POST", adset_id, { ...params, execution_options: ["validate_only"] }, { write_lease_holder: holder }));
+					if (validation.success !== true) throw new Error("Meta did not confirm successful flight validation.");
+					const rechecked = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
+					if (adsetAgeDifferences(before, rechecked).length) throw new Error("Ad set changed during flight validation; no real write attempted.");
+					if (validate_only) {
+						const warning = await releaseAccountOperationLease(env, holder);
+						return asToolResult({ mode: "validate_only", before, proposed: params, validation, verified_unchanged: true, required_confirmation: phrase, write_lease_release_warning: warning });
+					}
+					await delay(BREVAR_SAME_OBJECT_POST_GAP_MS);
+					const afterWait = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
+					const parentAfterWait = await getOwnedObject(env, "CAMPAIGN", String(before.campaign_id), "is_adset_budget_sharing_enabled");
+					if (adsetAgeDifferences(before, afterWait).length || canonicalJson(campaign) !== canonicalJson(parentAfterWait)) throw new Error("Flight hierarchy changed before dispatch; no real write attempted.");
+					if (Date.parse(start_time) <= Date.now()) throw new Error("Requested flight start elapsed before dispatch; no real write attempted.");
+					dispatched = true;
+					const result = writeResponseSchema.parse(await callMetaGraph(env, "POST", adset_id, params, { write_lease_holder: holder }));
+					const after = await getOwnedObject(env, "ADSET", adset_id, ADSET_AGE_AUDIT_FIELDS);
+					const expected = { ...before, ...params };
+					// Graph returns budget strings and may normalize the ISO offset.
+					const normalizedAfter = { ...after, daily_budget: Number(after.daily_budget || 0), lifetime_budget: Number(after.lifetime_budget),
+						start_time: new Date(String(after.start_time)).toISOString(), end_time: new Date(String(after.end_time)).toISOString() };
+					const normalizedExpected = { ...expected, daily_budget: Number(before.daily_budget || 0), lifetime_budget: Number(before.lifetime_budget), start_time: new Date(start_time).toISOString() };
+					const differences = adsetAgeDifferences(normalizedExpected, normalizedAfter);
+					if (result.success !== true || differences.length) throw new Error(`Flight read-back mismatch: ${differences.join(", ")}.`);
+					auditMutation("finalize_lead_flight", { adset_id, lifetime_budget_minor: 30_000, duration_days: 15, verified: true });
+					const warning = await releaseAccountOperationLease(env, holder);
+					return asToolResult({ mode: "updated", before, after, verified: true, required_confirmation: phrase, write_lease_release_warning: warning });
+				} catch (error) {
+					if (dispatched && !(error instanceof MetaWriteNotDispatchedError)) return asToolError(new Error(`WRITE_OUTCOME_UNCERTAIN: reconcile the ad set before another write; lease retained. ${error instanceof Error ? error.message : "Flight update failed."}`));
+					if (leaseAcquired) await releaseAccountOperationLease(env, holder);
 					return asToolError(error);
 				}
 			},
@@ -2987,7 +3195,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					campaign_id: z.string().regex(META_ID_PATTERN),
 					confirmation_phrase: z.string().max(700).optional(),
 					daily_budget_minor: z.number().int().min(100).max(10_000_000).optional(),
-					destination_type: z.enum(["ON_POST", "WEBSITE", "WHATSAPP"]).optional(),
+					destination_type: z.enum(["ON_AD", "ON_POST", "WEBSITE", "WHATSAPP"]).optional(),
 					end_time: z.string().max(100).optional(),
 					expected_campaign_name: z.string().min(1).max(500),
 					lifetime_budget_minor: z
@@ -3062,6 +3270,12 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const { accountId } = getMetaConfig(env);
 					const campaign = await getOwnedObject(env, "CAMPAIGN", campaign_id);
 					assertExpectedName(campaign, expected_campaign_name);
+					if (destination_type === "ON_AD") {
+						if (campaign.objective !== "OUTCOME_LEADS" || optimization_goal !== "LEAD_GENERATION"
+							|| !META_ID_PATTERN.test(String(promotedObjectForMeta?.page_id || ""))) {
+							throw new Error("ON_AD requires OUTCOME_LEADS, LEAD_GENERATION, and promoted_object.page_id.");
+						}
+					}
 					if (adset_schedule) {
 						// CBO pacing belongs on the campaign; do not silently mix levels.
 						if (Number(campaign.daily_budget || 0) > 0 || Number(campaign.lifetime_budget || 0) > 0) {
@@ -3738,12 +3952,12 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const page = await assertAccessiblePage(env, page_id);
 					const params: Record<string, string | number> = {
 						fields:
-							"id,name,status,created_time,locale,questions,privacy_policy_url,follow_up_action_url,is_optimized_for_quality",
+							"id,name,status,page,page_id,created_time,locale,questions,privacy_policy_url,follow_up_action_url,is_optimized_for_quality,context_card,legal_content,thank_you_page",
 						limit,
 					};
 					if (after) params.after = after;
 					const response = graphListSchema.parse(
-						await callMetaGraph(env, "GET", `${page_id}/leadgen_forms`, params),
+						await callMetaGraph(env, "GET", `${page_id}/leadgen_forms`, params, { page_id_for_token: page_id }),
 					);
 					return asToolResult({
 						forms: response.data,
@@ -3769,6 +3983,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					"WRITE. Create one Meta Instant Form on an accessible Page. Exact confirmation and request_id are required. Forms do not spend money but may become selectable immediately.",
 				inputSchema: {
 					confirmation_phrase: z.string().max(700),
+					custom_disclaimer: leadFormDisclaimerSchema.optional(),
 					context_card: z
 						.object({
 							content: z.array(z.string().min(1).max(500)).min(1).max(20),
@@ -3785,11 +4000,14 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					privacy_policy_url: z.string().url().max(2_000),
 					questions: z.array(leadFormQuestionSchema).min(1).max(20),
 					request_id: z.string().uuid(),
+					thank_you_page: leadFormThankYouSchema.optional(),
+					validate_only: z.boolean().default(false),
 				},
 			},
 			async ({
 				confirmation_phrase,
 				context_card,
+				custom_disclaimer,
 				follow_up_action_url,
 				is_optimized_for_quality,
 				locale,
@@ -3799,21 +4017,17 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 				privacy_policy_url,
 				questions,
 				request_id,
+				thank_you_page,
+				validate_only,
 			}) => {
 				try {
 					const env = this.env as MetaEnv;
 					assertWritesEnabled(env);
 					await assertAccessiblePage(env, page_id);
-					assertConfirmation(confirmation_phrase, `CREATE LEAD FORM ${page_id} ${name}`);
-					await acquireAccountWriteLease(
-						env,
-						this.ctx.id.toString(),
-						`CREATE LEAD FORM ${page_id} ${name}`,
-					);
-					for (const question of questions.filter((item) => item.type === "CUSTOM")) {
-						if (!question.label || !question.options || !question.key) {
-							throw new Error("CUSTOM questions require key, label, and at least two options.");
-						}
+					const keys = questions.flatMap((question) => question.key ? [question.key] : []);
+					if (new Set(keys).size !== keys.length) throw new Error("Question keys must be unique.");
+					if (thank_you_page && thank_you_page.website_url !== follow_up_action_url) {
+						throw new Error("thank_you_page.website_url must match follow_up_action_url.");
 					}
 					const params: Record<string, string | number | boolean | object> = {
 						follow_up_action_url,
@@ -3824,18 +4038,302 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							link_text: privacy_policy_link_text,
 							url: privacy_policy_url,
 						},
-						questions,
+						questions: questions.map((question) => ({ ...question, ...(question.options ? {
+							options: question.options.map((value, index) => ({ key: `option_${index + 1}`, value })),
+						} : {}) })),
 					};
-					if (context_card) params.context_card = context_card;
+					if (context_card) params.context_card = { title: context_card.headline, content: context_card.content, style: context_card.style };
+					if (custom_disclaimer) params.custom_disclaimer = custom_disclaimer;
+					if (thank_you_page) params.thank_you_page = thank_you_page;
+					if (validate_only) return asToolResult({ mode: "local_preview", meta_validated: false, params });
+					assertConfirmation(confirmation_phrase, `CREATE LEAD FORM ${page_id} ${name}`);
+					await acquireAccountWriteLease(env, this.ctx.id.toString(), `CREATE LEAD FORM ${page_id} ${name}`);
 					const created = await runIdempotentCreate(env, "lead-form", request_id, async () =>
 						writeResponseSchema.parse(
-							await callMetaGraph(env, "POST", `${page_id}/leadgen_forms`, params),
+							await callMetaGraph(env, "POST", `${page_id}/leadgen_forms`, params, { page_id_for_token: page_id }),
 						),
 					);
 					auditMutation("create_lead_form", { name, page_id, request_id });
-					return asToolResult(created);
+					try {
+						const actual = await getOwnedLeadForm(env, page_id, String(writeResponseSchema.parse(created.result).id),
+							"id,name,status,page,page_id,questions,privacy_policy_url,follow_up_action_url,is_optimized_for_quality,context_card,legal_content,thank_you_page");
+						const actualQuestions = Array.isArray(actual.questions) ? actual.questions as Record<string, unknown>[] : [];
+						const requestedQuestions = params.questions as Record<string, unknown>[];
+						const checks = {
+							name: actual.name === name,
+							questions: actualQuestions.length === requestedQuestions.length && requestedQuestions.every((question, index) => {
+								const saved = actualQuestions[index];
+								return saved?.type === question.type && (question.type !== "CUSTOM" || (saved.key === question.key && saved.label === question.label
+									&& canonicalJson((saved.options as Record<string, unknown>[] | undefined)?.map((option) => ({ key: option.key, value: option.value })) || undefined) === canonicalJson(question.options)));
+							}),
+							privacy_policy_url: actual.privacy_policy_url === privacy_policy_url,
+							follow_up_action_url: actual.follow_up_action_url === follow_up_action_url,
+							is_optimized_for_quality: actual.is_optimized_for_quality === is_optimized_for_quality,
+							context_card: !context_card || (() => {
+								const saved = actual.context_card as { title?: string; content?: unknown; style?: string } | undefined;
+								return saved?.title === context_card.headline && saved?.style === context_card.style && canonicalJson(saved?.content) === canonicalJson(context_card.content);
+							})(),
+							thank_you_page: !thank_you_page || Object.entries(thank_you_page).every(([key, value]) => (actual.thank_you_page as Record<string, unknown> | undefined)?.[key] === value),
+							custom_disclaimer: !custom_disclaimer || (() => {
+								const saved = (actual.legal_content as { custom_disclaimer?: { title?: string; body?: { text?: string }; checkboxes?: typeof custom_disclaimer.checkboxes } } | undefined)?.custom_disclaimer;
+								return saved?.title === custom_disclaimer.title && saved?.body?.text === custom_disclaimer.body.text && saved?.checkboxes?.length === custom_disclaimer.checkboxes.length
+									&& custom_disclaimer.checkboxes.every((checkbox, index) => saved.checkboxes![index]?.key === checkbox.key && saved.checkboxes![index]?.text === checkbox.text
+										&& (saved.checkboxes![index]?.is_required ?? true) === checkbox.is_required && (saved.checkboxes![index]?.is_checked_by_default ?? false) === false);
+							})(),
+						};
+						return asToolResult({ ...created, actual, checks, verified: Object.values(checks).every(Boolean),
+							consent_defaults: "Missing native checkbox defaults use documented is_required=true and is_checked_by_default=false.", crm_verified: false });
+					} catch (error) {
+						return asToolResult({ ...created, verified: false, readback_error: error instanceof Error ? error.message : "Form read-back failed; do not recreate." });
+					}
 				} catch (error) {
 					return asToolError(error);
+				}
+			},
+		);
+
+		this.server.registerTool(
+			"meta_get_lead_form_details",
+			{
+				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: true },
+				description: "Read-only. Read exact owned Instant Form questions, privacy, context, native consent and thank-you configuration for audit. Never collects leads or changes a form.",
+				inputSchema: { page_id: z.string().regex(META_ID_PATTERN), form_id: z.string().regex(META_ID_PATTERN), expected_form_name: z.string().min(1).max(500) },
+			},
+			async ({ page_id, form_id, expected_form_name }) => {
+				try {
+					const form = await getOwnedLeadForm(this.env as MetaEnv, page_id, form_id,
+						"id,name,status,page,page_id,questions,privacy_policy_url,follow_up_action_url,is_optimized_for_quality,context_card,legal_content,thank_you_page");
+					assertExpectedName(form, expected_form_name);
+					return asToolResult({ form, page_id, form_id, identity_verified: true, crm_verified: false });
+				} catch (error) { return asToolError(error); }
+			},
+		);
+
+		this.server.registerTool(
+			"meta_get_lead_page_identity",
+			{
+				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: true },
+				description: "Read-only. Verify one accessible Page and its connected Instagram identity against account-owned Instagram actors. Returns public brand metadata and Page tasks only; never exposes Page tokens.",
+				inputSchema: { page_id: z.string().regex(META_ID_PATTERN) },
+			},
+			async ({ page_id }) => {
+				try { return asToolResult(await getLeadPageIdentity(this.env as MetaEnv, page_id)); }
+				catch (error) { return asToolError(error); }
+			},
+		);
+
+		this.server.registerTool(
+			"meta_list_form_leads",
+			{
+				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: true },
+				description: "Read-only. Bounded retrieval of leads or explicitly identified test leads from an exact owned Page/form. Personal fields are opt-in. Does not configure a webhook or imply Google Sheets integration.",
+				inputSchema: {
+					after: z.string().max(2_000).optional(),
+					expected_form_name: z.string().min(1).max(500),
+					form_id: z.string().regex(META_ID_PATTERN),
+					include_personal_data: z.boolean().default(false),
+					limit: z.number().int().min(1).max(100).default(25),
+					page_id: z.string().regex(META_ID_PATTERN),
+					test_leads_only: z.boolean().default(false),
+				},
+			},
+			async ({ after, expected_form_name, form_id, include_personal_data, limit, page_id, test_leads_only }) => {
+				try {
+					const env = this.env as MetaEnv;
+					await assertLeadsRetrievalPermission(env);
+					const form = await getOwnedLeadForm(env, page_id, form_id);
+					assertExpectedName(form, expected_form_name);
+					const edge = test_leads_only ? "test_leads" : "leads";
+					const response = graphListSchema.parse(await callMetaGraph(env, "GET", `${form_id}/${edge}`, {
+						fields: "id,created_time,form_id,ad_id,adset_id,campaign_id,is_organic,platform" + (include_personal_data ? ",field_data,custom_disclaimer_responses" : ""),
+						limit, ...(after ? { after } : {}),
+					}, { page_id_for_token: page_id }));
+					return asToolResult({ form, leads: response.data, is_test_dataset: test_leads_only, paging: pagingCursors(response.paging),
+						integration_configured: false, crm_verified: false });
+				} catch (error) { return asToolError(error); }
+			},
+		);
+
+		this.server.registerTool(
+			"meta_create_form_test_lead",
+			{
+				annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: true, readOnlyHint: false },
+				description: "WRITE/PREVIEW. Create one explicitly synthetic Meta test lead for an exact owned form. Rejects an existing test lead instead of deleting it. No real person's data or real CRM is accepted; exclude the result from qualified leads and enrollments.",
+				inputSchema: {
+					confirmation_phrase: z.string().max(700).optional(),
+					expected_form_name: z.string().min(1).max(500),
+					form_id: z.string().regex(META_ID_PATTERN),
+					page_id: z.string().regex(META_ID_PATTERN),
+					request_id: z.string().uuid(),
+					validate_only: z.boolean().default(true),
+				},
+			},
+			async ({ confirmation_phrase, expected_form_name, form_id, page_id, request_id, validate_only }) => {
+				try {
+					const env = this.env as MetaEnv;
+					assertWritesEnabled(env);
+					await assertLeadsRetrievalPermission(env);
+					const form = await getOwnedLeadForm(env, page_id, form_id, "id,name,status,page,page_id,questions,legal_content");
+					assertExpectedName(form, expected_form_name);
+					const questions = z.array(z.record(z.string(), z.unknown())).parse(form.questions);
+					const fields: Record<string, string> = { FULL_NAME: "full_name", EMAIL: "email", PHONE: "phone_number", CITY: "city", STATE: "state" };
+					const values: Record<string, string> = { FULL_NAME: "[TEST] BREVAR — integração", EMAIL: "brevar-test@example.invalid", PHONE: "[TEST] SEM TELEFONE", CITY: "[TEST]", STATE: "[TEST]" };
+					const field_data = questions.map((question) => ({
+						name: String(question.key || fields[String(question.type)] || ""),
+						values: [String(question.type === "CUSTOM" ? "[TEST] NÃO VALIDAR CRM/INTERESSE" : values[String(question.type)] || "[TEST]")],
+					}));
+					if (field_data.some((field) => !field.name)) throw new Error("Cannot map every test question safely.");
+					const params = { field_data };
+					const phrase = `CREATE TEST LEAD ${page_id} ${form_id} SYNTHETIC`;
+					if (validate_only) return asToolResult({ mode: "local_preview", meta_validated: false, is_test: true, params, required_confirmation: phrase });
+					assertConfirmation(confirmation_phrase || "", phrase);
+					const existing = graphListSchema.parse(await callMetaGraph(env, "GET", `${form_id}/test_leads`, { fields: "id", limit: 2 }, { page_id_for_token: page_id }));
+					if (existing.data.length) throw new Error("A synthetic test lead already exists; no creation or deletion was dispatched.");
+					await acquireAccountWriteLease(env, this.ctx.id.toString(), phrase);
+					const created = await runIdempotentCreate(env, "form-test-lead", request_id, async () => writeResponseSchema.parse(
+						await callMetaGraph(env, "POST", `${form_id}/test_leads`, params, { page_id_for_token: page_id })));
+					auditMutation("create_form_test_lead", { page_id, form_id, request_id, is_test: true });
+					return asToolResult({ created, is_test: true, crm_verified: false, qualified_lead: false, integration_verified: false });
+				} catch (error) { return asToolError(error); }
+			},
+		);
+
+		this.server.registerTool(
+			"meta_create_lead_form_image_ad_draft",
+			{
+				annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: true, readOnlyHint: false },
+				description: "WRITE/PREVIEW. Create one PAUSED native Instant Form image ad. Optional audited square/feed/story hashes use placement customization; never substitutes a website form or enables delivery.",
+				inputSchema: {
+					adset_id: z.string().regex(META_ID_PATTERN),
+					confirmation_phrase: z.string().max(700).optional(),
+					description: z.string().max(1_000).optional(),
+					expected_adset_name: z.string().min(1).max(500),
+					headline: z.string().min(1).max(500),
+					image_hash: z.string().min(1).max(500),
+					expected_instagram_username: z.string().min(1).max(100).optional(),
+					instagram_actor_id: z.string().regex(META_ID_PATTERN).optional(),
+					lead_gen_form_id: z.string().regex(META_ID_PATTERN),
+					message: z.string().min(1).max(5_000),
+					name: z.string().min(1).max(500),
+					page_id: z.string().regex(META_ID_PATTERN),
+					placement_images: z.object({
+						feed_4x5: z.string().min(1).max(500),
+						square_1x1: z.string().min(1).max(500),
+						story_9x16: z.string().min(1).max(500),
+					}).strict().optional(),
+					request_id: z.string().uuid(),
+					validate_only: z.boolean().default(true),
+				},
+			},
+			async ({ adset_id, confirmation_phrase, description, expected_adset_name, expected_instagram_username, headline, image_hash,
+				instagram_actor_id, lead_gen_form_id, message, name, page_id, placement_images, request_id, validate_only }) => {
+				let created: z.infer<typeof writeResponseSchema> | undefined;
+				try {
+					const env = this.env as MetaEnv;
+					assertWritesEnabled(env);
+					const { accountId } = getMetaConfig(env);
+					const adset = await getOwnedObject(env, "ADSET", adset_id, "targeting");
+					assertExpectedName(adset, expected_adset_name);
+					if (adset.destination_type !== "ON_AD" || adset.optimization_goal !== "LEAD_GENERATION" || getPromotedPageId(adset) !== page_id) {
+						throw new Error("Image Instant Form ads require the matching Page, ON_AD, and LEAD_GENERATION.");
+					}
+					const publisherPlatforms = (adset.targeting as { publisher_platforms?: string[] } | undefined)?.publisher_platforms;
+					if (publisherPlatforms?.includes("instagram") && !instagram_actor_id) throw new Error("Instagram placements require a verified explicit Instagram identity.");
+					if (instagram_actor_id) {
+						if (!expected_instagram_username) throw new Error("An explicit Instagram actor requires its expected public username.");
+						const identity = await getLeadPageIdentity(env, page_id);
+						if (!identity.verified_instagram_accounts.some((item) => item.id === instagram_actor_id && item.username.toLowerCase() === expected_instagram_username.replace(/^@/, "").toLowerCase())) {
+							throw new Error("Instagram identity does not match both the exact Page and configured ad account.");
+						}
+					}
+					const form = await getOwnedLeadForm(env, page_id, lead_gen_form_id);
+					const hashes = [...new Set([image_hash, ...Object.values(placement_images || {})])];
+					const images = graphListSchema.parse(await callMetaGraph(env, "GET", `${accountId}/adimages`, {
+						fields: "hash,width,height", hashes, limit: 10,
+					})).data;
+					for (const hash of hashes) {
+						if (images.filter((item) => item.hash === hash).length !== 1) throw new Error("Every image hash must be uniquely owned by the configured account.");
+					}
+					if (placement_images) {
+						if (image_hash !== placement_images.feed_4x5) throw new Error("Default image_hash must equal the feed_4x5 hash.");
+						const targeting = z.record(z.string(), z.unknown()).parse(adset.targeting);
+						const publishers = Array.isArray(targeting.publisher_platforms) ? targeting.publisher_platforms.map(String) : [];
+						if (!publishers.length || publishers.some((platform) => !["facebook", "instagram"].includes(platform))) {
+							throw new Error("Placement image customization requires explicit Facebook/Instagram-only targeting.");
+						}
+						for (const [label, ratio] of [["feed_4x5", 4 / 5], ["square_1x1", 1], ["story_9x16", 9 / 16]] as const) {
+							const image = images.find((item) => item.hash === placement_images[label])!;
+							if (!Number(image.width) || !Number(image.height) || Math.abs(Number(image.width) / Number(image.height) - ratio) > 0.002) {
+								throw new Error(`Image ${label} does not have the audited requested aspect ratio.`);
+							}
+						}
+					}
+					const linkData: Record<string, unknown> = {
+						call_to_action: { type: "LEARN_MORE", value: { lead_gen_form_id } },
+						image_hash, link: "https://fb.me/", message, name: headline,
+					};
+					if (description) linkData.description = description;
+					const objectStorySpec: Record<string, unknown> = { page_id, link_data: linkData };
+					if (instagram_actor_id) objectStorySpec.instagram_user_id = instagram_actor_id;
+					const features = ["standard_enhancements", "image_auto_crop", "image_background_gen", "image_uncrop", "image_touchups", "image_templates", "image_animation",
+						"media_type_automation", "text_generation", "text_optimizations", "pac_genai_recomposition", "pac_recomposition", "pac_relaxation", "replace_media_text"];
+					const creative: Record<string, unknown> = { object_story_spec: objectStorySpec,
+						degrees_of_freedom_spec: { creative_features_spec: Object.fromEntries(features.map((feature) => [feature, { enroll_status: "OPT_OUT" }])) } };
+					if (placement_images) {
+						creative.asset_feed_spec = {
+							ad_formats: ["SINGLE_IMAGE"], optimization_type: "PLACEMENT",
+							images: Object.entries(placement_images).map(([label, hash]) => ({ hash, adlabels: [{ name: label }] })),
+							bodies: [{ text: message }], titles: [{ text: headline }],
+							...(description ? { descriptions: [{ text: description }] } : {}),
+							call_to_action_types: ["LEARN_MORE"],
+							call_to_actions: [{ type: "LEARN_MORE", value: { lead_gen_form_id } }],
+							link_urls: [{ website_url: "https://fb.me/" }],
+							asset_customization_rules: [
+								{ customization_spec: { publisher_platforms: ["facebook", "instagram"], facebook_positions: ["story", "facebook_reels"], instagram_positions: ["story", "reels"] }, image_label: { name: "story_9x16" }, priority: 1 },
+								{ customization_spec: { publisher_platforms: ["facebook", "instagram"], facebook_positions: ["feed"], instagram_positions: ["stream"] }, image_label: { name: "feed_4x5" }, priority: 2 },
+								{ customization_spec: { publisher_platforms: ["facebook", "instagram"] }, image_label: { name: "square_1x1" }, is_default: true, priority: 3 },
+							],
+						};
+					}
+					const params: Record<string, string | number | boolean | object> = { adset_id, creative, name, status: "PAUSED" };
+					if (validate_only) {
+						params.execution_options = ["validate_only", "include_recommendations"];
+						const validation = await callMetaGraph(env, "POST", `${accountId}/ads`, params);
+						return asToolResult({ form, mode: "validate_only", status_for_create: "PAUSED", proposed: params, validation });
+					}
+					assertConfirmation(confirmation_phrase || "", `CREATE LEAD FORM IMAGE AD ${adset_id} ${name}`);
+					await acquireAccountWriteLease(env, this.ctx.id.toString(), `CREATE LEAD FORM IMAGE AD ${adset_id} ${name}`);
+					const operation = await runIdempotentCreate(env, "lead-form-image-ad", request_id, async () =>
+						writeResponseSchema.parse(await callMetaGraph(env, "POST", `${accountId}/ads`, params)));
+					created = writeResponseSchema.parse(operation.result);
+					auditMutation("create_lead_form_image_ad", { adset_id, form_id: lead_gen_form_id, name, request_id, status: "PAUSED" });
+					const actual = await getOwnedObject(env, "AD", String(created.id));
+					assertExpectedName(actual, name);
+					if (actual.status !== "PAUSED" || actual.adset_id !== adset_id) throw new Error("Created ad hierarchy/status failed read-back.");
+					const creativeId = z.object({ id: z.string().regex(META_ID_PATTERN) }).parse(actual.creative).id;
+					const saved = z.record(z.string(), z.unknown()).parse(await callMetaGraph(env, "GET", creativeId, { fields: "id,object_story_spec,asset_feed_spec,degrees_of_freedom_spec" }));
+					const savedStory = saved.object_story_spec as typeof objectStorySpec | undefined;
+					const savedLink = savedStory?.link_data as typeof linkData | undefined;
+					if (String(savedStory?.page_id) !== page_id || String((savedLink?.call_to_action as { value?: { lead_gen_form_id?: string } } | undefined)?.value?.lead_gen_form_id) !== lead_gen_form_id
+						|| savedLink?.image_hash !== image_hash || savedLink?.message !== message || savedLink?.name !== headline) {
+						throw new Error("Created image creative content/form failed read-back.");
+					}
+					if (instagram_actor_id && savedStory?.instagram_user_id !== instagram_actor_id) throw new Error("Created Instagram identity failed read-back.");
+					const savedFeatures = (saved.degrees_of_freedom_spec as { creative_features_spec?: Record<string, { enroll_status?: string }> } | undefined)?.creative_features_spec;
+					if (features.some((feature) => savedFeatures?.[feature]?.enroll_status !== "OPT_OUT")) throw new Error("Image/text transformation opt-outs were not confirmed; review before any activation.");
+					if (placement_images) {
+						const feed = saved.asset_feed_spec as { images?: { hash?: string; adlabels?: { name?: string }[] }[]; asset_customization_rules?: unknown[]; [key: string]: unknown } | undefined;
+						const requested = creative.asset_feed_spec as { images: { hash?: string; adlabels?: { name?: string }[] }[]; [key: string]: unknown };
+						const imageLabels = (images: { hash?: string; adlabels?: { name?: string }[] }[] | undefined) => images?.map((item) => ({ hash: item.hash, adlabels: item.adlabels?.map((label) => ({ name: label.name })) })).sort((a, b) => String(a.hash).localeCompare(String(b.hash)));
+						if (canonicalJson(imageLabels(feed?.images)) !== canonicalJson(imageLabels(requested.images))
+							|| ["asset_customization_rules", "bodies", "titles", "descriptions", "call_to_action_types", "call_to_actions", "link_urls", "ad_formats", "optimization_type"]
+								.some((field) => canonicalJson(feed?.[field]) !== canonicalJson(requested[field]))) {
+							throw new Error("Created placement image mapping failed read-back.");
+						}
+					}
+					return asToolResult({ created, form, verified: true, ad: actual, creative: saved, idempotent_replay: operation.idempotent_replay });
+				} catch (error) {
+					return created ? asToolResult({ created, verified: false, error: error instanceof Error ? error.message : "Read-back failed; do not recreate." }) : asToolError(error);
 				}
 			},
 		);
@@ -3889,12 +4387,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					if (getPromotedPageId(adset) !== page_id) {
 						throw new Error(`page_id must match the promoted page on ad set ${adset_id}.`);
 					}
-					const form = z
-						.object({ id: z.string(), name: z.string(), status: z.string().optional() })
-						.passthrough()
-						.parse(
-							await callMetaGraph(env, "GET", lead_gen_form_id, { fields: "id,name,status" }),
-						);
+					const form = await getOwnedLeadForm(env, page_id, lead_gen_form_id);
 					const videoData: Record<string, unknown> = {
 						call_to_action: {
 							type: "LEARN_MORE",
