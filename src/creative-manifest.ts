@@ -25,6 +25,26 @@ import ahaAclsConhecaStoriesV1 from "./creative-data/aha-acls-conheca-stories-v1
 
 import ahaPalsConhecaStoriesV1 from "./creative-data/aha-pals-conheca-stories-v1";
 
+
+import brevar2027Asset0 from "./creative-data/brevar2027-bnu-a-feed";
+import brevar2027Asset1 from "./creative-data/brevar2027-bnu-a-story";
+import brevar2027Asset2 from "./creative-data/brevar2027-bnu-a-square";
+import brevar2027Asset3 from "./creative-data/brevar2027-bnu-b-feed";
+import brevar2027Asset4 from "./creative-data/brevar2027-bnu-b-story";
+import brevar2027Asset5 from "./creative-data/brevar2027-bnu-b-square";
+import brevar2027Asset6 from "./creative-data/brevar2027-flp-a-feed";
+import brevar2027Asset7 from "./creative-data/brevar2027-flp-a-story";
+import brevar2027Asset8 from "./creative-data/brevar2027-flp-a-square";
+import brevar2027Asset9 from "./creative-data/brevar2027-flp-b-feed";
+import brevar2027Asset10 from "./creative-data/brevar2027-flp-b-story";
+import brevar2027Asset11 from "./creative-data/brevar2027-flp-b-square";
+import brevar2027Asset12 from "./creative-data/brevar2027-cwb-a-feed";
+import brevar2027Asset13 from "./creative-data/brevar2027-cwb-a-story";
+import brevar2027Asset14 from "./creative-data/brevar2027-cwb-a-square";
+import brevar2027Asset15 from "./creative-data/brevar2027-cwb-b-feed";
+import brevar2027Asset16 from "./creative-data/brevar2027-cwb-b-story";
+import brevar2027Asset17 from "./creative-data/brevar2027-cwb-b-square";
+
 export const CREATIVE_ASSETS: Record<string, { mimeType: "image/jpeg" | "image/png"; base64: string }> = {
   "/creative-assets/aha-acls-ritmo-stories-v1-ecff9ec7929ee2a2.jpg": { mimeType: "image/jpeg", base64: ahaAclsRitmoStoriesV1 },
   "/creative-assets/aha-pals-avaliacao-stories-v1-928962364e3ed8b7.jpg": { mimeType: "image/jpeg", base64: ahaPalsAvaliacaoStoriesV1 },
@@ -44,5 +64,23 @@ export const CREATIVE_ASSETS: Record<string, { mimeType: "image/jpeg" | "image/p
   "/creative-assets/brevar-oeste-preparo-feed-9b503fe767c41b65.jpg": { mimeType: "image/jpeg", base64: asset10 },
   "/creative-assets/brevar-oeste-preparo-stories-46e1e3cf4d0dc1a7.jpg": { mimeType: "image/jpeg", base64: asset11 },
   "/creative-assets/brevar-oeste-regional-feed-7e7020f8549037b1.jpg": { mimeType: "image/jpeg", base64: asset12 },
-  "/creative-assets/brevar-oeste-regional-stories-78893973a4b01a45.jpg": { mimeType: "image/jpeg", base64: asset13 }
+  "/creative-assets/brevar-oeste-regional-stories-78893973a4b01a45.jpg": { mimeType: "image/jpeg", base64: asset13 },
+  "/creative-assets/brevar2027-bnu-a-feed-9a90bbbd52b368af.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset0 },
+  "/creative-assets/brevar2027-bnu-a-story-bf2e68ac7b768d0c.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset1 },
+  "/creative-assets/brevar2027-bnu-a-square-6379fb767c241288.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset2 },
+  "/creative-assets/brevar2027-bnu-b-feed-09d53d22e7959451.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset3 },
+  "/creative-assets/brevar2027-bnu-b-story-715773d170ec4f28.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset4 },
+  "/creative-assets/brevar2027-bnu-b-square-6dd2877a161617e5.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset5 },
+  "/creative-assets/brevar2027-flp-a-feed-24f1d562e8e87c01.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset6 },
+  "/creative-assets/brevar2027-flp-a-story-9304653a7039014a.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset7 },
+  "/creative-assets/brevar2027-flp-a-square-bd4c32c77224bacc.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset8 },
+  "/creative-assets/brevar2027-flp-b-feed-cb25d304b401f92e.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset9 },
+  "/creative-assets/brevar2027-flp-b-story-3c628401e41a387d.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset10 },
+  "/creative-assets/brevar2027-flp-b-square-d67081f6741282fa.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset11 },
+  "/creative-assets/brevar2027-cwb-a-feed-901b1c7467f45f45.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset12 },
+  "/creative-assets/brevar2027-cwb-a-story-097eebd6cca56e3a.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset13 },
+  "/creative-assets/brevar2027-cwb-a-square-545ceb111d5dce1a.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset14 },
+  "/creative-assets/brevar2027-cwb-b-feed-1c5c285176caf2ba.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset15 },
+  "/creative-assets/brevar2027-cwb-b-story-e95936863614edef.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset16 },
+  "/creative-assets/brevar2027-cwb-b-square-757d3a9369535838.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset17 }
 };

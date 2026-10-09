@@ -1,0 +1,590 @@
+{
+  "encoding": {
+    "format": "JPEG",
+    "quality": 95,
+    "chroma_subsampling": "4:4:4",
+    "resize": false,
+    "crop": false,
+    "photo_reconstruction": false,
+    "source_pngs_preserved": true,
+    "source_svgs_preserved": true
+  },
+  "assets": [
+    {
+      "key": "BNU_A_feed",
+      "filename": "brevar2027-bnu-a-feed-9a90bbbd52b368af.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-bnu-a-feed-9a90bbbd52b368af.jpg",
+      "png_source": "BNU_A_feed_1080x1350.png",
+      "source_png_sha256": "9135b4129bdafe2042ad9323de01dd929b1a6075313035916e5740fcfbe4f1ac",
+      "source_svg_sha256": "1fe030b5280620e70f14cf676023464f02b4a651b6cd9706a776b14fb9007716",
+      "sha256": "9a90bbbd52b368aff6f64099bf68f3243454facfff37ccce3a12b58ae276badf",
+      "width": 1080,
+      "height": 1350,
+      "bytes": 312967,
+      "city": "Blumenau",
+      "course_date": "2027-04-17",
+      "photo_caption": "Registro de edição anterior do BREVAR.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "BNU 01.jpg",
+          "sha256": "d2a98a5eec29acdce9b5ce84b4500bee658c9b4c8f53e957a68b7946c7635fdc"
+        }
+      ]
+    },
+    {
+      "key": "BNU_A_story",
+      "filename": "brevar2027-bnu-a-story-bf2e68ac7b768d0c.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-bnu-a-story-bf2e68ac7b768d0c.jpg",
+      "png_source": "BNU_A_story_1080x1920.png",
+      "source_png_sha256": "7e7f9f30f74bc085f9d664ec34cf99517b0771d0d54c528eab4ae7794649d586",
+      "source_svg_sha256": "cff3aa10ce6014121d4e87e78681c8344e8c598aa396a50c28493f2cf45d5e18",
+      "sha256": "bf2e68ac7b768d0c28b3ff7539bac20d183676d6fb7db4dddf1f20a9f0e6afc0",
+      "width": 1080,
+      "height": 1920,
+      "bytes": 319969,
+      "city": "Blumenau",
+      "course_date": "2027-04-17",
+      "photo_caption": "Registro de edição anterior do BREVAR.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "BNU 01.jpg",
+          "sha256": "d2a98a5eec29acdce9b5ce84b4500bee658c9b4c8f53e957a68b7946c7635fdc"
+        }
+      ]
+    },
+    {
+      "key": "BNU_A_square",
+      "filename": "brevar2027-bnu-a-square-6379fb767c241288.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-bnu-a-square-6379fb767c241288.jpg",
+      "png_source": "BNU_A_square_1080x1080.png",
+      "source_png_sha256": "828ea2274df869dbb0f62576a8778efe4abce914e8e72935673bee7154ded715",
+      "source_svg_sha256": "0e46031571cd77638d84499057746b6355c7fcd574156034a5df747ad32f16cd",
+      "sha256": "6379fb767c24128833a2fc720f47efb576a0fb42d6f75e2986b43f1e44881c36",
+      "width": 1080,
+      "height": 1080,
+      "bytes": 274728,
+      "city": "Blumenau",
+      "course_date": "2027-04-17",
+      "photo_caption": "Registro de edição anterior do BREVAR.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "BNU 01.jpg",
+          "sha256": "d2a98a5eec29acdce9b5ce84b4500bee658c9b4c8f53e957a68b7946c7635fdc"
+        }
+      ]
+    },
+    {
+      "key": "BNU_B_feed",
+      "filename": "brevar2027-bnu-b-feed-09d53d22e7959451.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-bnu-b-feed-09d53d22e7959451.jpg",
+      "png_source": "BNU_B_feed_1080x1350.png",
+      "source_png_sha256": "655b2bce34bed0c089bd2a599bd916b866c3e7569f6af8ea29e5ba879d485ddb",
+      "source_svg_sha256": "f8f9c5ff594129e06b505c7d9c13b4cd3ab3afe6bb564c91f61b386cde80564d",
+      "sha256": "09d53d22e7959451305ba06e55e087e27568f7540dcc65e754679c1e44fe1601",
+      "width": 1080,
+      "height": 1350,
+      "bytes": 275147,
+      "city": "Blumenau",
+      "course_date": "2027-04-17",
+      "photo_caption": "Registro de edição anterior do BREVAR.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "FLP 02.jpg",
+          "sha256": "d488d4678281c9fbde612e43badebdf1ccd9882c2c9f32f9cb33eb3a8fdcc0d2"
+        }
+      ]
+    },
+    {
+      "key": "BNU_B_story",
+      "filename": "brevar2027-bnu-b-story-715773d170ec4f28.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-bnu-b-story-715773d170ec4f28.jpg",
+      "png_source": "BNU_B_story_1080x1920.png",
+      "source_png_sha256": "72c0016759eff7b692f71a673253c802e9374e86c871142dce328ae582d78893",
+      "source_svg_sha256": "2819795fa3ff8aa384bcd5012e2f7acd538e18759fdfe1deb7e35e50bfe3b68c",
+      "sha256": "715773d170ec4f2858d8c42ed9529604d7919917947dfba52fb561f0f2da2a08",
+      "width": 1080,
+      "height": 1920,
+      "bytes": 284144,
+      "city": "Blumenau",
+      "course_date": "2027-04-17",
+      "photo_caption": "Registro de edição anterior do BREVAR.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "FLP 02.jpg",
+          "sha256": "d488d4678281c9fbde612e43badebdf1ccd9882c2c9f32f9cb33eb3a8fdcc0d2"
+        }
+      ]
+    },
+    {
+      "key": "BNU_B_square",
+      "filename": "brevar2027-bnu-b-square-6dd2877a161617e5.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-bnu-b-square-6dd2877a161617e5.jpg",
+      "png_source": "BNU_B_square_1080x1080.png",
+      "source_png_sha256": "741d1e26e344d6192558c3d9e8915caa91fe09bf884bd71e9e48d2fde49a5b7d",
+      "source_svg_sha256": "f26e71da95b65c693f0181b4561d575f8eb3d44992451b9fb0edc43e6998ca04",
+      "sha256": "6dd2877a161617e55a12cce5417d495b3685fe32b359deddc9c7a4a1d9f75c95",
+      "width": 1080,
+      "height": 1080,
+      "bytes": 223213,
+      "city": "Blumenau",
+      "course_date": "2027-04-17",
+      "photo_caption": "Registro de edição anterior do BREVAR.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "FLP 02.jpg",
+          "sha256": "d488d4678281c9fbde612e43badebdf1ccd9882c2c9f32f9cb33eb3a8fdcc0d2"
+        }
+      ]
+    },
+    {
+      "key": "FLP_A_feed",
+      "filename": "brevar2027-flp-a-feed-24f1d562e8e87c01.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-flp-a-feed-24f1d562e8e87c01.jpg",
+      "png_source": "FLP_A_feed_1080x1350.png",
+      "source_png_sha256": "3ab4056c98b8fbf7233320c0fbda6d705772a54718624a59a835faea49efb7a2",
+      "source_svg_sha256": "424966d7a7ad0ed75a53940acea640d8a2800bcabdbe9b50b40bc5959e736065",
+      "sha256": "24f1d562e8e87c0174a2550454d18d3cdd54ca81c5127b66684088caa95253a9",
+      "width": 1080,
+      "height": 1350,
+      "bytes": 291741,
+      "city": "Florianópolis",
+      "course_date": "2027-03-27",
+      "photo_caption": "Registro de edição anterior do BREVAR.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "FLP 12.JPG",
+          "sha256": "417bf6a5b60991e637f1f5682a3a386b5e742ba911d3e61dedb838338098a412"
+        }
+      ]
+    },
+    {
+      "key": "FLP_A_story",
+      "filename": "brevar2027-flp-a-story-9304653a7039014a.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-flp-a-story-9304653a7039014a.jpg",
+      "png_source": "FLP_A_story_1080x1920.png",
+      "source_png_sha256": "f7668fadf2901cacdec003ce16a1aee42695ac406d2d1c3ca363b86ceaa39cbe",
+      "source_svg_sha256": "bbf28af8884f2bba9db7a5df0c1cc8312130451997e93baa0ae0bed218b6fd58",
+      "sha256": "9304653a7039014a95079c1b03b9b744003fcbd256583f483231c79c600e496c",
+      "width": 1080,
+      "height": 1920,
+      "bytes": 298726,
+      "city": "Florianópolis",
+      "course_date": "2027-03-27",
+      "photo_caption": "Registro de edição anterior do BREVAR.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "FLP 12.JPG",
+          "sha256": "417bf6a5b60991e637f1f5682a3a386b5e742ba911d3e61dedb838338098a412"
+        }
+      ]
+    },
+    {
+      "key": "FLP_A_square",
+      "filename": "brevar2027-flp-a-square-bd4c32c77224bacc.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-flp-a-square-bd4c32c77224bacc.jpg",
+      "png_source": "FLP_A_square_1080x1080.png",
+      "source_png_sha256": "6f6ec3ba523dc876c96211761e454eb9e60dade99e9d98cdd96fbc2551d60bcc",
+      "source_svg_sha256": "539c05102f53bda2e6994c327316664a4faf225ec2e8ba4b77ef8a2c698d8a09",
+      "sha256": "bd4c32c77224bacc690e1e41a99346071414551e1feed01fd6a101c22b87de24",
+      "width": 1080,
+      "height": 1080,
+      "bytes": 261840,
+      "city": "Florianópolis",
+      "course_date": "2027-03-27",
+      "photo_caption": "Registro de edição anterior do BREVAR.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "FLP 12.JPG",
+          "sha256": "417bf6a5b60991e637f1f5682a3a386b5e742ba911d3e61dedb838338098a412"
+        }
+      ]
+    },
+    {
+      "key": "FLP_B_feed",
+      "filename": "brevar2027-flp-b-feed-cb25d304b401f92e.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-flp-b-feed-cb25d304b401f92e.jpg",
+      "png_source": "FLP_B_feed_1080x1350.png",
+      "source_png_sha256": "32b92544cbca1a31ac90d5dd674f7bc20548f9948e3452de0b76601558b7213b",
+      "source_svg_sha256": "5f3cef6745eda2b8f8a3c212432587fe477571add379c258192e985508627b59",
+      "sha256": "cb25d304b401f92eb208c587bbd486e78a306bd085530fb88d3a29638005d246",
+      "width": 1080,
+      "height": 1350,
+      "bytes": 268955,
+      "city": "Florianópolis",
+      "course_date": "2027-03-27",
+      "photo_caption": "Registro de edição anterior do BREVAR.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "FLP 11.JPG",
+          "sha256": "e55d2ac385d745d4afd0f57220f26e8174e73380afb3f9a4ca82767077ecb2d6"
+        }
+      ]
+    },
+    {
+      "key": "FLP_B_story",
+      "filename": "brevar2027-flp-b-story-3c628401e41a387d.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-flp-b-story-3c628401e41a387d.jpg",
+      "png_source": "FLP_B_story_1080x1920.png",
+      "source_png_sha256": "6ed3576de3f20261ef956d394fb44f644d50213b44ac3ebf1804970b8a9d61ba",
+      "source_svg_sha256": "b57fd2d6fe3dbeca2f15e2502abdd597aeda437c1847c317ac556055189794b0",
+      "sha256": "3c628401e41a387da2b624510796737ba9837c5921c9171320297fd6160866f0",
+      "width": 1080,
+      "height": 1920,
+      "bytes": 276808,
+      "city": "Florianópolis",
+      "course_date": "2027-03-27",
+      "photo_caption": "Registro de edição anterior do BREVAR.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "FLP 11.JPG",
+          "sha256": "e55d2ac385d745d4afd0f57220f26e8174e73380afb3f9a4ca82767077ecb2d6"
+        }
+      ]
+    },
+    {
+      "key": "FLP_B_square",
+      "filename": "brevar2027-flp-b-square-d67081f6741282fa.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-flp-b-square-d67081f6741282fa.jpg",
+      "png_source": "FLP_B_square_1080x1080.png",
+      "source_png_sha256": "6b7a122bdb4ed29d096fa3932a244326c776b651012e4ad5189bbb9fc92d02d8",
+      "source_svg_sha256": "7862ec8982d018351c32fa005cefebf8192f3b87101ab1994de254eb67eba12c",
+      "sha256": "d67081f6741282fa4c550923ff5b9c8fe53a172e0de86c3bbdaaaf8cb5fcd658",
+      "width": 1080,
+      "height": 1080,
+      "bytes": 215116,
+      "city": "Florianópolis",
+      "course_date": "2027-03-27",
+      "photo_caption": "Registro de edição anterior do BREVAR.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "FLP 11.JPG",
+          "sha256": "e55d2ac385d745d4afd0f57220f26e8174e73380afb3f9a4ca82767077ecb2d6"
+        }
+      ]
+    },
+    {
+      "key": "CWB_A_feed",
+      "filename": "brevar2027-cwb-a-feed-901b1c7467f45f45.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-cwb-a-feed-901b1c7467f45f45.jpg",
+      "png_source": "CWB_A_feed_1080x1350.png",
+      "source_png_sha256": "169cc6a6a0e671c5f492974cbe73dc58913df98251c015f12d6772bcaa2b33ba",
+      "source_svg_sha256": "4064099c3d1fd76ef3b2a5cd202261a7baacde65ae1305e88f8e02fe7b7a32a1",
+      "sha256": "901b1c7467f45f45b296ad48d1a4aa9abb086f3d4ec12ce34dc88b2c3eb38ac6",
+      "width": 1080,
+      "height": 1350,
+      "bytes": 294895,
+      "city": "Curitiba",
+      "course_date": "2027-05-08",
+      "photo_caption": "Registro realizado fora de Curitiba.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "FLP 03.jpg",
+          "sha256": "d34f1363311cea2f22e4ca105acbd303f1eae7ca25b2738917f1df11bf044d54"
+        }
+      ]
+    },
+    {
+      "key": "CWB_A_story",
+      "filename": "brevar2027-cwb-a-story-097eebd6cca56e3a.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-cwb-a-story-097eebd6cca56e3a.jpg",
+      "png_source": "CWB_A_story_1080x1920.png",
+      "source_png_sha256": "02d44c1d4c6c7b8c903a6781c75dfb2cf0e083e21be801ca607cd1d2378ff5b2",
+      "source_svg_sha256": "c7c3060367bafe802b8dbbbbca188f465518af91833951525190e0dfc4702f84",
+      "sha256": "097eebd6cca56e3a4ce032331b1ea587472a874c9a1dcf0ae0ab296e2b11f980",
+      "width": 1080,
+      "height": 1920,
+      "bytes": 301431,
+      "city": "Curitiba",
+      "course_date": "2027-05-08",
+      "photo_caption": "Registro realizado fora de Curitiba.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "FLP 03.jpg",
+          "sha256": "d34f1363311cea2f22e4ca105acbd303f1eae7ca25b2738917f1df11bf044d54"
+        }
+      ]
+    },
+    {
+      "key": "CWB_A_square",
+      "filename": "brevar2027-cwb-a-square-545ceb111d5dce1a.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-cwb-a-square-545ceb111d5dce1a.jpg",
+      "png_source": "CWB_A_square_1080x1080.png",
+      "source_png_sha256": "89bae90e49307ebd6467121ae80c622c65aa037d1410adaad25634f9449b6c6f",
+      "source_svg_sha256": "ac95a6e80055372b9253c3ce05265d7e716e2eada4f1e750dee4fdc14d7b603d",
+      "sha256": "545ceb111d5dce1a2067fc64a7c8dfb0e11602db493315df45ed5888d256f54e",
+      "width": 1080,
+      "height": 1080,
+      "bytes": 259975,
+      "city": "Curitiba",
+      "course_date": "2027-05-08",
+      "photo_caption": "Registro realizado fora de Curitiba.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "FLP 03.jpg",
+          "sha256": "d34f1363311cea2f22e4ca105acbd303f1eae7ca25b2738917f1df11bf044d54"
+        }
+      ]
+    },
+    {
+      "key": "CWB_B_feed",
+      "filename": "brevar2027-cwb-b-feed-1c5c285176caf2ba.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-cwb-b-feed-1c5c285176caf2ba.jpg",
+      "png_source": "CWB_B_feed_1080x1350.png",
+      "source_png_sha256": "390811115501b8f4eac313cdbbea59b9a44c4ae4bfa90c406cede3e195ab306a",
+      "source_svg_sha256": "97f9670a5e4d3dc5d7b48b499ad416c223b060f7626d13801ea00250bb263cc1",
+      "sha256": "1c5c285176caf2baff6e98f0e00138e6736b86027fa8f7d6d9e592f08bbb60f5",
+      "width": 1080,
+      "height": 1350,
+      "bytes": 241731,
+      "city": "Curitiba",
+      "course_date": "2027-05-08",
+      "photo_caption": "Registro realizado fora de Curitiba.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "ITJ 14.JPG",
+          "sha256": "fb881f5d74abdbe96fbc8e3c4e78dd9d8ce922b29582123b1753e0a97d7659c0"
+        }
+      ]
+    },
+    {
+      "key": "CWB_B_story",
+      "filename": "brevar2027-cwb-b-story-e95936863614edef.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-cwb-b-story-e95936863614edef.jpg",
+      "png_source": "CWB_B_story_1080x1920.png",
+      "source_png_sha256": "5902f6b7d2804932d6711f9a93619c41f2aa435ae36633e912bb826d5ece6be4",
+      "source_svg_sha256": "498ad340f738c33b00d86b5182b19e2ea5d3f84b439396987846616bfc5b87d6",
+      "sha256": "e95936863614edefd033ab069145ac32fe6fc059df4d37a406dc9db438d9ddf4",
+      "width": 1080,
+      "height": 1920,
+      "bytes": 247030,
+      "city": "Curitiba",
+      "course_date": "2027-05-08",
+      "photo_caption": "Registro realizado fora de Curitiba.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "ITJ 14.JPG",
+          "sha256": "fb881f5d74abdbe96fbc8e3c4e78dd9d8ce922b29582123b1753e0a97d7659c0"
+        }
+      ]
+    },
+    {
+      "key": "CWB_B_square",
+      "filename": "brevar2027-cwb-b-square-757d3a9369535838.jpg",
+      "public_relative_path": "/creative-assets/brevar2027-cwb-b-square-757d3a9369535838.jpg",
+      "png_source": "CWB_B_square_1080x1080.png",
+      "source_png_sha256": "5126026db2446e56c5b2502230a464e065ff81210ca26965e63d03e58f8318f5",
+      "source_svg_sha256": "04d482df9c3cc827652a12aa06e0c34a99ce1909ad0356607d46448c12d63aac",
+      "sha256": "757d3a9369535838ed150ecc6ad5cea9c72fea74d9c94b52c9ebdef855f56a51",
+      "width": 1080,
+      "height": 1080,
+      "bytes": 199263,
+      "city": "Curitiba",
+      "course_date": "2027-05-08",
+      "photo_caption": "Registro realizado fora de Curitiba.",
+      "original_asset_sources": [
+        {
+          "kind": "original_logo",
+          "name": "LOGO BREVAR - Copia.webp",
+          "sha256": "9e2205b4fad4ab75c13df3eefa22cc91354ba638d72d9cda568a15a80b9439c1"
+        },
+        {
+          "kind": "original_logo",
+          "name": "LOGO STOICUS.png",
+          "sha256": "9bed9af7dc671b8641da11fa7bd4272d25d28a8e9d4af2f9598d98e5a1995db2"
+        },
+        {
+          "kind": "original_photo",
+          "name": "ITJ 14.JPG",
+          "sha256": "fb881f5d74abdbe96fbc8e3c4e78dd9d8ce922b29582123b1753e0a97d7659c0"
+        }
+      ]
+    }
+  ]
+}

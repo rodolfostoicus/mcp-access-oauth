@@ -1,5 +1,7 @@
 "use strict";
 
+// v2.3.18 lead-form tests below use the same real-handler offline harness.
+
 // Offline integration tests: execute the real TypeScript tool handlers while
 // replacing every network request and KV operation with in-memory fixtures.
 // No production credentials, Cloudflare calls, or Meta writes are possible.
@@ -98,6 +100,7 @@ async function harness(options = {}) {
       ? new URLSearchParams(String(init.body)) : url.searchParams);
     // Do not retain headers or the fake Authorization value in test logs.
     const call = { method: init.method, path: graphPath, params };
+    options.inspectRequest?.(init, call);
     calls.push(call);
     fetchSignals.push(init.signal);
     const override = options.respond && await options.respond(call);
@@ -803,8 +806,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.17");
-  assert.equal(h.metadata.version, "2.3.17");
+  assert.equal(result.connector_version, "2.3.18");
+  assert.equal(h.metadata.version, "2.3.18");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -830,8 +833,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.17");
-  assert.equal(h.metadata.version, "2.3.17");
+  assert.equal(result.connector_version, "2.3.18");
+  assert.equal(h.metadata.version, "2.3.18");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1529,7 +1532,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.17");
+  assert.equal(result.connector_version, "2.3.18");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1603,7 +1606,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.17");
+  assert.equal(result.connector_version, "2.3.18");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1809,7 +1812,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.17");
+    assert.equal(result.connector_version, "2.3.18");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -4667,4 +4670,298 @@ test("WhatsApp keeps conversion_specs exact even when a Page/post engagement rem
   assert.equal(read.eligible, false); assert.match(read.tracking_evidence.error, /WhatsApp conversion_specs must remain exact/);
   assert.ok(read.configuration_differences.includes("ad.conversion_specs"));
   assert.equal(postCalls(h).length, posts); assert.equal(h.runtime.storageWrites.length, writes);
+});
+
+const LEAD_FORM = '950001';
+const LEAD_FORM_NAME = 'BREVAR Curitiba 2027 — interesse';
+const PAGE_TOKEN_OFFLINE = 'PAGE_TOKEN_OFFLINE_NOT_A_CREDENTIAL';
+const LEAD_DRAFT_NAME = 'BREVAR | CWB | 2027 | MÉDICOS | INÍCIO PENDENTE';
+const leadCampaign = { ...campaignFixture, objective: 'OUTCOME_LEADS', is_adset_budget_sharing_enabled: false };
+const leadAdset = { ...adsetFixture, name: LEAD_DRAFT_NAME, destination_type: 'ON_AD', optimization_goal: 'LEAD_GENERATION',
+  promoted_object: { page_id: PAGE }, daily_budget: '0', lifetime_budget: '30000',
+  targeting: { age_min: 25, age_max: 50, publisher_platforms: ['facebook', 'instagram'] } };
+const leadForm = { id: LEAD_FORM, name: LEAD_FORM_NAME, page_id: PAGE, status: 'ACTIVE',
+  questions: [{ type: 'FULL_NAME' }, { type: 'EMAIL' }, { type: 'PHONE' }, { type: 'CUSTOM', key: 'crm_numero', label: 'Número do CRM' }] };
+function leadFormInput(overrides = {}) { return {
+  name: LEAD_FORM_NAME, page_id: PAGE, confirmation_phrase: `CREATE LEAD FORM ${PAGE} ${LEAD_FORM_NAME}`,
+  follow_up_action_url: 'https://example.com/interest', privacy_policy_url: 'https://example.com/privacy',
+  privacy_policy_link_text: 'Política de privacidade', request_id: REQUEST_ID,
+  questions: [{ type: 'FULL_NAME' }, { type: 'EMAIL' }, { type: 'PHONE' }, { type: 'CUSTOM', key: 'crm_numero', label: 'Número do CRM' },
+    { type: 'CUSTOM', key: 'crm_uf', label: 'UF do CRM', options: ['SC', 'PR', 'RS'] }], ...overrides }; }
+function leadImageInput(overrides = {}) { return { adset_id: ADSET, expected_adset_name: LEAD_DRAFT_NAME,
+  name: 'BREVAR CWB 2027 — método', headline: 'Conheça como você vai treinar', message: 'Cadastro de interesse para médicos e médicas.',
+  image_hash: 'feed-hash', lead_gen_form_id: LEAD_FORM, page_id: PAGE, instagram_actor_id: '953001', expected_instagram_username: 'stoicus_educa', request_id: REQUEST_ID, ...overrides }; }
+function leadResponder(call) {
+  if (call.path === 'me/accounts') return { data: [{ id: PAGE, name: 'Offline Page', tasks: ['ADVERTISE', 'MANAGE_LEADS'], access_token: PAGE_TOKEN_OFFLINE }] };
+  if (call.path === LEAD_FORM) return leadForm;
+  if (call.path === PAGE) return { id: PAGE, name: 'Offline Stoicus Page', username: 'stoicus', website: 'https://www.stoicus.com.br', instagram_business_account: { id: '953001', username: 'stoicus_educa' } };
+  if (call.path === `act_${ACCOUNT}/instagram_accounts`) return { data: [{ id: '953001', username: 'stoicus_educa', name: 'Stoicus' }] };
+  if (call.path === `act_${ACCOUNT}/adimages`) return { data: [
+    { hash: 'feed-hash', width: 1080, height: 1350 }, { hash: 'square-hash', width: 1080, height: 1080 }, { hash: 'story-hash', width: 1080, height: 1920 }] };
+  if (call.path === `${PAGE}/leadgen_forms`) return call.method === 'GET' ? { data: [leadForm] } : { id: LEAD_FORM };
+  if (call.path === 'me/permissions') return { data: [{ permission: 'leads_retrieval', status: 'granted' }] };
+}
+
+test('lead Page-token routing fixes error190 internally without exposing or persisting a token', async () => {
+  const authRoles = [];
+  const h = await harness({ useGate: true, clock: statusTestClock(), respond: leadResponder,
+    inspectRequest(init, call) {
+      const auth = init.headers.get('Authorization');
+      if (call.path === `${PAGE}/leadgen_forms`) authRoles.push(auth === `Bearer ${PAGE_TOKEN_OFFLINE}`);
+      if (call.path === 'me/accounts') assert.notEqual(auth, `Bearer ${PAGE_TOKEN_OFFLINE}`);
+    } });
+  const result = toolPayload(await h.invoke('meta_list_lead_forms', { page_id: PAGE }));
+  assert.equal(result.forms[0].id, LEAD_FORM);
+  assert.deepEqual(authRoles, [true]);
+  assert.equal(JSON.stringify(result).includes(PAGE_TOKEN_OFFLINE), false);
+  assert.equal(JSON.stringify(h.kvWrites).includes(PAGE_TOKEN_OFFLINE), false);
+  assert.equal(JSON.stringify(h.auditEvents).includes(PAGE_TOKEN_OFFLINE), false);
+});
+
+test('lead Page-token routing fails closed when the exact Page has no derived token', async () => {
+  const h = await harness({ useGate: true, clock: statusTestClock(), respond(call) {
+    if (call.path === 'me/accounts') return { data: [{ id: PAGE, tasks: ['ADVERTISE', 'MANAGE_LEADS'] }] };
+  } });
+  const result = await h.invoke('meta_list_lead_forms', { page_id: PAGE });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /no Page Access Token/);
+  assert.equal(h.calls.filter(c => c.path === `${PAGE}/leadgen_forms`).length, 0);
+});
+
+test('CRM short text is preserved and multiple choices use native key/value option objects', async () => {
+  const h = await harness({ respond: leadResponder });
+  const result = toolPayload(await h.invoke('meta_create_lead_form', leadFormInput({ validate_only: true,
+    thank_you_page: { title: 'Interesse registrado', body: 'Abra o WhatsApp e envie sua mensagem. Toque em enviar.', button_text: 'Abrir WhatsApp', button_type: 'VIEW_WEBSITE', website_url: 'https://example.com/interest' },
+    custom_disclaimer: { title: 'Contato sobre esta turma', body: { text: 'Receber informações sobre o BREVAR.' }, checkboxes: [{ key: 'contato_brevar', text: 'Autorizo contato sobre o BREVAR.', is_required: true }] } })));
+  assert.equal(result.mode, 'local_preview'); assert.equal(result.meta_validated, false);
+  assert.equal(Object.hasOwn(result.params.questions[3], 'options'), false);
+  assert.equal(result.params.questions[3].key, 'crm_numero');
+  assert.deepEqual(result.params.questions[4].options, [{ key: 'option_1', value: 'SC' }, { key: 'option_2', value: 'PR' }, { key: 'option_3', value: 'RS' }]);
+  assert.equal(result.params.custom_disclaimer.checkboxes[0].is_checked_by_default, false);
+  assert.equal(postCalls(h).length, 0); assert.equal(h.kvWrites.length, 0);
+});
+
+test('CRM form schema rejects unlabeled custom fields and prechecked consent', async () => {
+  const h = await harness();
+  await assert.rejects(h.invoke('meta_create_lead_form', leadFormInput({ questions: [{ type: 'CUSTOM', key: 'crm_numero' }] })));
+  await assert.rejects(h.invoke('meta_create_lead_form', leadFormInput({ custom_disclaimer: { title: 'Consentimento', body: { text: 'Contato.' }, checkboxes: [{ key: 'consent', text: 'Aceito', is_checked_by_default: true }] } })));
+  assert.equal(h.calls.length, 0);
+});
+
+test('27 CRM UFs fit without confusing professional UF with residence STATE', async () => {
+  const h = await harness({ respond: leadResponder });
+  const options = ['AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO'];
+  const out = toolPayload(await h.invoke('meta_create_lead_form', leadFormInput({ validate_only: true, questions: [{ type: 'CUSTOM', key: 'crm_uf', label: 'UF de inscrição no CRM', options }] })));
+  assert.equal(out.params.questions[0].type, 'CUSTOM'); assert.equal(out.params.questions[0].options.length, 27);
+});
+
+test('explicit ON_AD is native LEAD_GENERATION and keeps provisional daily20 PAUSED without a flight', async () => {
+  const h = await harness({ campaign: leadCampaign });
+  const out = toolPayload(await h.invoke('meta_create_adset_draft', adsetInput({ destination_type: 'ON_AD', promoted_object: { page_id: PAGE },
+    optimization_goal: 'LEAD_GENERATION', daily_budget_minor: 2000, name: LEAD_DRAFT_NAME })));
+  const params = postCalls(h)[0].params;
+  assert.equal(params.destination_type, 'ON_AD'); assert.equal(params.daily_budget, '2000'); assert.equal(params.status, 'PAUSED');
+  assert.equal(Object.hasOwn(params, 'start_time'), false); assert.equal(Object.hasOwn(params, 'end_time'), false);
+  assert.equal(Object.hasOwn(params, 'adset_schedule'), false); assert.equal(out.resolved_optimization_goal, 'LEAD_GENERATION');
+});
+
+test('ON_AD rejects an incompatible objective without a create POST', async () => {
+  const h = await harness();
+  const out = await h.invoke('meta_create_adset_draft', adsetInput({ destination_type: 'ON_AD', promoted_object: { page_id: PAGE }, optimization_goal: 'LEAD_GENERATION' }));
+  assert.equal(out.isError, true); assert.equal(postCalls(h).length, 0);
+});
+
+test('native image lead CTA and three placement ratios use one exact form without website lead substitution', async () => {
+  const h = await harness({ adset: leadAdset, respond: leadResponder });
+  const out = toolPayload(await h.invoke('meta_create_lead_form_image_ad_draft', leadImageInput({ placement_images: { feed_4x5: 'feed-hash', square_1x1: 'square-hash', story_9x16: 'story-hash' } })));
+  const creative = postCalls(h)[0].params.creative;
+  assert.equal(out.mode, 'validate_only'); assert.equal(out.status_for_create, 'PAUSED');
+  assert.deepEqual(creative.object_story_spec.link_data.call_to_action, { type: 'LEARN_MORE', value: { lead_gen_form_id: LEAD_FORM } });
+  assert.equal(creative.object_story_spec.link_data.link, 'https://fb.me/');
+  assert.equal(creative.asset_feed_spec.images.length, 3); assert.equal(creative.asset_feed_spec.optimization_type, 'PLACEMENT');
+  assert.equal(creative.asset_feed_spec.asset_customization_rules[0].image_label.name, 'story_9x16');
+  assert.equal(creative.asset_feed_spec.asset_customization_rules[1].image_label.name, 'feed_4x5');
+  assert.equal(h.kvWrites.length, 0);
+});
+
+for (const [label, override, pattern] of [
+  ['wrong Page', { ...leadForm, page_id: '999999' }, /does not belong/],
+  ['archived form', { ...leadForm, status: 'ARCHIVED' }, /not usable/],
+]) test(`image lead ad refuses ${label} before Meta ad preview`, async () => {
+  const h = await harness({ adset: leadAdset, respond(call) { return call.path === LEAD_FORM ? override : leadResponder(call); } });
+  const out = await h.invoke('meta_create_lead_form_image_ad_draft', leadImageInput());
+  assert.equal(out.isError, true); assert.match(out.content[0].text, pattern); assert.equal(postCalls(h).length, 0);
+});
+
+test('wrong image ratio cannot reach an ad validation or change budgets', async () => {
+  const h = await harness({ adset: leadAdset, respond(call) { if (call.path === `act_${ACCOUNT}/adimages`) return { data: [
+    { hash: 'feed-hash', width: 1080, height: 1350 }, { hash: 'square-hash', width: 1080, height: 1080 }, { hash: 'story-hash', width: 1080, height: 1080 }] }; return leadResponder(call); } });
+  const out = await h.invoke('meta_create_lead_form_image_ad_draft', leadImageInput({ placement_images: { feed_4x5: 'feed-hash', square_1x1: 'square-hash', story_9x16: 'story-hash' } }));
+  assert.equal(out.isError, true); assert.match(out.content[0].text, /aspect ratio/); assert.equal(postCalls(h).length, 0);
+});
+
+for (const type of ['ADSET', 'AD', 'CAMPAIGN']) test(`pending lead flight blocks ${type} ACTIVE and never dispatches status POST`, async () => {
+  const obj = type === 'ADSET' ? leadAdset : type === 'AD' ? { id: '950099', account_id: ACCOUNT, name: 'BREVAR 2027 creative', adset_id: ADSET, campaign_id: CAMPAIGN, status: 'PAUSED' } : leadCampaign;
+  const h = await harness({ adset: leadAdset, campaign: leadCampaign, respond(call) {
+    if (call.path === '950099') return obj;
+    if (call.path === `${CAMPAIGN}/adsets`) return { data: [leadAdset] };
+  } });
+  const out = await h.invoke('meta_set_delivery_status', { object_type: type, object_id: obj.id, expected_name: obj.name, status: 'ACTIVE', confirmation_phrase: `SET ${type} ${obj.id} ACTIVE` });
+  assert.equal(out.isError, true); assert.match(out.content[0].text, /flight is pending/); assert.equal(postCalls(h).length, 0);
+});
+
+for (const zone of ['America/Noronha', 'America/Sao_Paulo']) test(`flight preview fixes300cap and15days across month boundary with correct hours in ${zone}`, async () => {
+  const h = await harness({ clock: statusTestClock(), adset: leadAdset, campaign: leadCampaign, respond(call) {
+    if (call.path === `act_${ACCOUNT}`) return { id: `act_${ACCOUNT}`, account_id: ACCOUNT, name: 'Offline account', account_status: 1, currency: 'BRL', timezone_name: zone };
+  } });
+  const out = toolPayload(await h.invoke('meta_configure_lead_adset_flight', { adset_id: ADSET, expected_name: LEAD_DRAFT_NAME, start_time: '2026-10-28T06:00:00-03:00' }));
+  assert.equal(out.before.lifetime_budget, '30000'); assert.equal(Object.hasOwn(out.proposed, 'daily_budget'), false); assert.equal(Object.hasOwn(out.proposed, 'lifetime_budget'), false);
+  assert.equal(Date.parse(out.proposed.end_time) - Date.parse(out.proposed.start_time), 15 * 86400000);
+  assert.equal(out.proposed.end_time, '2026-11-12T09:00:00.000Z');
+  assert.equal(out.proposed.adset_schedule[0].start_minute, zone === 'America/Noronha' ? 420 : 360);
+  assert.equal(out.proposed.adset_schedule[0].end_minute, zone === 'America/Noronha' ? 1440 : 1380);
+  assert.equal(out.proposed.name.endsWith(' | INÍCIO PENDENTE'), false);
+  assert.equal(out.verified_unchanged, true); assert.equal(postCalls(h).length, 1);
+  assert.deepEqual(postCalls(h)[0].params.execution_options, ['validate_only']);
+});
+
+test('lead retrieval fails before form access when permission is absent', async () => {
+  const h = await harness();
+  const out = await h.invoke('meta_list_form_leads', { page_id: PAGE, form_id: LEAD_FORM, expected_form_name: LEAD_FORM_NAME, include_personal_data: true });
+  assert.equal(out.isError, true); assert.match(out.content[0].text, /leads_retrieval/);
+  assert.equal(h.calls.length, 1); assert.equal(h.calls[0].path, 'me/permissions'); assert.equal(postCalls(h).length, 0);
+});
+
+test('test lead preview only builds conspicuously synthetic values and cannot certify a physician or integration', async () => {
+  const h = await harness({ respond: leadResponder });
+  const out = toolPayload(await h.invoke('meta_create_form_test_lead', { page_id: PAGE, form_id: LEAD_FORM, expected_form_name: LEAD_FORM_NAME, request_id: REQUEST_ID }));
+  assert.equal(out.mode, 'local_preview'); assert.equal(out.is_test, true); assert.equal(out.meta_validated, false);
+  assert.equal(out.params.field_data.find(f => f.name === 'crm_numero').values[0], '[TEST] NÃO VALIDAR CRM/INTERESSE');
+  assert.equal(out.params.field_data.find(f => f.name === 'email').values[0], 'brevar-test@example.invalid');
+  assert.equal(postCalls(h).length, 0);
+});
+
+test('existing Meta test lead prevents another test creation and never deletes anything', async () => {
+  const h = await harness({ respond(call) { if (call.path === `${LEAD_FORM}/test_leads`) return { data: [{ id: '999000' }] }; return leadResponder(call); } });
+  const out = await h.invoke('meta_create_form_test_lead', { page_id: PAGE, form_id: LEAD_FORM, expected_form_name: LEAD_FORM_NAME, request_id: REQUEST_ID,
+    validate_only: false, confirmation_phrase: `CREATE TEST LEAD ${PAGE} ${LEAD_FORM} SYNTHETIC` });
+  assert.equal(out.isError, true); assert.match(out.content[0].text, /already exists/); assert.equal(postCalls(h).length, 0);
+});
+
+test('context-card input headline maps to native Meta title', async () => {
+  const h = await harness({ respond: leadResponder });
+  const out = toolPayload(await h.invoke('meta_create_lead_form', leadFormInput({ validate_only: true, context_card: { headline: 'BREVAR em Curitiba', content: ['Exclusivo para médicos e médicas.'] } })));
+  assert.equal(out.params.context_card.title, 'BREVAR em Curitiba');
+  assert.equal(Object.hasOwn(out.params.context_card, 'headline'), false);
+});
+
+test('final Instagram cursor without next is complete and binds exact Page/account/username', async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === `act_${ACCOUNT}/instagram_accounts`) return { data: [{ id: '953001', username: 'stoicus_educa' }], paging: { cursors: { after: 'final-position' } } };
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_get_lead_page_identity', { page_id: PAGE }));
+  assert.equal(out.identity_verified, true); assert.equal(out.verified_instagram_accounts[0].username, 'stoicus_educa');
+});
+
+test('same-name wrong Instagram account cannot pass exact actor verification', async () => {
+  const h = await harness({ adset: leadAdset, respond(call) {
+    if (call.path === `act_${ACCOUNT}/instagram_accounts`) return { data: [{ id: '953002', username: 'stoicus_educa' }] };
+    return leadResponder(call);
+  } });
+  const out = await h.invoke('meta_create_lead_form_image_ad_draft', leadImageInput());
+  assert.equal(out.isError, true); assert.match(out.content[0].text, /Instagram identity/); assert.equal(postCalls(h).length, 0);
+});
+
+test('Instagram placements cannot silently fall back to a Page-backed actor', async () => {
+  const h = await harness({ adset: leadAdset, respond: leadResponder });
+  const out = await h.invoke('meta_create_lead_form_image_ad_draft', leadImageInput({ instagram_actor_id: undefined, expected_instagram_username: undefined }));
+  assert.equal(out.isError, true); assert.match(out.content[0].text, /verified explicit Instagram identity/); assert.equal(postCalls(h).length, 0);
+});
+
+test('exact native form reader exposes audit fields without retrieving leads', async () => {
+  const h = await harness({ respond: leadResponder });
+  const out = toolPayload(await h.invoke('meta_get_lead_form_details', { page_id: PAGE, form_id: LEAD_FORM, expected_form_name: LEAD_FORM_NAME }));
+  assert.equal(out.identity_verified, true); assert.equal(out.crm_verified, false);
+  const fields = h.calls.find(c => c.path === LEAD_FORM).params.fields;
+  for (const field of ['questions', 'legal_content', 'thank_you_page', 'context_card']) assert.ok(fields.includes(field));
+  assert.equal(h.calls.some(c => c.path.endsWith('/leads')), false); assert.equal(postCalls(h).length, 0);
+});
+
+test('form creation keeps its ID when native read-back is incomplete and never recreates', async () => {
+  const h = await harness({ respond: leadResponder });
+  const out = toolPayload(await h.invoke('meta_create_lead_form', leadFormInput()));
+  assert.equal(out.result.id, LEAD_FORM); assert.equal(out.verified, false); assert.equal(out.checks.questions, false);
+  assert.equal(postCalls(h).length, 1); assert.equal(postCalls(h)[0].path, `${PAGE}/leadgen_forms`);
+});
+
+test('native lead image real create verifies actor, content, opt-outs and full three-format mapping', async () => {
+  let proposed;
+  const h = await harness({ adset: leadAdset, respond(call) {
+    if (call.path === `act_${ACCOUNT}/ads`) { proposed = call.params.creative; return { id: '953099' }; }
+    if (call.path === '953099') return { id: '953099', account_id: ACCOUNT, name: 'BREVAR CWB 2027 — método', status: 'PAUSED', adset_id: ADSET, campaign_id: CAMPAIGN, creative: { id: '953098' } };
+    if (call.path === '953098') return { id: '953098', ...proposed };
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_create_lead_form_image_ad_draft', leadImageInput({ validate_only: false,
+    confirmation_phrase: `CREATE LEAD FORM IMAGE AD ${ADSET} BREVAR CWB 2027 — método`, placement_images: { feed_4x5: 'feed-hash', square_1x1: 'square-hash', story_9x16: 'story-hash' } })));
+  assert.equal(out.verified, true); assert.equal(out.created.id, '953099'); assert.equal(postCalls(h).length, 1);
+  assert.equal(proposed.object_story_spec.instagram_user_id, '953001');
+  assert.equal(proposed.degrees_of_freedom_spec.creative_features_spec.image_background_gen.enroll_status, 'OPT_OUT');
+  assert.equal(proposed.degrees_of_freedom_spec.creative_features_spec.text_generation.enroll_status, 'OPT_OUT');
+});
+
+for (const drift of ['adlabels', 'titles', 'opt_out']) test(`image lead create reports ${drift} mismatch with the created ID and no retry`, async () => {
+  let proposed;
+  const h = await harness({ adset: leadAdset, respond(call) {
+    if (call.path === `act_${ACCOUNT}/ads`) { proposed = call.params.creative; return { id: '953099' }; }
+    if (call.path === '953099') return { id: '953099', account_id: ACCOUNT, name: 'BREVAR CWB 2027 — método', status: 'PAUSED', adset_id: ADSET, campaign_id: CAMPAIGN, creative: { id: '953098' } };
+    if (call.path === '953098') {
+      const saved = JSON.parse(JSON.stringify(proposed));
+      if (drift === 'adlabels') saved.asset_feed_spec.images[0].adlabels = [{ name: 'story_9x16' }];
+      if (drift === 'titles') saved.asset_feed_spec.titles[0].text = 'Different headline';
+      if (drift === 'opt_out') saved.degrees_of_freedom_spec.creative_features_spec.image_background_gen.enroll_status = 'OPT_IN';
+      return { id: '953098', ...saved };
+    }
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_create_lead_form_image_ad_draft', leadImageInput({ validate_only: false,
+    confirmation_phrase: `CREATE LEAD FORM IMAGE AD ${ADSET} BREVAR CWB 2027 — método`, placement_images: { feed_4x5: 'feed-hash', square_1x1: 'square-hash', story_9x16: 'story-hash' } })));
+  assert.equal(out.verified, false); assert.equal(out.created.id, '953099'); assert.ok(out.error); assert.equal(postCalls(h).length, 1);
+});
+
+test('lifetime flight real update preserves300, waits31seconds, only reschedules, and remainsPAUSED', async () => {
+  let current = JSON.parse(JSON.stringify(leadAdset));
+  const clock = statusTestClock(), waits = [];
+  const timer = clock.setTimeout;
+  clock.setTimeout = (callback, ms) => { waits.push(ms); return timer(callback, ms); };
+  const h = await harness({ campaign: leadCampaign, clock, respond(call) {
+    if (call.path === `act_${ACCOUNT}`) return { id: `act_${ACCOUNT}`, account_id: ACCOUNT, name: 'Offline', currency: 'BRL', timezone_name: 'America/Noronha' };
+    if (call.path === ADSET && call.method === 'GET') return current;
+    if (call.path === ADSET && call.method === 'POST') {
+      if (!call.params.execution_options) current = { ...current, ...call.params };
+      return { success: true };
+    }
+  } });
+  const start = '2026-10-28T06:00:00-03:00';
+  const out = toolPayload(await h.invoke('meta_configure_lead_adset_flight', { adset_id: ADSET, expected_name: LEAD_DRAFT_NAME, start_time: start,
+    validate_only: false, confirmation_phrase: `FINALIZE LEAD FLIGHT ${ADSET} START ${start} 15D BRL 300.00` }));
+  assert.equal(out.verified, true); assert.equal(out.after.status, 'PAUSED'); assert.equal(out.after.lifetime_budget, '30000');
+  assert.ok(waits.includes(31000)); assert.equal(postCalls(h).length, 2);
+  for (const post of postCalls(h)) { assert.equal(Object.hasOwn(post.params, 'daily_budget'), false); assert.equal(Object.hasOwn(post.params, 'lifetime_budget'), false); }
+});
+
+test('campaign activation reads all child pages and accepts final cursor without next', async () => {
+  let status = 'PAUSED';
+  const h = await harness({ respond(call) {
+    if (call.path === CAMPAIGN) {
+      if (call.method === 'POST') { status = call.params.status; return { success: true }; }
+      return { ...leadCampaign, status };
+    }
+    if (call.path === `${CAMPAIGN}/adsets`) return call.params.after
+      ? { data: [], paging: { cursors: { after: 'final-position' } } }
+      : { data: [{ ...leadAdset, name: 'BREVAR 2027 ready' }], paging: { next: 'https://graph.facebook.com/not-followed', cursors: { after: 'next-page' } } };
+  } });
+  const out = toolPayload(await h.invoke('meta_set_delivery_status', { object_type: 'CAMPAIGN', object_id: CAMPAIGN, expected_name: CAMPAIGN_NAME, status: 'ACTIVE', confirmation_phrase: `SET CAMPAIGN ${CAMPAIGN} ACTIVE` }));
+  assert.equal(out.after.status, 'ACTIVE'); assert.equal(h.calls.filter(c => c.path === `${CAMPAIGN}/adsets`).length, 2);
 });
