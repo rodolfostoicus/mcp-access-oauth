@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.19";
+const CONNECTOR_VERSION = "2.3.20";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -700,9 +700,10 @@ export class MetaApiGate {
 					if (call.page_id_for_token) {
 						const pageId = call.page_id_for_token;
 						const permitted = call.path === `${pageId}/leadgen_forms`
+							|| (call.method === "GET" && call.path === `${pageId}/instagram_accounts`)
 							|| (call.method === "GET" && /^\d+(?:\/(?:leads|test_leads))?$/.test(call.path))
 							|| (call.method === "POST" && /^\d+\/test_leads$/.test(call.path));
-						if (!permitted) throw new Error("Page token is restricted to lead-form and lead-test endpoints.");
+						if (!permitted) throw new Error("Page token is restricted to lead-form, lead-test and Page Instagram identity endpoints.");
 						// Resolve inside this account gate. The token is never returned,
 						// cached in KV, logged, or accepted from a tool caller.
 						let cursor: string | undefined;
@@ -866,18 +867,83 @@ async function assertLeadsRetrievalPermission(env: MetaEnv) {
 
 async function getLeadPageIdentity(env: MetaEnv, pageId: string) {
 	const accessible = await assertAccessiblePage(env, pageId);
-	const page = z.object({ id: z.string(), name: z.string() }).passthrough().parse(await callMetaGraph(env, "GET", pageId, {
-		fields: "id,name,username,website,instagram_business_account{id,username},connected_instagram_account{id,username}",
-	}, { page_id_for_token: pageId }));
+	const diagnosticError = (error: unknown) => (error instanceof Error ? error.message : "Identity metadata unavailable.")
+		.replace(/access_token=[^&\s]+/gi, "access_token=[redacted]")
+		.replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, "Bearer [redacted]");
+	type IdentitySource = { data: Record<string, unknown>[]; complete: boolean; error: string | null; pages_read: number };
+	// Follow only returned opaque cursors, never arbitrary paging URLs. Preserve
+	// partial evidence but distinguish it from a complete empty inventory.
+	const readIdentityEdge = async (path: string, pageToken = false): Promise<IdentitySource> => {
+		const data: Record<string, unknown>[] = [];
+		const visited = new Set<string>();
+		let cursor: string | undefined;
+		let pagesRead = 0;
+		try {
+			for (let pageIndex = 0; pageIndex < 3; pageIndex++) {
+				const response = graphListSchema.extend({ data: z.array(z.record(z.string(), z.unknown())) }).parse(await callMetaGraph(env, "GET", path, {
+					fields: "id,username,name", limit: 100, ...(cursor ? { after: cursor } : {}),
+				}, pageToken ? { page_id_for_token: pageId } : undefined));
+				pagesRead++;
+				data.push(...response.data);
+				if (!response.paging?.next) return { data, complete: true, error: null, pages_read: pagesRead };
+				const next = response.paging.cursors?.after;
+				if (!next || visited.has(next)) return { data, complete: false, error: "Identity edge pagination has no usable next cursor.", pages_read: pagesRead };
+				visited.add(next);
+				cursor = next;
+			}
+			return { data, complete: false, error: "Identity edge pagination exceeded the three-page diagnostic bound.", pages_read: pagesRead };
+		} catch (error) {
+			return { data, complete: false, error: diagnosticError(error), pages_read: pagesRead };
+		}
+	};
+	let page: Record<string, unknown> = { id: pageId, name: String(accessible.name || "") };
+	let pageFieldsError: string | null = null;
+	try {
+		page = z.object({ id: z.string(), name: z.string() }).passthrough().parse(await callMetaGraph(env, "GET", pageId, {
+			fields: "id,name,username,website,instagram_business_account{id,username},connected_instagram_account{id,username}",
+		}, { page_id_for_token: pageId }));
+	} catch (error) {
+		pageFieldsError = diagnosticError(error);
+	}
 	if (page.id !== pageId) throw new Error("Page identity mismatch.");
 	const { accountId } = getMetaConfig(env);
-	const actors = graphListSchema.parse(await callMetaGraph(env, "GET", `${accountId}/instagram_accounts`, { fields: "id,username,name", limit: 100 }));
-	if (actors.paging?.next) throw new Error("Instagram actor inventory is incomplete; inspect bounded pagination before use.");
-	const linked = [page.instagram_business_account, page.connected_instagram_account]
-		.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object").map((item) => ({ id: String(item.id), username: String(item.username || "") }));
-	const matched = linked.filter((item) => actors.data.some((actor) => String(actor.id) === item.id && String(actor.username || "").toLowerCase() === item.username.toLowerCase()));
+	const actors = await readIdentityEdge(`${accountId}/instagram_accounts`);
+	const connected = await readIdentityEdge(`${accountId}/connected_instagram_accounts`);
+	const pageAccounts = await readIdentityEdge(`${pageId}/instagram_accounts`, true);
+	const normalize = (items: Record<string, unknown>[]) => items.filter((item) => META_ID_PATTERN.test(String(item.id || "")))
+		.map((item) => ({ id: String(item.id), username: String(item.username || "").replace(/^@/, "") }));
+	const linked = normalize([
+		page.instagram_business_account, page.connected_instagram_account,
+	].filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object").concat(pageAccounts.data));
+	const accountActors = normalize(actors.data);
+	const connectedActors = normalize(connected.data);
+	const exactMatch = (left: { id: string; username: string }, right: { id: string; username: string }) =>
+		Boolean(left.username) && left.id === right.id && left.username.toLowerCase() === right.username.toLowerCase();
+	const allEvidence = [...linked, ...accountActors, ...connectedActors];
+	const hasConflictingUsername = (item: { id: string; username: string }) => allEvidence.some((other) =>
+		other.id === item.id && other.username && other.username.toLowerCase() !== item.username.toLowerCase());
+	const distinct = (items: { id: string; username: string }[]) => items.filter((item, index) =>
+		items.findIndex((other) => exactMatch(item, other)) === index);
+	// A connected account is diagnostic evidence, not proof of advertising
+	// authorization. Keep the creator's verified-actor prerequisite unchanged.
+	const matched = distinct(linked.filter((item) => !hasConflictingUsername(item) && accountActors.some((actor) => exactMatch(item, actor))));
+	const connectedMatches = distinct(linked.filter((item) => !hasConflictingUsername(item) && connectedActors.some((actor) => exactMatch(item, actor))));
+	const incomplete = Boolean(pageFieldsError) || !actors.complete || !connected.complete || !pageAccounts.complete
+		|| allEvidence.some((item) => !item.username || hasConflictingUsername(item));
 	return { page, page_tasks: accessible.tasks, account_instagram_actors: actors.data, verified_instagram_accounts: matched,
-		identity_verified: matched.length > 0 };
+		identity_verified: matched.length > 0,
+		identity_status: matched.length ? "verified" : "unknown",
+		identity_metadata_incomplete: incomplete,
+		page_instagram_accounts: pageAccounts.data, account_connected_instagram_accounts: connected.data,
+		page_linked_connected_candidates: connectedMatches.map((item) => ({ ...item, page_linked: true, account_connected: true,
+			advertising_authorization: matched.some((actor) => exactMatch(item, actor)) ? "verified_account_actor" : "unknown" })),
+		identity_sources: { page_fields: { complete: pageFieldsError === null, error: pageFieldsError },
+			account_instagram_accounts: { ...actors, data: undefined }, account_connected_instagram_accounts: { ...connected, data: undefined },
+			page_instagram_accounts: { ...pageAccounts, data: undefined } },
+		instagram_basic_scope_status: "unknown", instagram_basic_scope_checked: false,
+		identity_note: matched.length ? "Exact Page-linked identity is present in the configured account advertising actor inventory."
+			: "Identity is not verified. Empty or unavailable metadata does not prove the Instagram profile is absent; connected candidates do not prove advertising authorization. Check instagram_basic separately with the token-permission diagnostic.",
+	};
 }
 
 async function getOwnedObject(

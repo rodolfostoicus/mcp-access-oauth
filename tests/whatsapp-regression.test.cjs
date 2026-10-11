@@ -806,8 +806,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.19");
-  assert.equal(h.metadata.version, "2.3.19");
+  assert.equal(result.connector_version, "2.3.20");
+  assert.equal(h.metadata.version, "2.3.20");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -833,8 +833,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.19");
-  assert.equal(h.metadata.version, "2.3.19");
+  assert.equal(result.connector_version, "2.3.20");
+  assert.equal(h.metadata.version, "2.3.20");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1532,7 +1532,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.19");
+  assert.equal(result.connector_version, "2.3.20");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1606,7 +1606,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.19");
+  assert.equal(result.connector_version, "2.3.20");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1812,7 +1812,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.19");
+    assert.equal(result.connector_version, "2.3.20");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -4696,6 +4696,7 @@ function leadResponder(call) {
   if (call.path === LEAD_FORM) return leadForm;
   if (call.path === PAGE) return { id: PAGE, name: 'Offline Stoicus Page', username: 'stoicus', website: 'https://www.stoicus.com.br', instagram_business_account: { id: '953001', username: 'stoicus_educa' } };
   if (call.path === `act_${ACCOUNT}/instagram_accounts`) return { data: [{ id: '953001', username: 'stoicus_educa', name: 'Stoicus' }] };
+  if (call.path === `act_${ACCOUNT}/connected_instagram_accounts` || call.path === `${PAGE}/instagram_accounts`) return { data: [] };
   if (call.path === `act_${ACCOUNT}/adimages`) return { data: [
     { hash: 'feed-hash', width: 1080, height: 1350 }, { hash: 'square-hash', width: 1080, height: 1080 }, { hash: 'story-hash', width: 1080, height: 1920 }] };
   if (call.path === `${PAGE}/leadgen_forms`) return call.method === 'GET' ? { data: [leadForm] } : { id: LEAD_FORM };
@@ -5013,15 +5014,18 @@ test('a Page identity mismatch is isolated without changing forms or their pagin
   assertReadOnlyDiagnostic(h);
 });
 
-test('Instagram actor diagnostic failure preserves successful forms and exposes a separate error', async () => {
+test('Instagram actor diagnostic failure preserves forms and exposes unknown identity with a source error', async () => {
   const h = await harness({ respond(call) {
     if (call.path === `act_${ACCOUNT}/instagram_accounts`) return { httpStatus: 403, body: { error: { code: 200, message: 'Instagram actors unavailable' } } };
     return leadResponder(call);
   } });
   const out = toolPayload(await h.invoke('meta_list_lead_forms', { page_id: PAGE }));
   assert.deepEqual(out.forms, [leadForm]);
-  assert.equal(out.page_identity, null);
-  assert.match(out.page_identity_error, /Instagram actors unavailable.*200/);
+  assert.equal(out.page_identity.identity_verified, false);
+  assert.equal(out.page_identity.identity_status, 'unknown');
+  assert.equal(out.page_identity.identity_metadata_incomplete, true);
+  assert.match(out.page_identity.identity_sources.account_instagram_accounts.error, /Instagram actors unavailable.*200/);
+  assert.equal(out.page_identity_error, null);
   assert.equal(JSON.stringify(out).includes(PAGE_TOKEN_OFFLINE), false);
   assertReadOnlyDiagnostic(h);
 });
@@ -5058,5 +5062,187 @@ test('granted lead scope cannot imply lead readiness when configured account acc
   assert.equal(out.lead_retrieval_access_verified, false);
   assert.equal(out.ready_for_reads, false);
   assert.equal(out.ready_for_writes, false);
+  assertReadOnlyDiagnostic(h);
+});
+
+// v2.3.20 separates Page/account relationship evidence from advertising actors.
+test('Page Instagram edge recovers omitted nested metadata using exact advertising actor evidence', async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === PAGE) return { id: PAGE, name: 'Offline Stoicus Page' };
+    if (call.path === `${PAGE}/instagram_accounts`) return { data: [{ id: '953001', username: 'stoicus_educa' }] };
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_list_lead_forms', { page_id: PAGE }));
+  assert.deepEqual(out.forms, [leadForm]);
+  assert.equal(out.page_identity.identity_verified, true);
+  assert.deepEqual(out.page_identity.verified_instagram_accounts, [{ id: '953001', username: 'stoicus_educa' }]);
+  assert.equal(out.page_identity.identity_sources.page_instagram_accounts.complete, true);
+  assert.equal(out.page_identity.instagram_basic_scope_status, 'unknown');
+  assert.equal(out.page_identity.instagram_basic_scope_checked, false);
+  assert.equal(h.calls.some(c => c.path === 'me/permissions'), false);
+  assertReadOnlyDiagnostic(h);
+});
+
+test('exact connected candidate preserves the diagnosis without claiming advertising authorization', async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === `act_${ACCOUNT}/instagram_accounts`) return { data: [] };
+    if (call.path === `act_${ACCOUNT}/connected_instagram_accounts`) return { data: [{ id: '953001', username: 'stoicus_educa' }] };
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_get_lead_page_identity', { page_id: PAGE }));
+  assert.equal(out.identity_verified, false);
+  assert.equal(out.identity_status, 'unknown');
+  assert.deepEqual(out.verified_instagram_accounts, []);
+  assert.deepEqual(out.page_linked_connected_candidates, [{ id: '953001', username: 'stoicus_educa', page_linked: true, account_connected: true, advertising_authorization: 'unknown' }]);
+  assertReadOnlyDiagnostic(h);
+});
+
+test('a connected candidate cannot relax the lead image creator exact advertising actor precondition', async () => {
+  const h = await harness({ adset: leadAdset, respond(call) {
+    if (call.path === `act_${ACCOUNT}/instagram_accounts`) return { data: [] };
+    if (call.path === `act_${ACCOUNT}/connected_instagram_accounts`) return { data: [{ id: '953001', username: 'stoicus_educa' }] };
+    return leadResponder(call);
+  } });
+  const out = await h.invoke('meta_create_lead_form_image_ad_draft', leadImageInput());
+  assert.equal(out.isError, true);
+  assert.match(out.content[0].text, /Instagram identity/);
+  assert.equal(postCalls(h).length, 0);
+});
+
+test('optional connected metadata failure preserves a previously verified Page and advertising actor', async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === `act_${ACCOUNT}/connected_instagram_accounts`) return { httpStatus: 403, body: { error: { code: 200, message: 'Optional connected metadata denied' } } };
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_list_lead_forms', { page_id: PAGE }));
+  assert.deepEqual(out.forms, [leadForm]);
+  assert.equal(out.page_identity.identity_verified, true);
+  assert.equal(out.page_identity.identity_metadata_incomplete, true);
+  assert.equal(out.page_identity.identity_sources.account_connected_instagram_accounts.complete, false);
+  assert.match(out.page_identity.identity_sources.account_connected_instagram_accounts.error, /Optional connected metadata denied.*200/);
+  assert.equal(out.page_identity_error, null);
+  assertReadOnlyDiagnostic(h);
+});
+
+test('nested Page metadata failure is isolated and Page edge plus advertising actor can recover exact identity', async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === PAGE) return { httpStatus: 403, body: { error: { code: 200, message: 'Nested Page metadata denied' } } };
+    if (call.path === `${PAGE}/instagram_accounts`) return { data: [{ id: '953001', username: 'stoicus_educa' }] };
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_list_lead_forms', { page_id: PAGE }));
+  assert.deepEqual(out.forms, [leadForm]);
+  assert.equal(out.page_identity.page.id, PAGE);
+  assert.equal(out.page_identity.identity_verified, true);
+  assert.match(out.page_identity.identity_sources.page_fields.error, /Nested Page metadata denied.*200/);
+  assert.equal(out.page_identity_error, null);
+  assertReadOnlyDiagnostic(h);
+});
+
+test('complete empty identity metadata reports unknown, without claiming missing instagram_basic or profile absence', async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === PAGE) return { id: PAGE, name: 'Offline Stoicus Page' };
+    if (call.path === `act_${ACCOUNT}/instagram_accounts`) return { data: [] };
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_get_lead_page_identity', { page_id: PAGE }));
+  assert.equal(out.identity_verified, false);
+  assert.equal(out.identity_status, 'unknown');
+  assert.equal(out.instagram_basic_scope_status, 'unknown');
+  assert.equal(out.instagram_basic_scope_checked, false);
+  assert.match(out.identity_note, /does not prove.*absent/);
+  assertReadOnlyDiagnostic(h);
+});
+
+test('identity pagination follows only opaque cursors and accepts a final cursor without next', async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === `act_${ACCOUNT}/instagram_accounts`) return call.params.after
+      ? { data: [{ id: '953001', username: 'stoicus_educa' }], paging: { cursors: { after: 'final-position' } } }
+      : { data: [], paging: { next: 'https://foreign.example/never-fetch', cursors: { after: 'next-position' } } };
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_get_lead_page_identity', { page_id: PAGE }));
+  assert.equal(out.identity_verified, true);
+  assert.equal(out.identity_sources.account_instagram_accounts.complete, true);
+  assert.equal(out.identity_sources.account_instagram_accounts.pages_read, 2);
+  assert.deepEqual(h.calls.filter(c => c.path === `act_${ACCOUNT}/instagram_accounts`).map(c => c.params.after), [undefined, 'next-position']);
+  assertReadOnlyDiagnostic(h);
+});
+
+test('identity pagination stops after three pages and preserves incomplete candidate evidence', async () => {
+  let page = 0;
+  const h = await harness({ respond(call) {
+    if (call.path === `act_${ACCOUNT}/instagram_accounts`) return { data: [] };
+    if (call.path === `${PAGE}/instagram_accounts`) {
+      page++;
+      return { data: [{ id: '953001', username: 'stoicus_educa' }], paging: { next: 'https://graph.facebook.com/never-fetch', cursors: { after: `position-${page}` } } };
+    }
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_list_lead_forms', { page_id: PAGE }));
+  assert.deepEqual(out.forms, [leadForm]);
+  assert.equal(out.page_identity.identity_status, 'unknown');
+  assert.equal(out.page_identity.identity_metadata_incomplete, true);
+  assert.equal(out.page_identity.identity_sources.page_instagram_accounts.pages_read, 3);
+  assert.equal(out.page_identity.identity_sources.page_instagram_accounts.complete, false);
+  assert.match(out.page_identity.identity_sources.page_instagram_accounts.error, /three-page/);
+  assert.equal(h.calls.filter(c => c.path === `${PAGE}/instagram_accounts`).length, 3);
+  assertReadOnlyDiagnostic(h);
+});
+
+test('identity edge with a next URL but no cursor is incomplete instead of a complete empty inventory', async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === `act_${ACCOUNT}/instagram_accounts`) return { data: [], paging: { next: 'https://foreign.example/no-cursor' } };
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_get_lead_page_identity', { page_id: PAGE }));
+  assert.equal(out.identity_status, 'unknown');
+  assert.equal(out.identity_metadata_incomplete, true);
+  assert.equal(out.identity_sources.account_instagram_accounts.complete, false);
+  assert.match(out.identity_sources.account_instagram_accounts.error, /no usable next cursor/);
+  assertReadOnlyDiagnostic(h);
+});
+
+test('malformed optional identity source does not silently become an empty complete inventory', async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === `act_${ACCOUNT}/connected_instagram_accounts`) return {};
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_list_lead_forms', { page_id: PAGE }));
+  assert.deepEqual(out.forms, [leadForm]);
+  assert.equal(out.page_identity.identity_verified, true);
+  assert.equal(out.page_identity.identity_metadata_incomplete, true);
+  assert.equal(out.page_identity.identity_sources.account_connected_instagram_accounts.complete, false);
+  assert.ok(out.page_identity.identity_sources.account_connected_instagram_accounts.error);
+  assertReadOnlyDiagnostic(h);
+});
+
+test('contradictory usernames for the same exact actor ID fail closed', async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === `act_${ACCOUNT}/connected_instagram_accounts`) return { data: [{ id: '953001', username: 'different_brand' }] };
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_get_lead_page_identity', { page_id: PAGE }));
+  assert.equal(out.identity_verified, false);
+  assert.equal(out.identity_status, 'unknown');
+  assert.equal(out.identity_metadata_incomplete, true);
+  assert.deepEqual(out.verified_instagram_accounts, []);
+  assertReadOnlyDiagnostic(h);
+});
+
+test('Page Instagram edge uses the same internally resolved Page token without exposing or persisting it', async () => {
+  const authRoles = [];
+  const h = await harness({ useGate: true, clock: statusTestClock(), respond(call) {
+    if (call.path === `${PAGE}/instagram_accounts`) return { data: [{ id: '953001', username: 'stoicus_educa' }] };
+    return leadResponder(call);
+  }, inspectRequest(init, call) {
+    if (call.path === `${PAGE}/instagram_accounts`) authRoles.push(init.headers.get('Authorization') === `Bearer ${PAGE_TOKEN_OFFLINE}`);
+  } });
+  const out = toolPayload(await h.invoke('meta_list_lead_forms', { page_id: PAGE }));
+  assert.deepEqual(authRoles, [true]);
+  assert.equal(out.page_identity.identity_verified, true);
+  assert.equal(JSON.stringify(out).includes(PAGE_TOKEN_OFFLINE), false);
+  assert.equal(JSON.stringify(h.kvWrites).includes(PAGE_TOKEN_OFFLINE), false);
+  assert.equal(JSON.stringify(h.auditEvents).includes(PAGE_TOKEN_OFFLINE), false);
   assertReadOnlyDiagnostic(h);
 });
