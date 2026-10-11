@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.18";
+const CONNECTOR_VERSION = "2.3.19";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -2047,6 +2047,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					);
 					const scopeReadyForReads = granted.has("ads_read") || granted.has("ads_management");
 					const scopeReadyForWrites = granted.has("ads_management");
+					const leadsRetrievalGranted = granted.has("leads_retrieval");
 					const writeSwitchEnabled = env.META_WRITE_ENABLED?.trim().toLowerCase() === "true";
 					return asToolResult({
 						configured_ad_account_id: accountId,
@@ -2066,6 +2067,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						page_whatsapp_diagnostics: pageWhatsappDiagnostics,
 						whatsapp_assets: whatsappAssetDiagnostics,
 						permissions,
+						leads_retrieval_granted: leadsRetrievalGranted,
+						ready_for_lead_retrieval: leadsRetrievalGranted && configuredAccountAccessible,
+						lead_retrieval_access_verified: false,
+						lead_retrieval_readiness_explanation:
+							"Lead readiness reports the granted leads_retrieval scope and configured-account read access only. Exact Page access and actual lead retrieval are not verified; no lead request was made.",
 						ready_for_reads: scopeReadyForReads && configuredAccountAccessible,
 						ready_for_writes:
 							scopeReadyForWrites && configuredAccountAccessible && writeSwitchEnabled,
@@ -3939,7 +3945,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 			"meta_list_lead_forms",
 			{
 				annotations: { destructiveHint: false, openWorldHint: true, readOnlyHint: true },
-				description: "Read-only. List Instant Forms owned by one accessible Facebook Page.",
+				description: "Read-only. List Instant Forms owned by one accessible Facebook Page and independently diagnose that same Page's connected Instagram identity against the configured ad account. Identity diagnostics never block a successful form listing.",
 				inputSchema: {
 					after: z.string().max(2_000).optional(),
 					limit: z.number().int().min(1).max(100).default(25),
@@ -3959,9 +3965,18 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const response = graphListSchema.parse(
 						await callMetaGraph(env, "GET", `${page_id}/leadgen_forms`, params, { page_id_for_token: page_id }),
 					);
+					let pageIdentity: Awaited<ReturnType<typeof getLeadPageIdentity>> | null = null;
+					let pageIdentityError: string | null = null;
+					try {
+						pageIdentity = await getLeadPageIdentity(env, page_id);
+					} catch (error) {
+						pageIdentityError = asToolError(error).content[0].text;
+					}
 					return asToolResult({
 						forms: response.data,
 						page: { id: page_id, name: page.name },
+						page_identity: pageIdentity,
+						page_identity_error: pageIdentityError,
 						paging: pagingCursors(response.paging),
 					});
 				} catch (error) {

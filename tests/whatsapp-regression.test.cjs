@@ -806,8 +806,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.18");
-  assert.equal(h.metadata.version, "2.3.18");
+  assert.equal(result.connector_version, "2.3.19");
+  assert.equal(h.metadata.version, "2.3.19");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -833,8 +833,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.18");
-  assert.equal(h.metadata.version, "2.3.18");
+  assert.equal(result.connector_version, "2.3.19");
+  assert.equal(h.metadata.version, "2.3.19");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1532,7 +1532,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.18");
+  assert.equal(result.connector_version, "2.3.19");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1606,7 +1606,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.18");
+  assert.equal(result.connector_version, "2.3.19");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1812,7 +1812,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.18");
+    assert.equal(result.connector_version, "2.3.19");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -4964,4 +4964,99 @@ test('campaign activation reads all child pages and accepts final cursor without
   } });
   const out = toolPayload(await h.invoke('meta_set_delivery_status', { object_type: 'CAMPAIGN', object_id: CAMPAIGN, expected_name: CAMPAIGN_NAME, status: 'ACTIVE', confirmation_phrase: `SET CAMPAIGN ${CAMPAIGN} ACTIVE` }));
   assert.equal(out.after.status, 'ACTIVE'); assert.equal(h.calls.filter(c => c.path === `${CAMPAIGN}/adsets`).length, 2);
+});
+
+// v2.3.19 adds read-only diagnostics to existing callable tools; no new schema
+// input, advertising mutation, token change, or lead retrieval is introduced.
+test('form listing verifies the same Page Instagram relationship against account actors without a POST', async () => {
+  const h = await harness({ respond: leadResponder });
+  const out = toolPayload(await h.invoke('meta_list_lead_forms', { page_id: PAGE }));
+  assert.deepEqual(out.forms, [leadForm]);
+  assert.equal(out.page.id, PAGE);
+  assert.equal(out.page_identity.page.id, PAGE);
+  assert.equal(out.page_identity.identity_verified, true);
+  assert.deepEqual(out.page_identity.verified_instagram_accounts, [{ id: '953001', username: 'stoicus_educa' }]);
+  assert.equal(out.page_identity_error, null);
+  assert.equal(h.calls.filter(c => c.path === `act_${ACCOUNT}/instagram_accounts`).length, 1);
+  assertReadOnlyDiagnostic(h);
+});
+
+for (const [label, actor] of [
+  ['matching username with another account actor ID', { id: '953999', username: 'stoicus_educa' }],
+  ['matching actor ID with another username', { id: '953001', username: 'another_brand' }],
+]) test(`form listing does not verify ${label}`, async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === `act_${ACCOUNT}/instagram_accounts`) return { data: [actor] };
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_list_lead_forms', { page_id: PAGE }));
+  assert.deepEqual(out.forms, [leadForm]);
+  assert.equal(out.page_identity.identity_verified, false);
+  assert.deepEqual(out.page_identity.verified_instagram_accounts, []);
+  assert.equal(out.page_identity_error, null);
+  assertReadOnlyDiagnostic(h);
+});
+
+test('a Page identity mismatch is isolated without changing forms or their pagination', async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === PAGE) return { id: '953777', name: 'Other Page' };
+    if (call.path === `${PAGE}/leadgen_forms`) return { data: [leadForm], paging: { next: 'https://graph.facebook.com/not-followed', cursors: { after: 'form-cursor' } } };
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_list_lead_forms', { page_id: PAGE }));
+  assert.deepEqual(out.forms, [leadForm]);
+  assert.equal(out.page.id, PAGE);
+  assert.equal(out.page_identity, null);
+  assert.match(out.page_identity_error, /Page identity mismatch/);
+  assert.equal(out.paging.after, 'form-cursor');
+  assert.equal(h.calls.some(c => c.path === `act_${ACCOUNT}/instagram_accounts`), false);
+  assertReadOnlyDiagnostic(h);
+});
+
+test('Instagram actor diagnostic failure preserves successful forms and exposes a separate error', async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === `act_${ACCOUNT}/instagram_accounts`) return { httpStatus: 403, body: { error: { code: 200, message: 'Instagram actors unavailable' } } };
+    return leadResponder(call);
+  } });
+  const out = toolPayload(await h.invoke('meta_list_lead_forms', { page_id: PAGE }));
+  assert.deepEqual(out.forms, [leadForm]);
+  assert.equal(out.page_identity, null);
+  assert.match(out.page_identity_error, /Instagram actors unavailable.*200/);
+  assert.equal(JSON.stringify(out).includes(PAGE_TOKEN_OFFLINE), false);
+  assertReadOnlyDiagnostic(h);
+});
+
+for (const [label, leadScope, expected] of [
+  ['missing', undefined, false],
+  ['declined', { permission: 'leads_retrieval', status: 'declined' }, false],
+  ['granted', { permission: 'leads_retrieval', status: 'granted' }, true],
+]) test(`${label} leads_retrieval is reported independently of granted ad scopes`, async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === 'me/permissions') return { data: [
+      { permission: 'ads_read', status: 'granted' }, { permission: 'ads_management', status: 'granted' }, ...(leadScope ? [leadScope] : []),
+    ] };
+  } });
+  const out = toolPayload(await h.invoke('meta_get_token_permissions'));
+  assert.equal(out.leads_retrieval_granted, expected);
+  assert.equal(out.ready_for_lead_retrieval, expected);
+  assert.equal(out.lead_retrieval_access_verified, false);
+  assert.equal(out.ready_for_reads, true);
+  assert.equal(out.ready_for_writes, true);
+  assert.match(out.lead_retrieval_readiness_explanation, /no lead request was made/);
+  assert.deepEqual(h.calls.map(c => c.path), ['me/permissions', 'me', `act_${ACCOUNT}`]);
+  assertReadOnlyDiagnostic(h);
+});
+
+test('granted lead scope cannot imply lead readiness when configured account access fails', async () => {
+  const h = await harness({ respond(call) {
+    if (call.path === 'me/permissions') return { data: [{ permission: 'leads_retrieval', status: 'granted' }] };
+    if (call.path === `act_${ACCOUNT}`) return { httpStatus: 403, body: { error: { code: 200, message: 'Account unavailable' } } };
+  } });
+  const out = toolPayload(await h.invoke('meta_get_token_permissions'));
+  assert.equal(out.leads_retrieval_granted, true);
+  assert.equal(out.ready_for_lead_retrieval, false);
+  assert.equal(out.lead_retrieval_access_verified, false);
+  assert.equal(out.ready_for_reads, false);
+  assert.equal(out.ready_for_writes, false);
+  assertReadOnlyDiagnostic(h);
 });
