@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.20";
+const CONNECTOR_VERSION = "2.3.21";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -4545,8 +4545,9 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 				},
 			},
 			async ({ campaign_id, confirmation_phrase, expected_campaign_name }) => {
+				const env = this.env as MetaEnv;
+				let leaseAcquired = false;
 				try {
-					const env = this.env as MetaEnv;
 					assertWritesEnabled(env);
 					const before = await getOwnedObject(env, "CAMPAIGN", campaign_id);
 					assertExpectedName(before, expected_campaign_name);
@@ -4559,6 +4560,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						this.ctx.id.toString(),
 						`DELETE CAMPAIGN ${campaign_id} ${expected_campaign_name}`,
 					);
+					leaseAcquired = true;
 					const result = writeResponseSchema.parse(
 						await callMetaGraph(env, "POST", campaign_id, { status: "DELETED" }),
 					);
@@ -4569,6 +4571,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					return asToolResult({ before, result, status_requested: "DELETED" });
 				} catch (error) {
 					return asToolError(error);
+				} finally {
+					if (leaseAcquired) {
+						const warning = await releaseAccountOperationLease(env, this.ctx.id.toString());
+						if (warning) auditMutation("delete_campaign_lease_release_warning", { campaign_id, warning });
+					}
 				}
 			},
 		);
