@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.21";
+const CONNECTOR_VERSION = "2.3.22";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -222,7 +222,7 @@ type MetaPaging = {
 type OwnedObjectType = "CAMPAIGN" | "ADSET" | "AD";
 
 type MetaGraphCall = {
-	method: "GET" | "POST";
+	method: "GET" | "POST" | "DELETE";
 	params: Record<string, string | number | boolean | object>;
 	path: string;
 	write_lease_holder?: string;
@@ -518,7 +518,7 @@ function delay(ms: number) {
 
 async function callMetaGraphDirect(
 	env: MetaEnv,
-	method: "GET" | "POST",
+	method: "GET" | "POST" | "DELETE",
 	path: string,
 	params: Record<string, string | number | boolean | object>,
 	signal?: AbortSignal,
@@ -594,7 +594,7 @@ async function callMetaGraphDirect(
 }
 
 const metaGateCallSchema = z.object({
-	method: z.enum(["GET", "POST"]),
+	method: z.enum(["GET", "POST", "DELETE"]),
 	params: z.record(z.string(), z.unknown()),
 	path: z.string().min(1).max(1_000),
 	write_lease_holder: z.string().min(1).max(500).optional(),
@@ -611,7 +611,7 @@ const metaGateResponseSchema = z.object({
 
 async function callMetaGraph(
 	env: MetaEnv,
-	method: "GET" | "POST",
+	method: "GET" | "POST" | "DELETE",
 	path: string,
 	params: Record<string, string | number | boolean | object>,
 	options?: { write_lease_holder?: string; page_id_for_token?: string },
@@ -625,7 +625,7 @@ async function callMetaGraph(
 	const envelope = metaGateResponseSchema.parse(await response.json());
 	if (!envelope.ok) {
 		const message = envelope.error || "Meta API gate rejected the request.";
-		if (method === "POST" && envelope.write_dispatched === false) {
+		if (method !== "GET" && envelope.write_dispatched === false) {
 			throw new MetaWriteNotDispatchedError(message);
 		}
 		throw new Error(message);
@@ -686,7 +686,7 @@ export class MetaApiGate {
 					error: `category=RATE_LIMIT_COOLDOWN | wait ${retryAfterSeconds}s and retry from one chat`,
 					ok: false,
 					retry_after_seconds: retryAfterSeconds,
-					write_dispatched: call.method === "POST" ? false : undefined,
+					write_dispatched: call.method !== "GET" ? false : undefined,
 				}, { status: 429 });
 			}
 
@@ -736,7 +736,7 @@ export class MetaApiGate {
 					// pacing so an expired operation cannot dispatch a late POST.
 					// Legacy mutators retain their existing session-lease behavior.
 					if (call.write_lease_holder !== undefined) {
-						if (call.method !== "POST") throw new Error("Operation lease proof is only valid for POST requests.");
+						if (call.method === "GET") throw new Error("Operation lease proof is only valid for write requests.");
 						await assertAccountOperationLease(this.env, call.write_lease_holder);
 					}
 					const signal = call.write_lease_holder !== undefined
@@ -771,7 +771,7 @@ export class MetaApiGate {
 						error: (error instanceof Error ? error.message : "Unexpected Meta API error.")
 							.split(pageToken || "__unused_page_secret__").join("[redacted]"),
 						ok: false,
-						write_dispatched: call.method === "POST" ? dispatchStarted : undefined,
+						write_dispatched: call.method !== "GET" ? dispatchStarted : undefined,
 						retry_after_seconds: isMetaRateLimit(error)
 							? Math.ceil(Math.max(
 								error.retryAfterMs ?? META_GET_RETRY_DELAY_MS,
@@ -4562,13 +4562,20 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					);
 					leaseAcquired = true;
 					const result = writeResponseSchema.parse(
-						await callMetaGraph(env, "POST", campaign_id, { status: "DELETED" }),
+						await callMetaGraph(env, "DELETE", campaign_id, {}, { write_lease_holder: this.ctx.id.toString() }),
 					);
 					auditMutation("delete_campaign", {
 						campaign_id,
 						campaign_name: expected_campaign_name,
 					});
-					return asToolResult({ before, result, status_requested: "DELETED" });
+					let after: Record<string, unknown> | undefined;
+					let readback_error: string | undefined;
+					try {
+						after = await getOwnedObject(env, "CAMPAIGN", campaign_id);
+					} catch (error) {
+						readback_error = error instanceof Error ? error.message : "Unexpected readback error.";
+					}
+					return asToolResult({ before, result, status_requested: "DELETED", after, verified: after?.status === "DELETED", readback_error });
 				} catch (error) {
 					return asToolError(error);
 				} finally {
