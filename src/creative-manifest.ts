@@ -1,3 +1,5 @@
+import brevarAgendaFeed2027 from "./creative-data/brevar-agenda-2027-feed-out2026";
+import brevarAgendaStories2027 from "./creative-data/brevar-agenda-2027-stories-out2026";
 // Reviewed public advertising artwork manifest.
 // Public marketing images only. Do not place private data or credentials here.
 import asset0 from "./creative-data/preparo-feed";
@@ -83,4 +85,6 @@ export const CREATIVE_ASSETS: Record<string, { mimeType: "image/jpeg" | "image/p
   "/creative-assets/brevar2027-cwb-b-feed-1c5c285176caf2ba.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset15 },
   "/creative-assets/brevar2027-cwb-b-story-e95936863614edef.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset16 },
   "/creative-assets/brevar2027-cwb-b-square-757d3a9369535838.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset17 }
+  ,"/creative-assets/brevar-agenda-2027-feed-out2026.png": { mimeType: "image/png", base64: brevarAgendaFeed2027 }
+  ,"/creative-assets/brevar-agenda-2027-stories-out2026.png": { mimeType: "image/png", base64: brevarAgendaStories2027 }
 };
