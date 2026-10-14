@@ -1,3 +1,17 @@
+import brevarOesteRefined0 from "./creative-data/brevar-oeste-refinado-bnu_a-feed-out2026";
+import brevarOesteRefined1 from "./creative-data/brevar-oeste-refinado-bnu_b-feed-out2026";
+import brevarOesteRefined2 from "./creative-data/brevar-oeste-refinado-flp_a-feed-out2026";
+import brevarOesteRefined3 from "./creative-data/brevar-oeste-refinado-flp_b-feed-out2026";
+import brevarOesteRefined4 from "./creative-data/brevar-oeste-refinado-cwb_a-feed-out2026";
+import brevarOesteRefined5 from "./creative-data/brevar-oeste-refinado-cwb_b-feed-out2026";
+import brevarOesteRefined6 from "./creative-data/brevar-oeste-refinado-agenda-feed-out2026";
+import brevarOesteRefined7 from "./creative-data/brevar-oeste-refinado-bnu_a-story-out2026";
+import brevarOesteRefined8 from "./creative-data/brevar-oeste-refinado-bnu_b-story-out2026";
+import brevarOesteRefined9 from "./creative-data/brevar-oeste-refinado-flp_a-story-out2026";
+import brevarOesteRefined10 from "./creative-data/brevar-oeste-refinado-flp_b-story-out2026";
+import brevarOesteRefined11 from "./creative-data/brevar-oeste-refinado-cwb_a-story-out2026";
+import brevarOesteRefined12 from "./creative-data/brevar-oeste-refinado-cwb_b-story-out2026";
+import brevarOesteRefined13 from "./creative-data/brevar-oeste-refinado-agenda-story-out2026";
 import brevarAgendaFeed2027 from "./creative-data/brevar-agenda-2027-feed-out2026";
 import brevarAgendaStories2027 from "./creative-data/brevar-agenda-2027-stories-out2026";
 // Reviewed public advertising artwork manifest.
@@ -86,5 +100,19 @@ export const CREATIVE_ASSETS: Record<string, { mimeType: "image/jpeg" | "image/p
   "/creative-assets/brevar2027-cwb-b-story-e95936863614edef.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset16 },
   "/creative-assets/brevar2027-cwb-b-square-757d3a9369535838.jpg": { mimeType: "image/jpeg", base64: brevar2027Asset17 }
   ,"/creative-assets/brevar-agenda-2027-feed-out2026.png": { mimeType: "image/png", base64: brevarAgendaFeed2027 }
-  ,"/creative-assets/brevar-agenda-2027-stories-out2026.png": { mimeType: "image/png", base64: brevarAgendaStories2027 }
+  ,"/creative-assets/brevar-agenda-2027-stories-out2026.png": { mimeType: "image/png", base64: brevarAgendaStories2027 },
+  "/creative-assets/brevar-oeste-refinado-bnu_a-feed-out2026-b9311959a9453439.jpg": { mimeType: "image/jpeg", base64: brevarOesteRefined0 },
+  "/creative-assets/brevar-oeste-refinado-bnu_b-feed-out2026-976a5653d2227d85.jpg": { mimeType: "image/jpeg", base64: brevarOesteRefined1 },
+  "/creative-assets/brevar-oeste-refinado-flp_a-feed-out2026-288cf1ce3039d5d8.jpg": { mimeType: "image/jpeg", base64: brevarOesteRefined2 },
+  "/creative-assets/brevar-oeste-refinado-flp_b-feed-out2026-1a95f1f7fe094aef.jpg": { mimeType: "image/jpeg", base64: brevarOesteRefined3 },
+  "/creative-assets/brevar-oeste-refinado-cwb_a-feed-out2026-48d978ca663a268e.jpg": { mimeType: "image/jpeg", base64: brevarOesteRefined4 },
+  "/creative-assets/brevar-oeste-refinado-cwb_b-feed-out2026-a2544e1b9f18b522.jpg": { mimeType: "image/jpeg", base64: brevarOesteRefined5 },
+  "/creative-assets/brevar-oeste-refinado-agenda-feed-out2026-30cc9014f1ee00ea.jpg": { mimeType: "image/jpeg", base64: brevarOesteRefined6 },
+  "/creative-assets/brevar-oeste-refinado-bnu_a-story-out2026-6e2c5b70f872e1b8.jpg": { mimeType: "image/jpeg", base64: brevarOesteRefined7 },
+  "/creative-assets/brevar-oeste-refinado-bnu_b-story-out2026-c4d9cdc04956691b.jpg": { mimeType: "image/jpeg", base64: brevarOesteRefined8 },
+  "/creative-assets/brevar-oeste-refinado-flp_a-story-out2026-9ae85af5ad8db650.jpg": { mimeType: "image/jpeg", base64: brevarOesteRefined9 },
+  "/creative-assets/brevar-oeste-refinado-flp_b-story-out2026-54067bdaa69ffe4a.jpg": { mimeType: "image/jpeg", base64: brevarOesteRefined10 },
+  "/creative-assets/brevar-oeste-refinado-cwb_a-story-out2026-42948b5b0bec2646.jpg": { mimeType: "image/jpeg", base64: brevarOesteRefined11 },
+  "/creative-assets/brevar-oeste-refinado-cwb_b-story-out2026-6071428980f26a0b.jpg": { mimeType: "image/jpeg", base64: brevarOesteRefined12 },
+  "/creative-assets/brevar-oeste-refinado-agenda-story-out2026-89580ef95375d013.jpg": { mimeType: "image/jpeg", base64: brevarOesteRefined13 },
 };
