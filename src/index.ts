@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.22";
+const CONNECTOR_VERSION = "2.3.23";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -3236,7 +3236,17 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 							),
 					);
 					auditMutation("create_campaign", { name, request_id, status: "PAUSED" });
-					return asToolResult(created);
+					// Release only after the exact created object is read back PAUSED.
+					// A failed/uncertain create or read-back retains the existing lease.
+					const createdId = writeResponseSchema.parse(created.result).id;
+					if (!createdId) throw new Error("Create returned no object ID; reconcile before another write.");
+					const createdObject = await getOwnedObject(env, "CAMPAIGN", createdId);
+					assertExpectedName(createdObject, name);
+					if (createdObject.status !== "PAUSED") {
+						throw new Error("Created object read-back differs from the confirmed PAUSED request; reconcile before another write.");
+					}
+					const writeLeaseReleaseWarning = await releaseAccountOperationLease(env, this.ctx.id.toString());
+					return asToolResult({ ...created, verified: true, write_lease_release_warning: writeLeaseReleaseWarning });
 				} catch (error) {
 					return asToolError(error);
 				}
@@ -3445,7 +3455,17 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						request_id,
 						status: "PAUSED",
 					});
-					return asToolResult(created);
+					// Release only after the exact created object is read back PAUSED.
+					// A failed/uncertain create or read-back retains the existing lease.
+					const createdId = writeResponseSchema.parse(created.result).id;
+					if (!createdId) throw new Error("Create returned no object ID; reconcile before another write.");
+					const createdObject = await getOwnedObject(env, "ADSET", createdId);
+					assertExpectedName(createdObject, name);
+					if (createdObject.status !== "PAUSED" || String(createdObject.campaign_id || "") !== campaign_id) {
+						throw new Error("Created object read-back differs from the confirmed PAUSED request; reconcile before another write.");
+					}
+					const writeLeaseReleaseWarning = await releaseAccountOperationLease(env, this.ctx.id.toString());
+					return asToolResult({ ...created, verified: true, write_lease_release_warning: writeLeaseReleaseWarning });
 				} catch (error) {
 					return asToolError(error);
 				}
@@ -3673,7 +3693,17 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						request_id,
 						status: "PAUSED",
 					});
-					return asToolResult(created);
+					// Release only after the exact created object is read back PAUSED.
+					// A failed/uncertain create or read-back retains the existing lease.
+					const createdId = writeResponseSchema.parse(created.result).id;
+					if (!createdId) throw new Error("Create returned no object ID; reconcile before another write.");
+					const createdObject = await getOwnedObject(env, "AD", createdId);
+					assertExpectedName(createdObject, name);
+					if (createdObject.status !== "PAUSED" || String(createdObject.adset_id || "") !== adset_id) {
+						throw new Error("Created object read-back differs from the confirmed PAUSED request; reconcile before another write.");
+					}
+					const writeLeaseReleaseWarning = await releaseAccountOperationLease(env, this.ctx.id.toString());
+					return asToolResult({ ...created, verified: true, write_lease_release_warning: writeLeaseReleaseWarning });
 				} catch (error) {
 					return asToolError(error);
 				}
