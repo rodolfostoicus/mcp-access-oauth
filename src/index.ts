@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.23";
+const CONNECTOR_VERSION = "2.3.24";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -1222,6 +1222,10 @@ function buildWhatsAppLink(phoneNumber: string, prefilledMessage: string) {
 const BREVAR_CREATIVE_PAGE = "102139681237405";
 const BREVAR_CREATIVE_PHONE = "554791822809";
 const BREVAR_CREATIVE_COURSE_PATH = "/produtos/72/curso-brevar-fundamentos-t04-blumenau-sc/";
+const BREVAR_CREATIVE_APPROVED_SITE_PATHS = new Set([
+	BREVAR_CREATIVE_COURSE_PATH,
+	"/produtos-categorias/4/brevar/",
+]);
 const BREVAR_CREATIVE_FIELDS = "id,name,account_id,object_story_spec,object_story_id,source_instagram_media_id,asset_feed_spec,url_tags,degrees_of_freedom_spec,contextual_multi_ads";
 const BREVAR_AD_AUDIT_FIELDS = "tracking_specs,conversion_specs";
 const BREVAR_CREATIVE_CAMPAIGN_AUDIT_FIELDS = "spend_cap,start_time,stop_time,special_ad_categories,is_adset_budget_sharing_enabled";
@@ -1396,7 +1400,7 @@ function buildBrevarCreativeProposal(before: BrevarCreativeSnapshot, input: {
 		if (url.hostname !== "wa.me" || url.pathname !== `/${BREVAR_CREATIVE_PHONE}` || [...url.searchParams.keys()].some((key) => key !== "text")) throw new Error("WhatsApp link must use the approved BREVAR phone and optional text only.");
 		const promoted = z.record(z.string(), z.unknown()).parse(before.adset.promoted_object);
 		if (promoted.whatsapp_phone_number !== undefined && String(promoted.whatsapp_phone_number).replace(/\D/g, "") !== BREVAR_CREATIVE_PHONE) throw new Error("Parent WhatsApp phone differs from the approved destination.");
-	} else if (!["www.stoicus.com.br", "stoicus.com.br"].includes(url.hostname) || url.pathname !== BREVAR_CREATIVE_COURSE_PATH || [...url.searchParams.keys()].some((key) => !/^utm_(source|medium|campaign|term|content)$/.test(key))) {
+	} else if (!["www.stoicus.com.br", "stoicus.com.br"].includes(url.hostname) || !BREVAR_CREATIVE_APPROVED_SITE_PATHS.has(url.pathname) || [...url.searchParams.keys()].some((key) => !/^utm_(source|medium|campaign|term|content)$/.test(key))) {
 		throw new Error("Regional/on-post destination must be the approved BREVAR course URL with optional UTM parameters only.");
 	}
 	const linkData: Record<string, unknown> = {

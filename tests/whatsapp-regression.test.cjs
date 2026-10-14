@@ -806,8 +806,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.23");
-  assert.equal(h.metadata.version, "2.3.23");
+  assert.equal(result.connector_version, "2.3.24");
+  assert.equal(h.metadata.version, "2.3.24");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -833,8 +833,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.23");
-  assert.equal(h.metadata.version, "2.3.23");
+  assert.equal(result.connector_version, "2.3.24");
+  assert.equal(h.metadata.version, "2.3.24");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1532,7 +1532,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.23");
+  assert.equal(result.connector_version, "2.3.24");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1606,7 +1606,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.23");
+  assert.equal(result.connector_version, "2.3.24");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1812,7 +1812,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.23");
+    assert.equal(result.connector_version, "2.3.24");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -3988,6 +3988,34 @@ test("creative replacement on-post uses the approved site, preserves Instagram i
   assert.equal(result.verified, true);
   assert.equal(result.proposed.object_story_spec.link_data.call_to_action.type, "LEARN_MORE");
   assert.equal(result.proposed.url_tags, h.state.oldCreative.url_tags);
+});
+
+test("BREVAR category replacement preserves the approved 2027 destination and refuses lookalikes or extra parameters", async () => {
+  const category = "https://www.stoicus.com.br/produtos-categorias/4/brevar/?utm_source=meta&utm_content=agenda_feed";
+  for (const [url, accepted] of [
+    [category, true],
+    ["https://stoicus.com.br/produtos-categorias/4/brevar/", true],
+    ["https://www.stoicus.com.br/produtos-categorias/4/brevar/?redirect=https://evil.example", false],
+    ["https://www.stoicus.com.br.evil.example/produtos-categorias/4/brevar/", false],
+    ["https://www.stoicus.com.br/produtos-categorias/5/brevar/", false],
+    ["https://www.stoicus.com.br/produtos-categorias/4/brevar/extra", false],
+  ]) {
+    const h = await creativeReplacementHarness({ adjustState(s) { s.adset.destination_type = "ON_POST"; s.adset.optimization_goal = "POST_ENGAGEMENT"; } });
+    const raw = await h.invoke("meta_update_brevar_ad_creative", creativeReplaceInput({ link_url: url }));
+    if (accepted) {
+      const result = toolPayload(raw);
+      assert.equal(result.mode, "validate_only");
+      assert.equal(result.verified_unchanged, true);
+      assert.equal(result.proposed.object_story_spec.link_data.link, url);
+      assert.equal(result.proposed.object_story_spec.link_data.call_to_action.type, "LEARN_MORE");
+      assert.equal(realCreativePosts(h).length, 0);
+    } else {
+      assert.equal(raw.isError, true);
+      assert.match(raw.content[0].text, /approved BREVAR course URL/);
+      assert.equal(postCalls(h).length, 0);
+    }
+    assert.equal(h.runtime.values.has("lease"), false);
+  }
 });
 
 test("creative replacement rejects an unowned image hash and a failed Meta validation without any create", async () => {
