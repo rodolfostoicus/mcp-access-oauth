@@ -744,7 +744,7 @@ test("website ad-set payload remains website and preserves its promoted object",
   assert.equal(h.kvWrites.length, 0);
 });
 
-test("lead-generation path is unchanged and does not acquire WhatsApp routing", async () => {
+test("Page-only lead-generation resolves the omitted destination to native ON_AD", async () => {
   const h = await harness({ campaign: { ...campaignFixture, objective: "OUTCOME_LEADS" } });
   const result = toolPayload(await h.invoke("meta_create_adset_draft", adsetInput({
     promoted_object: { page_id: PAGE }, destination_type: undefined,
@@ -752,10 +752,11 @@ test("lead-generation path is unchanged and does not acquire WhatsApp routing", 
   })));
   const { params } = postCalls(h)[0];
   assert.equal(params.optimization_goal, "LEAD_GENERATION");
-  assert.equal(Object.hasOwn(params, "destination_type"), false);
+  assert.equal(params.destination_type, "ON_AD");
   assert.deepEqual(params.promoted_object, { page_id: PAGE });
   assert.equal(params.status, "PAUSED");
-  assert.equal(result.resolved_destination_type, null);
+  assert.equal(result.resolved_destination_type, "ON_AD");
+  assert.equal(result.inferred_native_lead_destination, true);
   assert.equal(result.resolved_optimization_goal, params.optimization_goal);
   assert.equal(h.kvWrites.length, 0);
 });
@@ -806,8 +807,8 @@ test("native WhatsApp creative cannot silently use a different Page or destinati
 test("permission readiness uses only three sequential reads and verifies the configured account", async () => {
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_token_permissions"));
-  assert.equal(result.connector_version, "2.3.24");
-  assert.equal(h.metadata.version, "2.3.24");
+  assert.equal(result.connector_version, "2.3.25");
+  assert.equal(h.metadata.version, "2.3.25");
   assert.equal(result.asset_diagnostics_included, false);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.configured_account.id, `act_${ACCOUNT}`);
@@ -833,8 +834,8 @@ test("Page WhatsApp diagnostics are opt-in, read-only, and report connector vers
   const result = toolPayload(await h.invoke("meta_get_token_permissions", {
     include_asset_diagnostics: true,
   }));
-  assert.equal(result.connector_version, "2.3.24");
-  assert.equal(h.metadata.version, "2.3.24");
+  assert.equal(result.connector_version, "2.3.25");
+  assert.equal(h.metadata.version, "2.3.25");
   assert.equal(result.asset_diagnostics_included, true);
   assert.equal(result.configured_account_accessible, true);
   assert.equal(result.scope_ready_for_reads, true);
@@ -1532,7 +1533,7 @@ test("account reads remain single-request by default and omit unrequested target
   const h = await harness();
   const result = toolPayload(await h.invoke("meta_get_ad_account"));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.24");
+  assert.equal(result.connector_version, "2.3.25");
   assert.equal(Object.hasOwn(result, "work_position_search"), false);
   assert.equal(Object.hasOwn(result, "work_position_validation"), false);
   assert.equal(Object.hasOwn(result, "audience_inventory"), false);
@@ -1606,7 +1607,7 @@ test("work-position schema bounds and transport failures preserve account-read s
     work_position_queries: ["Physician"], work_position_ids: ["910001"],
   }));
   assert.equal(result.account.id, `act_${ACCOUNT}`);
-  assert.equal(result.connector_version, "2.3.24");
+  assert.equal(result.connector_version, "2.3.25");
   assert.match(result.work_position_search[0].diagnostic_error, /Offline targeting diagnostic failure/);
   assert.match(result.work_position_validation.diagnostic_error, /Offline targeting diagnostic failure/);
   assert.equal(postCalls(h).length, 0);
@@ -1812,7 +1813,7 @@ test("audience metadata failures remain isolated from the normal account result"
     });
     const result = toolPayload(await h.invoke("meta_get_ad_account", { audience_inventory: { kind } }));
     assert.equal(result.account.id, `act_${ACCOUNT}`);
-    assert.equal(result.connector_version, "2.3.24");
+    assert.equal(result.connector_version, "2.3.25");
     assert.equal(result.audience_inventory.kind, kind);
     assert.match(result.audience_inventory.diagnostic_error, /Offline audience inventory failure/);
     assert.equal(Object.hasOwn(result.audience_inventory, "audiences"), false);
@@ -4798,6 +4799,56 @@ test('ON_AD rejects an incompatible objective without a create POST', async () =
   const h = await harness();
   const out = await h.invoke('meta_create_adset_draft', adsetInput({ destination_type: 'ON_AD', promoted_object: { page_id: PAGE }, optimization_goal: 'LEAD_GENERATION' }));
   assert.equal(out.isError, true); assert.equal(postCalls(h).length, 0);
+});
+
+test('legacy native lead inference preserves the complete targeting, R$300 lifetime cap and schedule', async () => {
+  const h = await harness({ campaign: leadCampaign });
+  const targeting = { age_min: 25, age_max: 50, geo_locations: { cities: [{ key: '253249', radius: 80, distance_unit: 'kilometer' }, { key: '272978', radius: 80, distance_unit: 'kilometer' }] },
+    flexible_spec: [{ industries: [{ id: '6012903159383' }], work_positions: [{ id: '105480999485471' }, { id: '1597521383816555' }] }],
+    publisher_platforms: ['facebook', 'instagram'], facebook_positions: ['feed', 'story', 'facebook_reels'], instagram_positions: ['stream', 'story', 'reels'],
+    device_platforms: ['mobile', 'desktop'], targeting_automation: { advantage_audience: 0, individual_setting: { age: 0, gender: 1, geo: 0 } } };
+  const schedule = [{ days: [0,1,2,3,4,5,6], start_minute: 420, end_minute: 1440, timezone_type: 'ADVERTISER' }];
+  const out = toolPayload(await h.invoke('meta_create_adset_draft', adsetInput({ optimization_goal: 'LEAD_GENERATION', promoted_object: { page_id: PAGE, smart_pse_enabled: false },
+    lifetime_budget_minor: 30000, start_time: '2099-10-22T19:00:00-02:00', end_time: '2099-11-06T19:00:00-02:00', adset_schedule: schedule, targeting })));
+  const params = postCalls(h)[0].params;
+  assert.equal(out.inferred_native_lead_destination, true); assert.equal(params.destination_type, 'ON_AD'); assert.equal(params.status, 'PAUSED');
+  assert.equal(params.lifetime_budget, '30000'); assert.equal(Object.hasOwn(params, 'daily_budget'), false);
+  assert.deepEqual(params.targeting, targeting); assert.deepEqual(params.adset_schedule, schedule); assert.deepEqual(params.pacing_type, ['day_parting']);
+  assert.equal(h.kvWrites.length, 0);
+});
+
+for (const [label, promotion, destination, objective] of [
+  ['explicit website', { page_id: PAGE }, 'WEBSITE', 'OUTCOME_LEADS'],
+  ['pixel promotion', { page_id: PAGE, pixel_id: '900008', custom_event_type: 'LEAD' }, undefined, 'OUTCOME_LEADS'],
+  ['app promotion', { page_id: PAGE, application_id: '900008' }, undefined, 'OUTCOME_LEADS'],
+  ['missing Page', {}, undefined, 'OUTCOME_LEADS'],
+  ['invalid Page', { page_id: 'not-a-meta-id' }, undefined, 'OUTCOME_LEADS'],
+  ['other campaign objective', { page_id: PAGE }, undefined, 'OUTCOME_TRAFFIC'],
+]) test(`native lead inference preserves ${label} without substituting ON_AD`, async () => {
+  const h = await harness({ campaign: { ...leadCampaign, objective } });
+  const out = toolPayload(await h.invoke('meta_create_adset_draft', adsetInput({ optimization_goal: 'LEAD_GENERATION', promoted_object: promotion, destination_type: destination })));
+  const params = postCalls(h)[0].params;
+  assert.equal(out.inferred_native_lead_destination, false); assert.equal(params.destination_type, destination);
+  assert.deepEqual(params.promoted_object, promotion); assert.equal(params.status, 'PAUSED'); assert.equal(h.kvWrites.length, 0);
+});
+
+for (const [label, returned, verified] of [
+  ['exact native destination', {}, true],
+  ['undefined destination', { destination_type: 'UNDEFINED' }, false],
+  ['changed optimization', { optimization_goal: 'LINK_CLICKS' }, false],
+  ['changed Page', { promoted_object: { page_id: '900099' } }, false],
+]) test(`native lead real create verifies ${label} before releasing its lease`, async () => {
+  const created = { ...leadAdset, id: '900007', account_id: ACCOUNT, name: ADSET_NAME, campaign_id: CAMPAIGN, promoted_object: { page_id: PAGE }, ...returned };
+  const h = await harness({ campaign: leadCampaign, respond(call) {
+    if (call.method === 'POST' && call.path === `act_${ACCOUNT}/adsets`) return { id: created.id };
+    if (call.method === 'GET' && call.path === created.id) return created;
+  } });
+  const result = await h.invoke('meta_create_adset_draft', adsetInput({ optimization_goal: 'LEAD_GENERATION', promoted_object: { page_id: PAGE }, lifetime_budget_minor: 30000,
+    validate_only: false, confirmation_phrase: `CREATE ADSET ${CAMPAIGN} ${ADSET_NAME}` }));
+  assert.equal(postCalls(h).length, 1); assert.equal(postCalls(h)[0].params.destination_type, 'ON_AD');
+  const releases = h.lockCalls.filter(c => ['release', 'release_owned'].includes(c.payload.action));
+  if (verified) { assert.equal(toolPayload(result).verified, true); assert.equal(releases.length, 1); }
+  else { assert.equal(result.isError, true); assert.match(result.content[0].text, /native lead destination read-back/); assert.equal(releases.length, 0); }
 });
 
 test('native image lead CTA and three placement ratios use one exact form without website lead substitution', async () => {
