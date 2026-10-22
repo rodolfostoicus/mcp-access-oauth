@@ -21,7 +21,7 @@ const META_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const WRITE_LEASE_TTL_MS = 10 * 60 * 1_000;
 const STATUS_POST_TIMEOUT_MS = 30_000;
 const STATUS_POST_MIN_LEASE_REMAINING_MS = 60_000;
-const CONNECTOR_VERSION = "2.3.24";
+const CONNECTOR_VERSION = "2.3.25";
 
 type MetaEnv = Env & {
 	META_ACCESS_TOKEN?: string;
@@ -3267,7 +3267,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					readOnlyHint: false,
 				},
 				description:
-					"WRITE/PREVIEW. Validate or create one ad set under an owned campaign. Real creation is always PAUSED and requires exact confirmation.",
+					"WRITE/PREVIEW. Validate or create one ad set under an owned campaign. Page-only LEAD_GENERATION in an OUTCOME_LEADS campaign resolves an omitted destination to ON_AD. Real creation is always PAUSED and requires exact confirmation.",
 				inputSchema: {
 					adset_schedule: adsetScheduleSchema.optional(),
 					bid_strategy: z
@@ -3391,9 +3391,17 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					const resolvedOptimizationGoal = compatibilityWhatsappPhone && destination_type === undefined
 						? "CONVERSATIONS"
 						: optimization_goal;
+					// Some clients still advertise the earlier schema without ON_AD.
+					// Resolve only an unambiguous Page-only native lead request. Never
+					// replace an explicit destination or a website/app promotion.
+					const inferredNativeLeadDestination = destination_type === undefined
+						&& campaign.objective === "OUTCOME_LEADS"
+						&& resolvedOptimizationGoal === "LEAD_GENERATION"
+						&& META_ID_PATTERN.test(String(promotedObjectForMeta?.page_id || ""))
+						&& Object.keys(promotedObjectForMeta || {}).every((key) => key === "page_id" || key === "smart_pse_enabled");
 					const resolvedDestinationType = compatibilityWhatsappPhone
 						? "WHATSAPP"
-						: destination_type;
+						: destination_type ?? (inferredNativeLeadDestination ? "ON_AD" : undefined);
 					const params: Record<string, string | number | boolean | object> = {
 						billing_event,
 						campaign_id,
@@ -3430,6 +3438,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 						return asToolResult({
 							mode: "validate_only",
 							resolved_destination_type: params.destination_type ?? null,
+							inferred_native_lead_destination: inferredNativeLeadDestination,
 							resolved_optimization_goal: params.optimization_goal,
 							status_for_create: "PAUSED",
 							validation,
@@ -3467,6 +3476,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 					assertExpectedName(createdObject, name);
 					if (createdObject.status !== "PAUSED" || String(createdObject.campaign_id || "") !== campaign_id) {
 						throw new Error("Created object read-back differs from the confirmed PAUSED request; reconcile before another write.");
+					}
+					if (resolvedDestinationType === "ON_AD" && (createdObject.destination_type !== "ON_AD"
+						|| createdObject.optimization_goal !== "LEAD_GENERATION"
+						|| getPromotedPageId(createdObject) !== String(promotedObjectForMeta?.page_id))) {
+						throw new Error("Created native lead destination read-back differs from ON_AD and the confirmed Page; reconcile before another write.");
 					}
 					const writeLeaseReleaseWarning = await releaseAccountOperationLease(env, this.ctx.id.toString());
 					return asToolResult({ ...created, verified: true, write_lease_release_warning: writeLeaseReleaseWarning });
