@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "stoicus-google-ads-mcp",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-09-13",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workers_dev": true,
+  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
+  "durable_objects": { "bindings": [{ "name": "GOOGLE_ADS_OPERATIONS", "class_name": "GoogleAdsOperations" }] },
+  "migrations": [{ "tag": "google-ads-operations-v1", "new_sqlite_classes": ["GoogleAdsOperations"] }],
+  "observability": { "enabled": false },
+  "vars": {
+    "GOOGLE_ADS_AUTH_MODE": "user_oauth",
+    "GOOGLE_ADS_API_VERSION": "v25"
+  }
+}
