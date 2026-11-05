@@ -18,7 +18,11 @@ export class GoogleAdsLoginSessions {
       }
       if (!['read','consume'].includes(job.operation)) return { error: 'LOGIN_SESSION_INVALID' };
       if (!saved) return { error: 'LOGIN_SESSION_NOT_FOUND' };
-      if (saved.expires <= Date.now()) { await tx.delete('session'); return { error: 'LOGIN_SESSION_EXPIRED' }; }
+      if (saved.expires <= Date.now()) {
+        const expiredFor = Math.max(0, Math.floor((Date.now() - saved.expires) / 1000));
+        await tx.delete('session');
+        return { error: 'LOGIN_SESSION_EXPIRED', expired_for_seconds: Math.min(86400, expiredFor) };
+      }
       if (saved.cookieHash !== job.cookieHash) return { error: 'LOGIN_SESSION_INVALID' };
       if (saved.phase !== job.phase) return { error: 'LOGIN_SESSION_PHASE_MISMATCH' };
       // The read/check/delete is one transaction, before the caller exchanges a
