@@ -2,6 +2,14 @@
 
 Destino: Cloudflare Worker existente **stoicus-google-ads-mcp**. O repositório contém também o Worker Meta na raiz. A raiz de construção do Google é obrigatoriamente **google-ads**.
 
+## Diagnóstico 0.2.3 - distinguir a origem e a etapa da falha
+
+Depois de confirmar a implantação0.2.2, a responsável relatou novamente o mesmo erro. Não foi declarada a restauração do acesso. No código0.2.2, `LOGIN_SESSION_EXPIRED` só significa prazo vencido de uma sessão DO encontrada; ausência, fase e cookie têm códigos próprios. O provider não traduz esses outros erros em expiração. Não há evidência para aumentar oTTL.
+
+A versão0.2.3 mantém os mesmos controles e oTTL600s. Toda resposta recebe `X-Stoicus-Connector-Version`. Os erros incluem somente serviço, versão, etapa e código seguro; quando observado diretamente peloDO, a expiração inclui o número limitado de segundos após o vencimento. Em navegaçãoHTML, a falha é apresentada em uma página legível com o diagnóstico, sem ecoarURL, query, state, code, cookie, e-mail ou mensagem upstream. A presença de umJSON antigo com apenas `error` não comprova acesso ao serviço novo: conferir a origem configurada e a resposta efetiva antes de outra alteração causal.
+
+Isso é instrumentação para localizar a falha restante, não prova de autenticação concluída ou de renovação do grantAds. Preservar a distinção entre implantação, loginMCP e acesso realGoogleAds.
+
 ## Correção 0.2.2 - sessões de login isoladas e consumo atômico
 
 O diagnóstico de 05/11/2026 encontrou que `LOGIN_SESSION_EXPIRED` reunia três condições: registro ausente, fase incorreta e prazo vencido. A sessão temporária era escrita/lida em Workers KV e um único cookie era compartilhado por tentativas. A captura não identifica qual condição ocorreu; o código permite falhas de leitura imediata e interferência entre abas.

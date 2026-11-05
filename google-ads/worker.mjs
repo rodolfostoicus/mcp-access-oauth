@@ -8,7 +8,7 @@ import { createManagement, listManagementTools, outputSchema, MAX_MUTATION_BYTES
 export { GoogleAdsOperations } from './operations.mjs';
 export { GoogleAdsLoginSessions } from './login-sessions.mjs';
 
-const VERSION = '0.2.2';
+const VERSION = '0.2.3';
 const required = ['PUBLIC_ORIGIN', 'STOICUS_ALLOWED_EMAILS', 'GOOGLE_ADS_CUSTOMER_ID',
   'GOOGLE_ADS_CLIENT_ID', 'GOOGLE_ADS_CLIENT_SECRET', 'GOOGLE_ADS_REFRESH_TOKEN'];
 function secure(response, referrerPolicy = 'no-referrer', formAction = "'self'") {
@@ -16,6 +16,7 @@ function secure(response, referrerPolicy = 'no-referrer', formAction = "'self'")
   result.headers.set('Cache-Control', 'no-store');
   result.headers.set('Referrer-Policy', referrerPolicy);
   result.headers.set('X-Content-Type-Options', 'nosniff');
+  result.headers.set('X-Stoicus-Connector-Version', VERSION);
   result.headers.set('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`);
   return result;
 }
@@ -26,6 +27,37 @@ function configuredOrigin(env) {
     if (url.origin !== env.PUBLIC_ORIGIN || url.protocol !== 'https:' || url.username || url.password || url.port) return null;
     return url.origin;
   } catch { return null; }
+}
+function failedRequest(input, error) {
+  // Identify the service and stage without echoing any URL query, cookie,
+  // Google code, OAuth state, operator address or upstream exception message.
+  const pathname = new URL(input.url).pathname;
+  const browserRoute = ['/authorize', '/callback', '/consent'].includes(pathname);
+  const stage = browserRoute ? pathname.slice(1) : 'request';
+  const code = error instanceof AuthFailure ? error.code : 'CONNECTOR_REQUEST_FAILED';
+  const status = error instanceof AuthFailure ? error.status : 500;
+  const expired = error instanceof AuthFailure && Number.isFinite(error.details?.expired_for_seconds)
+    ? { expired_for_seconds: error.details.expired_for_seconds } : {};
+  const report = { error: code, service: 'stoicus-google-ads', version: VERSION, stage, ...expired };
+  if (!browserRoute || !input.headers.get('Accept')?.includes('text/html')) return secure(Response.json(report, { status }));
+  const messages = {
+    LOGIN_SESSION_EXPIRED: 'O prazo desta tentativa terminou. A conexão não foi autorizada.',
+    LOGIN_SESSION_NOT_FOUND: 'O registro desta tentativa não está disponível ou já foi utilizado.',
+    LOGIN_SESSION_PHASE_MISMATCH: 'Esta tentativa chegou a uma etapa diferente daquela que estava aguardando.',
+    LOGIN_SESSION_MISSING: 'O navegador não enviou o cookie desta tentativa de conexão.',
+    LOGIN_SESSION_INVALID: 'O vínculo desta tentativa com o navegador não pôde ser validado.',
+    LOGIN_FLOW_INVALID: 'Esta página não contém uma tentativa de conexão válida.',
+    OAUTH_STATE_MISMATCH: 'Esta resposta não corresponde a uma tentativa de conexão válida.',
+    OPERATOR_NOT_ALLOWED: 'A conta Google selecionada não está autorizada a operar este conector.',
+    GOOGLE_LOGIN_FAILED: 'Não foi possível confirmar a resposta de login recebida do Google.',
+    GOOGLE_LOGIN_CANCELLED: 'O login no Google foi cancelado.',
+  };
+  return secure(page('Conexão Google Ads não concluída',
+    `<p>${messages[code] || 'A validação desta tentativa não foi concluída.'}</p>` +
+    `<p>Diagnóstico: <code>${code}</code><br>Serviço: Google Ads Stoicus<br>Versão: <strong>${VERSION}</strong><br>Etapa: <strong>${stage}</strong></p>` +
+    (expired.expired_for_seconds !== undefined ? `<p>O prazo foi ultrapassado há ${expired.expired_for_seconds} segundo(s).</p>` : '') +
+    '<p>Você pode compartilhar o diagnóstico acima sem enviar o endereço completo, códigos de login ou cookies.</p>' +
+    '<p>Para iniciar uma nova tentativa, volte à conexão Google Ads Stoicus Secure no ChatGPT. Uma página antiga de retorno não inicia outra conexão.</p>', status));
 }
 async function boundedRequest(request) {
   if (!request.body) return request;
@@ -118,8 +150,7 @@ export default {
         : "'self'";
       return secure(await provider.fetch(request, env, ctx), consentPage ? 'same-origin' : 'no-referrer', formAction);
     } catch (error) {
-      return secure(Response.json({ error: error instanceof AuthFailure ? error.code : 'CONNECTOR_REQUEST_FAILED' },
-        { status: error instanceof AuthFailure ? error.status : 500 }));
+      return failedRequest(input, error);
     }
   },
 };

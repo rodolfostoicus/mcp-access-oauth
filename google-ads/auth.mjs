@@ -10,7 +10,7 @@ const GOOGLE_USERINFO = 'https://openidconnect.googleapis.com/v1/userinfo';
 const encoder = new TextEncoder();
 
 export class AuthFailure extends Error {
-  constructor(code, status = 400) { super(code); this.code = code; this.status = status; }
+  constructor(code, status = 400, details = {}) { super(code); this.code = code; this.status = status; this.details = details; }
 }
 function reject(code, status) { throw new AuthFailure(code, status); }
 export function allowedEmail(env, email) {
@@ -54,7 +54,8 @@ async function sessionOperation(env, id, job) {
     headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(job) });
   if (!response.ok) reject('LOGIN_STORAGE_UNAVAILABLE', 503);
   const data = await response.json();
-  if (data.error) reject(data.error);
+  if (data.error) throw new AuthFailure(data.error, 400,
+    Number.isFinite(data.expired_for_seconds) ? { expired_for_seconds: Math.max(0, Math.min(86400, data.expired_for_seconds)) } : {});
   return data;
 }
 async function session(env, request, phase, consume = false) {

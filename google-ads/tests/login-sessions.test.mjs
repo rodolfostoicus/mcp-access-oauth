@@ -302,3 +302,74 @@ test('login binding absent fails closed and never starts upstream login', async 
     assert.equal(calls.length, before);
   } finally { await missing.dispose(); }
 });
+
+function verifyDiagnosticHeaders(response) {
+  assert.equal(response.headers.get('x-stoicus-connector-version'), '0.2.3');
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  const policy = response.headers.get('content-security-policy');
+  assert.match(policy, /default-src 'none'/);
+  assert.match(policy, /frame-ancestors 'none'/);
+  assert.match(policy, /base-uri 'none'/);
+  assert.equal(response.headers.get('location'), null);
+  assert.equal(response.headers.get('access-control-allow-origin'), null);
+}
+
+test('JSON login diagnostics identify the deployed version and callback stage without echoing request values', async () => {
+  const before = calls.length;
+  const privateCode = 'fixture-private-callback-code';
+  const privateState = 'fixture-private-malformed-state';
+  const privateEmail = 'fixture-private-email@example.test';
+  const params = new URLSearchParams({ code: privateCode, state: privateState, email: privateEmail });
+  const response = await send('/callback?' + params, { headers: { Accept: 'application/json', Cookie: 'fixture-private-cookie=fixture-private-cookie-value' } });
+  await denied(response);
+  verifyDiagnosticHeaders(response);
+  assert.match(response.headers.get('content-type'), /application\/json/);
+  const body = await response.text();
+  const data = JSON.parse(body);
+  assert.equal(data.error, 'OAUTH_STATE_MISMATCH');
+  assert.equal(data.service, 'stoicus-google-ads');
+  assert.equal(data.version, '0.2.3');
+  assert.equal(data.stage, 'callback');
+  for (const value of [privateCode, privateState, privateEmail, 'fixture-private-cookie-value']) assert.ok(!body.includes(value), value);
+  assert.equal(calls.length, before);
+});
+
+test('browser login errors render bounded Portuguese diagnostics with version and stage but no sensitive query or cookie data', async () => {
+  const before = calls.length;
+  const cases = [
+    ['/callback?state=fixture-private-state&code=fixture-private-code&email=fixture-private-email', 'callback', 'OAUTH_STATE_MISMATCH'],
+    ['/consent?csrf=fixture-private-csrf&code=fixture-private-code', 'consent', 'LOGIN_FLOW_INVALID'],
+  ];
+  for (const [path, stage, error] of cases) {
+    const response = await send(path, { headers: { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', Cookie: 'fixture-private-cookie=fixture-private-cookie-value' } });
+    await denied(response);
+    verifyDiagnosticHeaders(response);
+    assert.match(response.headers.get('content-type'), /text\/html/);
+    const html = await response.text();
+    assert.match(html, /lang="pt-BR"/);
+    assert.match(html, /0\.2\.3/);
+    assert.ok(html.includes(stage));
+    assert.ok(html.includes(error));
+    for (const value of ['fixture-private-state', 'fixture-private-code', 'fixture-private-email', 'fixture-private-csrf', 'fixture-private-cookie-value', 'fixture-secret', 'fixture-refresh', 'fixture-google-access']) assert.ok(!html.includes(value), value);
+  }
+  assert.equal(calls.length, before);
+});
+
+test('missing consent flow has the same safe JSON diagnostic metadata and production health exposes the matching version header', async () => {
+  const before = calls.length;
+  const response = await send('/consent', { headers: { Accept: 'application/json' } });
+  await denied(response);
+  verifyDiagnosticHeaders(response);
+  const diagnostic = await response.json();
+  assert.equal(diagnostic.error, 'LOGIN_FLOW_INVALID');
+  assert.equal(diagnostic.service, 'stoicus-google-ads');
+  assert.equal(diagnostic.version, '0.2.3');
+  assert.equal(diagnostic.stage, 'consent');
+  const health = await send('/health');
+  assert.equal(health.status, 200);
+  assert.equal(health.headers.get('x-stoicus-connector-version'), '0.2.3');
+  assert.equal((await health.json()).version, '0.2.3');
+  assert.equal(calls.length, before);
+});
