@@ -6,8 +6,9 @@ import { createGoogleAdsReadOnly, listGoogleAdsTools } from './read-only.mjs';
 import { createAuthHandler, allowedEmail, trustedRedirect, READ_SCOPE, WRITE_SCOPE, SCOPES, AuthFailure, page } from './auth.mjs';
 import { createManagement, listManagementTools, outputSchema, MAX_MUTATION_BYTES } from './management.mjs';
 export { GoogleAdsOperations } from './operations.mjs';
+export { GoogleAdsLoginSessions } from './login-sessions.mjs';
 
-const VERSION = '0.2.1';
+const VERSION = '0.2.2';
 const required = ['PUBLIC_ORIGIN', 'STOICUS_ALLOWED_EMAILS', 'GOOGLE_ADS_CUSTOMER_ID',
   'GOOGLE_ADS_CLIENT_ID', 'GOOGLE_ADS_CLIENT_SECRET', 'GOOGLE_ADS_REFRESH_TOKEN'];
 function secure(response, referrerPolicy = 'no-referrer', formAction = "'self'") {
@@ -19,7 +20,7 @@ function secure(response, referrerPolicy = 'no-referrer', formAction = "'self'")
   return result;
 }
 function configuredOrigin(env) {
-  if (required.some(k => typeof env[k] !== 'string' || !env[k].trim()) || !env.OAUTH_KV || env.GOOGLE_ADS_AUTH_MODE !== 'user_oauth') return null;
+  if (required.some(k => typeof env[k] !== 'string' || !env[k].trim()) || !env.OAUTH_KV || !env.GOOGLE_ADS_LOGIN_SESSIONS || env.GOOGLE_ADS_AUTH_MODE !== 'user_oauth') return null;
   try {
     const url = new URL(env.PUBLIC_ORIGIN);
     if (url.origin !== env.PUBLIC_ORIGIN || url.protocol !== 'https:' || url.username || url.password || url.port) return null;
@@ -78,6 +79,7 @@ export default {
       if (url.pathname === '/health' && input.method === 'GET') return secure(Response.json({
         service: 'stoicus-google-ads', version: VERSION, mode: 'management',
         write_infrastructure_ready: Boolean(env.GOOGLE_ADS_OPERATIONS),
+        login_sessions_ready: Boolean(env.GOOGLE_ADS_LOGIN_SESSIONS), browser_login_storage: 'durable_object',
         status: origin ? 'configured' : 'setup_required', google_connection_tested: false,
       }));
       if (!origin) return secure(page('Configuração pendente', '<p>O conector Google Ads está instalado e aguarda configuração pelo administrador.</p>', 503));

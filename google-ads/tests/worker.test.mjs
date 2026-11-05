@@ -19,7 +19,7 @@ let googleUser = { sub: 'fixture-user-123', email: 'operator@example.test', emai
 const mf = new Miniflare(convertV4MiniflareOptions({ modules: true, scriptPath: new URL('../dist/worker.js', import.meta.url).pathname,
   compatibilityDate: '2026-09-13', compatibilityFlags: ['nodejs_compat', 'global_fetch_strictly_public'],
   kvNamespaces: ['OAUTH_KV'], bindings: settings,
-  durableObjects: { GOOGLE_ADS_OPERATIONS: { className: 'GoogleAdsOperations', useSQLite: true } },
+  durableObjects: { GOOGLE_ADS_OPERATIONS: { className: 'GoogleAdsOperations', useSQLite: true }, GOOGLE_ADS_LOGIN_SESSIONS: { className: 'GoogleAdsLoginSessions', useSQLite: true } },
   outboundService: async request => {
     const body = request.method === 'POST' ? await request.text() : '';
     googleCalls.push({ url: request.url, body, headers: Object.fromEntries(request.headers) });
@@ -82,7 +82,7 @@ async function begin(client, scopes = READ_SCOPE) {
 async function login(flow) {
   return send('/callback?' + new URLSearchParams({ code: 'fixture-google-code', state: flow.google.searchParams.get('state'), iss: 'https://accounts.google.com' }), { headers: { Cookie: flow.cookie } });
 }
-let client, flow, consentCookie, csrf, authorizationCode, authorizationExchange, tokens;
+let client, flow, consentCookie, consentPath, consentFlow, csrf, authorizationCode, authorizationExchange, tokens;
 
 test('server denies unauthenticated access and publishes canonical OAuth discovery', async () => {
   const before = googleCalls.length;
@@ -124,14 +124,18 @@ test('login binds callback to the browser; tokens never appear in consent HTML',
   const loggedIn = await login(flow);
   assert.equal(loggedIn.status, 302, await loggedIn.clone().text());
   assert.equal(loggedIn.headers.get('referrer-policy'), 'no-referrer');
-  assert.equal(loggedIn.headers.get('location'), origin + '/consent');
+  consentPath = new URL(loggedIn.headers.get('location'));
+  assert.equal(consentPath.origin + consentPath.pathname, origin + '/consent');
+  consentFlow = consentPath.searchParams.get('flow');
+  assert.match(consentFlow, /^[A-Za-z0-9_-]{43}$/);
+  consentPath = consentPath.pathname + consentPath.search;
   consentCookie = cookie(loggedIn);
   const exchange = new URLSearchParams(googleCalls[before].body);
   assert.equal(exchange.get('grant_type'), 'authorization_code');
   assert.equal(await challenge(exchange.get('code_verifier')), flow.google.searchParams.get('code_challenge'));
   assert.equal(exchange.get('client_secret'), settings.GOOGLE_ADS_CLIENT_SECRET);
   assert.equal(exchange.has('refresh_token'), false);
-  const page = await send('/consent', { headers: { Cookie: consentCookie } });
+  const page = await send(consentPath, { headers: { Cookie: consentCookie } });
   const html = await page.text();
   assert.ok(html.includes('&lt;script&gt;fixture&lt;/script&gt;'));
   assert.ok(!html.includes('<script>fixture'));
@@ -148,16 +152,16 @@ test('login binds callback to the browser; tokens never appear in consent HTML',
   assert.equal((await login(flow)).status, 400);
 });
 test('consent requires same-origin POST and CSRF, then returns issuer and downstream state', async () => {
-  const values = { csrf, decision: 'allow' };
+  const values = { flow: consentFlow, csrf, decision: 'allow' };
   for (const browserOrigin of ['null', 'https://accounts.google.com', 'https://untrusted.example', 'https://chatgpt.com']) {
-    const denied = await send('/consent', { ...form(values),
+    const denied = await send(consentPath, { ...form(values),
       headers: { ...form(values).headers, Cookie: consentCookie, Origin: browserOrigin } });
     assert.equal(denied.status, 403);
     assert.equal(denied.headers.get('location'), null);
   }
-  assert.equal((await send('/consent', { ...form(values), headers: { ...form(values).headers, Cookie: consentCookie } })).status, 403);
-  assert.equal((await send('/consent', { ...form({ csrf: 'wrong', decision: 'allow' }), headers: { ...form(values).headers, Cookie: consentCookie, Origin: origin } })).status, 403);
-  const approved = await send('/consent', { ...form(values), headers: { ...form(values).headers, Cookie: consentCookie, Origin: origin } });
+  assert.equal((await send(consentPath, { ...form(values), headers: { ...form(values).headers, Cookie: consentCookie } })).status, 403);
+  assert.equal((await send(consentPath, { ...form({ flow: consentFlow, csrf: 'wrong', decision: 'allow' }), headers: { ...form(values).headers, Cookie: consentCookie, Origin: origin } })).status, 403);
+  const approved = await send(consentPath, { ...form(values), headers: { ...form(values).headers, Cookie: consentCookie, Origin: origin } });
   assert.equal(approved.status, 302, await approved.clone().text());
   assert.equal(approved.headers.get('referrer-policy'), 'no-referrer');
   assert.match(approved.headers.get('content-security-policy'), /form-action 'self';/);
@@ -253,10 +257,12 @@ test('management OAuth consent grants write explicitly and preserves the repaire
   managementClient=await register('Management fixture');
   const f=await begin(managementClient,SCOPES.join(' '));
   const logged=await login(f), consent=cookie(logged);
-  const page=await send('/consent',{headers:{Cookie:consent}}),html=await page.text();
+  const consentUrl=new URL(logged.headers.get('location'));
+  const consentPath=consentUrl.pathname+consentUrl.search;
+  const page=await send(consentPath,{headers:{Cookie:consent}}),html=await page.text();
   assert.match(html,/Autorizar gestão completa/);assert.match(html,/remova recursos/);
   assert.equal(page.headers.get('referrer-policy'),'same-origin');
-  const approved=await send('/consent',{...form({csrf:html.match(/name="csrf" value="([^"]+)"/)[1],decision:'allow'}),
+  const approved=await send(consentPath,{...form({flow:consentUrl.searchParams.get('flow'),csrf:html.match(/name="csrf" value="([^"]+)"/)[1],decision:'allow'}),
     headers:{...form({}).headers,Cookie:consent,Origin:origin}});
   const location=new URL(approved.headers.get('location'));
   const response=await send('/oauth/token',form({grant_type:'authorization_code',code:location.searchParams.get('code'),

@@ -2,6 +2,22 @@
 
 Destino: Cloudflare Worker existente **stoicus-google-ads-mcp**. O repositório contém também o Worker Meta na raiz. A raiz de construção do Google é obrigatoriamente **google-ads**.
 
+## Correção 0.2.2 - sessões de login isoladas e consumo atômico
+
+O diagnóstico de 05/11/2026 encontrou que `LOGIN_SESSION_EXPIRED` reunia três condições: registro ausente, fase incorreta e prazo vencido. A sessão temporária era escrita/lida em Workers KV e um único cookie era compartilhado por tentativas. A captura não identifica qual condição ocorreu; o código permite falhas de leitura imediata e interferência entre abas.
+
+Esta correção adiciona `GoogleAdsLoginSessions`, Durable Object SQLite privado no mesmo Worker, com o binding `GOOGLE_ADS_LOGIN_SESSIONS` e a migração adicional `google-ads-login-sessions-v1`. Cada tentativa tem identificador, cookie HttpOnly e nonce próprios. A validação e o consumo da sessão são atômicos, antes da troca do código Google e da emissão da concessão MCP. Sessões vencidas são removidas por alarme. Os erros de ausência, fase e expiração ficam distintos.
+
+Preservar `OAUTH_KV`, suas concessões existentes, `GoogleAdsOperations`, todos os secrets, a conta Ads e o Worker Meta. Não há fallback de login para KV. Tentativas de login em andamento da versão anterior devem ser iniciadas novamente depois da atualização. A ausência do novo binding falha fechada. Não remover a migração anterior ou a classe nova em um rollback; usar uma versão compatível com o binding implantado.
+
+Verificação: `npm test` executa o build e os testes com runtime real de Durable Objects SQLite. Conferir `version=0.2.2`, `browser_login_storage=durable_object` e `login_sessions_ready=true` em `/health`, além do check Workers Builds do commit integrado em `ads-google`. Somente depois iniciar nova autenticação pelo ChatGPT. Não reutilizar callbacks antigos nem gerar URLs OAuth manualmente.
+
+As verificações PKCE, state, cookie, CSRF, origem, e-mail autorizado, escopos e destinos ChatGPT continuam obrigatórias. Nenhuma campanha é alterada pela correção.
+
+O login MCP usa `openid email`; ele não renova `GOOGLE_ADS_REFRESH_TOKEN` do servidor. Se a leitura Ads retornar `invalid_grant` após autenticar o MCP, renovar o grant Ads pelo fluxo seguro existente e substituir o secret somente no painel Cloudflare. Não enviar credenciais ao chat. Investigar também o status Testando do aplicativo Google, que pode limitar o refresh token a sete dias.
+
+Referências técnicas: [consistência KV](https://developers.cloudflare.com/kv/concepts/how-kv-works/), [armazenamento transacional Durable Objects](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/) e [OAuth Google](https://developers.google.com/identity/protocols/oauth2/web-server).
+
 ## Atualização 0.2.0 — gestão completa de recursos
 
 Esta atualização foi autorizada pela responsável para habilitar leitura, criação, alteração e remoção no plugin existente. Preservar Worker, URL, plugin, cliente OAuth e secrets atuais. Não criar outro conector.
