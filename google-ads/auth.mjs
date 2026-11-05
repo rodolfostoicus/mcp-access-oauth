@@ -3,7 +3,7 @@
 export const READ_SCOPE = 'google_ads.read';
 export const WRITE_SCOPE = 'google_ads.write';
 export const SCOPES = [READ_SCOPE, WRITE_SCOPE];
-const COOKIE = '__Host-stoicus-google-login';
+const COOKIE = '__Host-stoicus-google-login-';
 const TTL = 600;
 const GOOGLE_TOKEN = 'https://oauth2.googleapis.com/token';
 const GOOGLE_USERINFO = 'https://openidconnect.googleapis.com/v1/userinfo';
@@ -22,30 +22,49 @@ export function trustedRedirect(value) {
 }
 function random() { return Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url'); }
 export async function challenge(value) { return Buffer.from(await crypto.subtle.digest('SHA-256', encoder.encode(value))).toString('base64url'); }
-function cookieValue(request) {
-  const values = (request.headers.get('Cookie') || '').split(';').map(x => x.trim()).filter(x => x.startsWith(COOKIE + '='));
+function cookieValue(request, id) {
+  const values = (request.headers.get('Cookie') || '').split(';').map(x => x.trim()).filter(x => x.startsWith(COOKIE + id + '='));
   if (values.length !== 1) reject('LOGIN_SESSION_MISSING');
-  const value = values[0].slice(COOKIE.length + 1);
+  const value = values[0].slice(COOKIE.length + id.length + 1);
   if (!/^[A-Za-z0-9_-]{43}$/.test(value)) reject('LOGIN_SESSION_INVALID');
   return value;
 }
-function cookie(value, maxAge = TTL) { return `${COOKIE}=${value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`; }
-function redirect(location, session) { return new Response(null, { status: 302, headers: { Location: location, 'Set-Cookie': cookie(session) } }); }
+function cookie(id, value, maxAge = TTL) { return `${COOKIE}${id}=${value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`; }
+function redirect(location, session, previous) {
+  const headers = new Headers({ Location: location });
+  headers.append('Set-Cookie', cookie(session.id, session.secret));
+  if (previous) headers.append('Set-Cookie', cookie(previous, '', 0));
+  return new Response(null, { status: 302, headers });
+}
 const escape = value => String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 export function page(title, body, status = 200) {
   return new Response(`<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><style>body{font:17px/1.6 system-ui;background:#f3f5f7;color:#142b43;margin:0}main{max-width:620px;margin:8vh auto;padding:36px;background:white;border-radius:12px}button{background:#142b43;color:white;padding:12px 20px;border:0;border-radius:6px;font:inherit;cursor:pointer}code{overflow-wrap:anywhere}small{color:#4c5968}</style><main><h1>${escape(title)}</h1>${body}</main></html>`, { status, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 async function save(env, value) {
   const id = random();
-  await env.OAUTH_KV.put('google-login:' + await challenge(id), JSON.stringify({ ...value, expires: Date.now() + TTL * 1000 }), { expirationTtl: TTL });
-  return id;
+  const secret = random();
+  await sessionOperation(env, id, { operation: 'create', value: { ...value,
+    cookieHash: await challenge(secret), expires: Date.now() + TTL * 1000 } });
+  return { id, secret };
 }
-async function session(env, request, phase) {
-  const id = cookieValue(request);
-  const key = 'google-login:' + await challenge(id);
-  const saved = await env.OAUTH_KV.get(key, 'json');
-  if (!saved || saved.phase !== phase || saved.expires <= Date.now()) reject('LOGIN_SESSION_EXPIRED');
-  return { id, key, saved };
+async function sessionOperation(env, id, job) {
+  if (!env.GOOGLE_ADS_LOGIN_SESSIONS) reject('LOGIN_STORAGE_UNAVAILABLE', 503);
+  const stub = env.GOOGLE_ADS_LOGIN_SESSIONS.get(env.GOOGLE_ADS_LOGIN_SESSIONS.idFromName(await challenge(id)));
+  const response = await stub.fetch('https://login.internal/session', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(job) });
+  if (!response.ok) reject('LOGIN_STORAGE_UNAVAILABLE', 503);
+  const data = await response.json();
+  if (data.error) reject(data.error);
+  return data;
+}
+async function session(env, request, phase, consume = false) {
+  const values = new URL(request.url).searchParams.getAll(phase === 'google' ? 'state' : 'flow');
+  if (values.length !== 1 || !/^[A-Za-z0-9_-]{43}$/.test(values[0])) reject(phase === 'google' ? 'OAUTH_STATE_MISMATCH' : 'LOGIN_FLOW_INVALID');
+  const id = values[0];
+  const secret = cookieValue(request, id);
+  const job = { operation: consume ? 'consume' : 'read', phase, cookieHash: await challenge(secret) };
+  const { saved } = await sessionOperation(env, id, job);
+  return { id, saved };
 }
 async function upstreamJSON(fetchImpl, url, init) {
   const controller = new AbortController();
@@ -96,14 +115,12 @@ export function createAuthHandler({ origin, fetchImpl = (...args) => globalThis.
           clientName: typeof client.clientName === 'string' ? client.clientName.slice(0,150) : 'ChatGPT' });
         const destination = new URL('https://accounts.google.com/o/oauth2/v2/auth');
         destination.search = new URLSearchParams({ client_id: env.GOOGLE_ADS_CLIENT_ID, redirect_uri: origin + '/callback',
-          response_type: 'code', scope: 'openid email', state: id, code_challenge: await challenge(verifier),
+          response_type: 'code', scope: 'openid email', state: id.id, code_challenge: await challenge(verifier),
           code_challenge_method: 'S256', access_type: 'online', prompt: 'select_account' }).toString();
         return redirect(destination.toString(), id);
       }
       if (url.pathname === '/callback' && request.method === 'GET') {
-        const { id, key, saved } = await session(env, request, 'google');
-        if (url.searchParams.getAll('state').length !== 1 || url.searchParams.get('state') !== id) reject('OAUTH_STATE_MISMATCH');
-        await env.OAUTH_KV.delete(key);
+        const { id, saved } = await session(env, request, 'google', true);
         if (url.searchParams.has('error')) reject('GOOGLE_LOGIN_CANCELLED');
         const code = url.searchParams.get('code');
         const issuer = url.searchParams.get('iss');
@@ -120,26 +137,26 @@ export function createAuthHandler({ origin, fetchImpl = (...args) => globalThis.
             !/^[A-Za-z0-9_-]{1,200}$/.test(user.sub)) reject('OPERATOR_NOT_ALLOWED', 403);
         const next = await save(env, { phase: 'consent', authRequest: saved.authRequest, clientName: saved.clientName,
           userId: user.sub, email: user.email.toLowerCase(), csrf: random() });
-        return redirect(origin + '/consent', next);
+        return redirect(origin + '/consent?flow=' + next.id, next, id);
       }
       if (url.pathname === '/consent' && (request.method === 'GET' || request.method === 'POST')) {
-        const { key, saved } = await session(env, request, 'consent');
+        const { id, saved } = await session(env, request, 'consent');
         if (!allowedEmail(env, saved.email)) reject('OPERATOR_NOT_ALLOWED', 403);
         if (request.method === 'GET') {
           const write = saved.authRequest.scope.includes(WRITE_SCOPE);
           const permission = write ? 'consulte, crie, modifique e remova recursos Google Ads da Stoicus, incluindo anúncios, campanhas, orçamentos, públicos e configurações da conta. Alterações podem ativar anúncios, gerar despesas ou remover recursos' : 'consulte os dados Google Ads da Stoicus: identificação da conta, campanhas, orçamentos e resultados';
-          return page('Autorizar conexão', `<p>Conta: <strong>${escape(saved.email)}</strong></p><p>Permitir que <strong>${escape(saved.clientName)}</strong> ${permission}.</p><p>Destino da autorização: <code>${escape(saved.authRequest.redirectUri)}</code></p><form method="post" action="/consent"><input type="hidden" name="csrf" value="${escape(saved.csrf)}"><button name="decision" value="allow">${write ? 'Autorizar gestão completa' : 'Autorizar leitura'}</button> <button name="decision" value="deny">Cancelar</button></form>`);
+          return page('Autorizar conexão', `<p>Conta: <strong>${escape(saved.email)}</strong></p><p>Permitir que <strong>${escape(saved.clientName)}</strong> ${permission}.</p><p>Destino da autorização: <code>${escape(saved.authRequest.redirectUri)}</code></p><form method="post" action="/consent?flow=${escape(id)}"><input type="hidden" name="flow" value="${escape(id)}"><input type="hidden" name="csrf" value="${escape(saved.csrf)}"><button name="decision" value="allow">${write ? 'Autorizar gestão completa' : 'Autorizar leitura'}</button> <button name="decision" value="deny">Cancelar</button></form>`);
         }
         if (request.headers.get('Origin') !== origin) reject('CONSENT_ORIGIN_MISMATCH', 403);
         if (!request.headers.get('Content-Type')?.startsWith('application/x-www-form-urlencoded')) reject('INVALID_CONSENT');
         const form = new URLSearchParams(await request.text());
-        if (form.getAll('csrf').length !== 1 || form.get('csrf') !== saved.csrf || form.getAll('decision').length !== 1) reject('CONSENT_CSRF_MISMATCH', 403);
-        await env.OAUTH_KV.delete(key);
-        if (form.get('decision') !== 'allow') return page('Conexão cancelada', '<p>Você pode fechar esta janela.</p>');
-        const completed = await env.OAUTH_PROVIDER.completeAuthorization({ request: saved.authRequest,
-          userId: saved.userId, metadata: { clientName: saved.clientName }, scope: saved.authRequest.scope,
-          props: { userId: saved.userId, email: saved.email, scopes: saved.authRequest.scope } });
-        return new Response(null, { status: 302, headers: { Location: completed.redirectTo, 'Set-Cookie': cookie('',0) } });
+        if (form.getAll('flow').length !== 1 || form.get('flow') !== id || form.getAll('csrf').length !== 1 || form.get('csrf') !== saved.csrf || form.getAll('decision').length !== 1 || !['allow','deny'].includes(form.get('decision'))) reject('CONSENT_CSRF_MISMATCH', 403);
+        const claimed = (await session(env, request, 'consent', true)).saved;
+        if (form.get('decision') !== 'allow') { const denied = page('Conexão cancelada', '<p>Você pode fechar esta janela.</p>'); denied.headers.set('Set-Cookie',cookie(id,'',0)); return denied; }
+        const completed = await env.OAUTH_PROVIDER.completeAuthorization({ request: claimed.authRequest,
+          userId: claimed.userId, metadata: { clientName: claimed.clientName }, scope: claimed.authRequest.scope,
+          props: { userId: claimed.userId, email: claimed.email, scopes: claimed.authRequest.scope } });
+        return new Response(null, { status: 302, headers: { Location: completed.redirectTo, 'Set-Cookie': cookie(id,'',0) } });
       }
       return new Response('Not found', { status: 404 });
     },

@@ -6,8 +6,14 @@
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "workers_dev": true,
   "kv_namespaces": [{ "binding": "OAUTH_KV" }],
-  "durable_objects": { "bindings": [{ "name": "GOOGLE_ADS_OPERATIONS", "class_name": "GoogleAdsOperations" }] },
-  "migrations": [{ "tag": "google-ads-operations-v1", "new_sqlite_classes": ["GoogleAdsOperations"] }],
+  "durable_objects": { "bindings": [
+    { "name": "GOOGLE_ADS_OPERATIONS", "class_name": "GoogleAdsOperations" },
+    { "name": "GOOGLE_ADS_LOGIN_SESSIONS", "class_name": "GoogleAdsLoginSessions" }
+  ] },
+  "migrations": [
+    { "tag": "google-ads-operations-v1", "new_sqlite_classes": ["GoogleAdsOperations"] },
+    { "tag": "google-ads-login-sessions-v1", "new_sqlite_classes": ["GoogleAdsLoginSessions"] }
+  ],
   "observability": { "enabled": false },
   "vars": {
     "GOOGLE_ADS_AUTH_MODE": "user_oauth",
