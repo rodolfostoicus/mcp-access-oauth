@@ -87,6 +87,29 @@ test('account identity and timezone are verified before listing campaigns', asyn
     assert.equal(calls.length, 2);
   }
 });
+test('campaign inventory selects the v25 start and end datetime fields', async () => {
+  const campaign = {
+    id: '19',
+    startDateTime: '2026-11-10 06:00:00',
+    endDateTime: '2026-11-16 23:00:00',
+  };
+  const { client } = fixture({ fetchImpl: async (url, init) => {
+    if (url.endsWith('/token')) {
+      return json({ access_token: 'fixture-access-token', expires_in: 3600, token_type: 'Bearer' });
+    }
+    const { query } = JSON.parse(init.body);
+    if (query.includes('FROM customer')) return json({ results: [{ customer: account }] });
+    assert.doesNotMatch(query, /\bcampaign\.(?:start_date|end_date)\b/);
+    assert.match(query, /\bcampaign\.start_date_time\b/);
+    assert.match(query, /\bcampaign\.end_date_time\b/);
+    return json({ results: [{ campaign }] });
+  } });
+
+  const result = await client.callTool('google_ads_list_campaigns');
+  assert.equal(result.read_access_verified, true);
+  assert.equal(result.time_zone, account.timeZone);
+  assert.deepEqual(result.rows, [{ campaign }]);
+});
 test('performance keeps exact micros, account currency, and explicit date range', async () => {
   const { client, calls } = fixture();
   const result = await client.callTool('google_ads_get_performance', { start_date: '2026-09-01', end_date: '2026-09-13' });
