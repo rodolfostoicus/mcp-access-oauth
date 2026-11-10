@@ -256,7 +256,7 @@ export function createGoogleAdsReadOnly({ env, authorize, fetchImpl, now }) {
         if (name === 'google_ads_get_account') return { ...common, account };
         let query;
         if (name === 'google_ads_list_campaigns') {
-          query = 'SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type, campaign.start_date, campaign.end_date, campaign.bidding_strategy_type, campaign.geo_target_type_setting.positive_geo_target_type, campaign_budget.id, campaign_budget.amount_micros, campaign_budget.total_amount_micros, campaign_budget.period, campaign_budget.explicitly_shared FROM campaign WHERE campaign.status != REMOVED ORDER BY campaign.id LIMIT 1001';
+          query = 'SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type, campaign.start_date_time, campaign.end_date_time, campaign.bidding_strategy_type, campaign.geo_target_type_setting.positive_geo_target_type, campaign_budget.id, campaign_budget.amount_micros, campaign_budget.total_amount_micros, campaign_budget.period, campaign_budget.explicitly_shared FROM campaign WHERE campaign.status != REMOVED ORDER BY campaign.id LIMIT 1001';
         } else {
           query = `SELECT campaign.id, campaign.name, campaign.status, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions, metrics.conversions_value FROM campaign WHERE segments.date BETWEEN '${args.start_date}' AND '${args.end_date}' ORDER BY metrics.cost_micros DESC LIMIT 1001`;
         }
