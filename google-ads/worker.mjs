@@ -2,15 +2,14 @@ import OAuthProvider, { OAuthError } from '@cloudflare/workers-oauth-provider';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { createGoogleAdsReadOnly, listGoogleAdsTools } from './read-only.mjs';
+import { config as googleAdsConfig, createGoogleAdsReadOnly, listGoogleAdsTools } from './read-only.mjs';
 import { createAuthHandler, allowedEmail, trustedRedirect, READ_SCOPE, WRITE_SCOPE, SCOPES, AuthFailure, page } from './auth.mjs';
 import { createManagement, listManagementTools, outputSchema, MAX_MUTATION_BYTES } from './management.mjs';
 export { GoogleAdsOperations } from './operations.mjs';
 export { GoogleAdsLoginSessions } from './login-sessions.mjs';
 
 const VERSION = '0.2.3';
-const required = ['PUBLIC_ORIGIN', 'STOICUS_ALLOWED_EMAILS', 'GOOGLE_ADS_CUSTOMER_ID',
-  'GOOGLE_ADS_CLIENT_ID', 'GOOGLE_ADS_CLIENT_SECRET', 'GOOGLE_ADS_REFRESH_TOKEN'];
+const required = ['PUBLIC_ORIGIN', 'STOICUS_ALLOWED_EMAILS', 'GOOGLE_ADS_CLIENT_ID', 'GOOGLE_ADS_CLIENT_SECRET'];
 function secure(response, referrerPolicy = 'no-referrer', formAction = "'self'") {
   const result = new Response(response.body, response);
   result.headers.set('Cache-Control', 'no-store');
@@ -21,8 +20,10 @@ function secure(response, referrerPolicy = 'no-referrer', formAction = "'self'")
   return result;
 }
 function configuredOrigin(env) {
-  if (required.some(k => typeof env[k] !== 'string' || !env[k].trim()) || !env.OAUTH_KV || !env.GOOGLE_ADS_LOGIN_SESSIONS || env.GOOGLE_ADS_AUTH_MODE !== 'user_oauth') return null;
+  if (required.some(k => typeof env[k] !== 'string' || !env[k].trim()) ||
+      !env.OAUTH_KV || !env.GOOGLE_ADS_LOGIN_SESSIONS || !env.GOOGLE_ADS_AUTH_MODE) return null;
   try {
+    googleAdsConfig(env);
     const url = new URL(env.PUBLIC_ORIGIN);
     if (url.origin !== env.PUBLIC_ORIGIN || url.protocol !== 'https:' || url.username || url.password || url.port) return null;
     return url.origin;

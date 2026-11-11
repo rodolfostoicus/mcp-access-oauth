@@ -16,7 +16,7 @@ let mutateFailure = null;
 let holdMutation = null;
 let nextResourceId = 100;
 let googleUser = { sub: 'fixture-user-123', email: 'operator@example.test', email_verified: true };
-const mf = new Miniflare(convertV4MiniflareOptions({ modules: true, scriptPath: new URL('../dist/worker.js', import.meta.url).pathname,
+const workerOptions = { modules: true, scriptPath: new URL('../dist/worker.js', import.meta.url).pathname,
   compatibilityDate: '2026-09-13', compatibilityFlags: ['nodejs_compat', 'global_fetch_strictly_public'],
   kvNamespaces: ['OAUTH_KV'], bindings: settings,
   durableObjects: { GOOGLE_ADS_OPERATIONS: { className: 'GoogleAdsOperations', useSQLite: true }, GOOGLE_ADS_LOGIN_SESSIONS: { className: 'GoogleAdsLoginSessions', useSQLite: true } },
@@ -53,24 +53,25 @@ const mf = new Miniflare(convertV4MiniflareOptions({ modules: true, scriptPath: 
     }
     throw new Error('Unexpected outbound destination');
   },
-}));
+};
+const mf = new Miniflare(convertV4MiniflareOptions(workerOptions));
 after(async () => { await mf.dispose(); });
 const send = (path, init = {}) => mf.dispatchFetch(origin + path, { ...init, redirect: 'manual' });
 const form = value => ({ method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(value).toString() });
 const jsonPost = value => ({ method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' }, body: JSON.stringify(value) });
 const cookie = response => response.headers.get('set-cookie').split(';')[0];
-async function register(name = 'Fixture ChatGPT') {
-  const response = await send('/oauth/register', jsonPost({ client_name: name, redirect_uris: [callback],
+async function register(name = 'Fixture ChatGPT', request = send) {
+  const response = await request('/oauth/register', jsonPost({ client_name: name, redirect_uris: [callback],
     grant_types: ['authorization_code','refresh_token'], response_types: ['code'], token_endpoint_auth_method: 'none' }));
   assert.equal(response.status, 201, await response.clone().text());
   return response.json();
 }
-async function begin(client, scopes = READ_SCOPE) {
+async function begin(client, scopes = READ_SCOPE, request = send) {
   const verifier = 'fixture-pkce-verifier-123456789012345678901234567890';
   const query = new URLSearchParams({ client_id: client.client_id, redirect_uri: callback, response_type: 'code',
     scope: scopes, resource: origin + '/mcp', state: 'fixture-downstream-state',
     code_challenge: await challenge(verifier), code_challenge_method: 'S256' });
-  const response = await send('/authorize?' + query);
+  const response = await request('/authorize?' + query);
   assert.equal(response.status, 302, await response.clone().text());
   const google = new URL(response.headers.get('location'));
   assert.equal(google.origin + google.pathname, 'https://accounts.google.com/o/oauth2/v2/auth');
@@ -79,8 +80,8 @@ async function begin(client, scopes = READ_SCOPE) {
   assert.equal(google.searchParams.get('code_challenge_method'), 'S256');
   return { verifier, query, cookie: cookie(response), google };
 }
-async function login(flow) {
-  return send('/callback?' + new URLSearchParams({ code: 'fixture-google-code', state: flow.google.searchParams.get('state'), iss: 'https://accounts.google.com' }), { headers: { Cookie: flow.cookie } });
+async function login(flow, request = send) {
+  return request('/callback?' + new URLSearchParams({ code: 'fixture-google-code', state: flow.google.searchParams.get('state'), iss: 'https://accounts.google.com' }), { headers: { Cookie: flow.cookie } });
 }
 let client, flow, consentCookie, consentPath, consentFlow, csrf, authorizationCode, authorizationExchange, tokens;
 
@@ -106,6 +107,82 @@ test('server denies unauthenticated access and publishes canonical OAuth discove
     }
     assert.equal((await send('/mcp', { headers: { Origin: browserOrigin } })).status, 403);
   }
+});
+test('service account supplies Ads access while the Worker requires operator OAuth', async t => {
+  const keys = await crypto.subtle.generateKey({ name: 'RSASSA-PKCS1-v1_5',
+    modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, true, ['sign', 'verify']);
+  const encodedKey = Buffer.from(await crypto.subtle.exportKey('pkcs8', keys.privateKey)).toString('base64');
+  const bindings = { ...settings, GOOGLE_ADS_AUTH_MODE: 'service_account',
+    GOOGLE_ADS_SERVICE_ACCOUNT_JSON: JSON.stringify({
+      type: 'service_account',
+      client_email: 'fixture-worker@fixture-project.iam.gserviceaccount.com',
+      private_key: '-----BEGIN PRIVATE KEY-----\n' + encodedKey + '\n-----END PRIVATE KEY-----',
+    }) };
+  delete bindings.GOOGLE_ADS_REFRESH_TOKEN;
+  let rejectToken = false;
+  const worker = new Miniflare(convertV4MiniflareOptions({ ...workerOptions, bindings,
+    outboundService: async request => {
+      if (rejectToken && request.url === 'https://oauth2.googleapis.com/token') {
+        return Response.json({ error: 'invalid_grant' }, { status: 400 });
+      }
+      return workerOptions.outboundService(request);
+    },
+  }));
+  t.after(() => worker.dispose());
+  const request = (path, init = {}) => worker.dispatchFetch(origin + path, { ...init, redirect: 'manual' });
+  const before = googleCalls.length;
+  assert.equal((await (await request('/health')).json()).status, 'configured');
+  assert.equal((await request('/mcp', jsonPost({}))).status, 401);
+  assert.equal(googleCalls.length, before);
+
+  const operator = await register('Service account fixture', request);
+  const attempt = await begin(operator, READ_SCOPE, request);
+  const logged = await login(attempt, request);
+  assert.equal(logged.status, 302);
+  const consentUrl = new URL(logged.headers.get('location'));
+  const consentPath = consentUrl.pathname + consentUrl.search;
+  const consent = await (await request(consentPath, { headers: { Cookie: cookie(logged) } })).text();
+  const approved = await request(consentPath, { ...form({
+    flow: consentUrl.searchParams.get('flow'),
+    csrf: consent.match(/name="csrf" value="([^"]+)"/)[1],
+    decision: 'allow',
+  }), headers: { ...form({}).headers, Cookie: cookie(logged), Origin: origin } });
+  const authCode = new URL(approved.headers.get('location')).searchParams.get('code');
+  const exchange = await request('/oauth/token', form({ grant_type: 'authorization_code',
+    code: authCode, client_id: operator.client_id, code_verifier: attempt.verifier,
+    redirect_uri: callback, resource: origin + '/mcp' }));
+  assert.equal(exchange.status, 200);
+  const issued = await exchange.json();
+  assert.equal(issued.scope, READ_SCOPE);
+
+  const call = async (name, args = {}) => {
+    const response = await request('/mcp', {
+      ...jsonPost({ jsonrpc: '2.0', id: 1, method: 'tools/call',
+        params: { name, arguments: args } }),
+      headers: { ...jsonPost({}).headers, Authorization: 'Bearer ' + issued.access_token },
+    });
+    assert.equal(response.status, 200);
+    return (await response.json()).result.structuredContent;
+  };
+  const beforeRead = googleCalls.length;
+  const read = await call('google_ads_get_account');
+  assert.equal(read.read_access_verified, true);
+  assert.equal(read.customer_id, '1234567890');
+  const tokenRequest = new URLSearchParams(googleCalls[beforeRead].body);
+  assert.equal(tokenRequest.get('grant_type'), 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+  assert.equal(tokenRequest.has('refresh_token'), false);
+  assert.equal(googleCalls[beforeRead + 1].url, 'https://googleads.googleapis.com/v25/customers/1234567890/googleAds:search');
+  assert.equal((await call('google_ads_update')).error, 'WRITE_SCOPE_REQUIRED');
+  rejectToken = true;
+  const rejected = await call('google_ads_get_account');
+  assert.equal(rejected.oauth_error, 'invalid_grant');
+  assert.equal(rejected.reauthorization_required, undefined);
+
+  await worker.setOptions(convertV4MiniflareOptions({ ...workerOptions, bindings: {
+    ...settings, GOOGLE_ADS_AUTH_MODE: 'service_account',
+  } }));
+  assert.equal((await (await request('/health')).json()).status, 'setup_required');
+  assert.equal((await request('/mcp', jsonPost({}))).status, 503);
 });
 test('registration and authorization require trusted callback and S256 PKCE', async () => {
   const response = await send('/oauth/register', jsonPost({ client_name: 'Untrusted', redirect_uris: ['https://untrusted.example/callback'] }));

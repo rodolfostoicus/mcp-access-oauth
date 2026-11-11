@@ -146,7 +146,9 @@ export function createGoogleAdsClient({ env, fetchImpl = (...args) => globalThis
           ...(fieldPaths.length ? { field_paths: [...new Set(fieldPaths)].slice(0,10) } : {}),
           ...(policyFindings.length ? { policy_findings: policyFindings } : {}),
           ...(policyFindingsTruncated ? { policy_findings_truncated: true } : {}),
-          ...(oauthError ? { oauth_error: oauthError, ...(oauthError === 'invalid_grant' ? { reauthorization_required: true } : {}) } : {}),
+          ...(oauthError ? { oauth_error: oauthError } : {}),
+          ...(oauthError === 'invalid_grant' && settings.GOOGLE_ADS_AUTH_MODE === 'user_oauth'
+            ? { reauthorization_required: true } : {}),
           ...(requestId && /^[a-zA-Z0-9_-]{1,100}$/.test(requestId) ? { request_id: requestId } : {}),
         });
       }
