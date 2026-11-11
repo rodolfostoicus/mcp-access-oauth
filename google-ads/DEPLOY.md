@@ -2,6 +2,17 @@
 
 Destino: Cloudflare Worker existente **stoicus-google-ads-mcp**. O repositório contém também o Worker Meta na raiz. A raiz de construção do Google é obrigatoriamente **google-ads**.
 
+## Tokens da API emitidos por conta de serviço
+
+O modo `service_account` usa uma identidade dedicada para obter tokens de acesso temporários do Google Ads. O cliente assina a solicitação no Worker e solicita outro token quando necessário. O login Google dos operadores no ChatGPT continua usando o cliente OAuth web existente e a lista de operadores autorizados.
+
+1. Confirmar o projeto Google Cloud da Stoicus com acesso de produção à API. Um administrador adiciona a conta de serviço somente à conta Google Ads da Stoicus. Usar **Somente leitura** para auditoria ou **Padrão** se a gestão de campanhas também estiver autorizada.
+2. Instalar o JSON da conta de serviço no Secret `GOOGLE_ADS_SERVICE_ACCOUNT_JSON` do Worker Google, pela administração do Cloudflare. Manter a chave no gerenciador de segredos autorizado. Se a organização exigir credenciais sem chave, confirmar a arquitetura aprovada antes de provisionar a identidade.
+3. Após a concessão e a instalação, mudar `GOOGLE_ADS_AUTH_MODE` para `service_account` em `google-ads/wrangler.jsonc` e implantar pela branch `ads-google`. O repositório define o valor usado nos deploys. O modo selecionado exige a credencial correspondente. Em `service_account`, um erro de emissão de token exige verificar a identidade e sua chave no Google Cloud.
+4. Confirmar o build e consultar a conta **626-161-8641**, o inventário e o desempenho pela integração autenticada. A validação de uma operação de gestão depende de escopo do operador e permissões da conta de serviço. Usar `validate_only` antes da operação autorizada.
+
+[Conta de serviço do Google Ads](https://developers.google.com/google-ads/api/docs/oauth/service-accounts) · [Segredos do Worker](https://developers.cloudflare.com/workers/configuration/secrets/)
+
 ## Diagnóstico 0.2.3 - distinguir a origem e a etapa da falha
 
 Depois de confirmar a implantação0.2.2, a responsável relatou novamente o mesmo erro. Não foi declarada a restauração do acesso. No código0.2.2, `LOGIN_SESSION_EXPIRED` só significa prazo vencido de uma sessão DO encontrada; ausência, fase e cookie têm códigos próprios. O provider não traduz esses outros erros em expiração. Não há evidência para aumentar oTTL.
