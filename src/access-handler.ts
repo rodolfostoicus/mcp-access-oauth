@@ -24,7 +24,23 @@ export async function handleAccessRequest(
 	const { pathname, searchParams } = new URL(request.url);
 
 	if (request.method === "GET" && pathname === "/authorize") {
-		const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+		let oauthReqInfo: AuthRequest;
+		try {
+			oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+		} catch (error) {
+			// The provider currently uses an untyped Error for an unknown client.
+			if (!(error instanceof Error) ||
+				error.message !== "Invalid client. The clientId provided does not match to this client.") {
+				throw error;
+			}
+			const response = new OAuthError(
+				"invalid_client",
+				"Cadastro OAuth do aplicativo não encontrado. Solicite ao administrador que restaure o cadastro original ou configure um novo registro no aplicativo.",
+			).toResponse();
+			response.headers.set("Cache-Control", "no-store");
+			response.headers.set("Referrer-Policy", "no-referrer");
+			return response;
+		}
 		const { clientId } = oauthReqInfo;
 		if (!clientId) {
 			return new Response("Invalid request", { status: 400 });
